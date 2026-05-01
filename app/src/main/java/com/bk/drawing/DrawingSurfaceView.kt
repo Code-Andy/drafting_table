@@ -8,26 +8,31 @@ import androidx.graphics.lowlatency.BufferInfo
 import androidx.graphics.lowlatency.GLFrontBufferedRenderer
 import androidx.graphics.opengl.egl.EGLManager
 
-data class StrokePoint(val x: Float, val y: Float, val pressure: Float)
+data class StrokeSample(
+    val x: Float,
+    val y: Float,
+    val pressure: Float,
+    val isNewStroke: Boolean
+)
 
 class DrawingSurfaceView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : SurfaceView(context, attrs) {
 
-    private val callback = object : GLFrontBufferedRenderer.Callback<StrokePoint> {
+    private val callback = object : GLFrontBufferedRenderer.Callback<StrokeSample> {
         override fun onDrawFrontBufferedLayer(
             eglManager: EGLManager,
             width: Int,
             height: Int,
             bufferInfo: BufferInfo,
             transform: FloatArray,
-            param: StrokePoint
+            param: StrokeSample
         ) {
-            // width/height are view-space (landscape) dims. bufferInfo.width/height are
-            // the actual buffer pixel dims (often portrait on devices whose panel is
-            // physically portrait). The transform maps view-pixel -> buffer-pixel.
-            NativeRenderer.drawFrontDot(
+            if (param.isNewStroke) {
+                NativeRenderer.beginStroke()
+            }
+            NativeRenderer.extendStroke(
                 bufferInfo.width, bufferInfo.height,
                 transform,
                 param.x, param.y, param.pressure
@@ -40,24 +45,22 @@ class DrawingSurfaceView @JvmOverloads constructor(
             height: Int,
             bufferInfo: BufferInfo,
             transform: FloatArray,
-            params: Collection<StrokePoint>
+            params: Collection<StrokeSample>
         ) {
-            val flat = FloatArray(params.size * 3)
-            var i = 0
-            for (p in params) {
-                flat[i++] = p.x
-                flat[i++] = p.y
-                flat[i++] = p.pressure
+            // Empty params means a refresh (e.g. orientation change), not a
+            // commit — don't promote the in-progress stroke to committed in
+            // that case, since the user may still be drawing it.
+            if (params.isNotEmpty()) {
+                NativeRenderer.commitStroke()
             }
-            NativeRenderer.drawAllDots(
+            NativeRenderer.renderDocument(
                 bufferInfo.width, bufferInfo.height,
-                transform,
-                flat, params.size
+                transform
             )
         }
     }
 
-    private var renderer: GLFrontBufferedRenderer<StrokePoint>? =
+    private var renderer: GLFrontBufferedRenderer<StrokeSample>? =
         GLFrontBufferedRenderer(this, callback)
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -69,21 +72,24 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                r.renderFrontBufferedLayer(StrokePoint(event.x, event.y, event.pressure))
+                r.renderFrontBufferedLayer(
+                    StrokeSample(event.x, event.y, event.pressure, isNewStroke = true)
+                )
             }
             MotionEvent.ACTION_MOVE -> {
-                // Walk historical samples between vsyncs — Android delivers many input
-                // samples per frame and we want every dab, not just the latest.
                 for (i in 0 until event.historySize) {
                     r.renderFrontBufferedLayer(
-                        StrokePoint(
+                        StrokeSample(
                             event.getHistoricalX(i),
                             event.getHistoricalY(i),
-                            event.getHistoricalPressure(i)
+                            event.getHistoricalPressure(i),
+                            isNewStroke = false
                         )
                     )
                 }
-                r.renderFrontBufferedLayer(StrokePoint(event.x, event.y, event.pressure))
+                r.renderFrontBufferedLayer(
+                    StrokeSample(event.x, event.y, event.pressure, isNewStroke = false)
+                )
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 r.commit()
