@@ -21,9 +21,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var toolButton: Button
     private lateinit var layerButton: Button
     private lateinit var gridButton: Button
+    private lateinit var snapButton: Button
 
     // Grid cycles off → lines → dots → off.
     private var gridState = 0   // 0 = off, 1 = lines, 2 = dots
+    private var snapEnabled = true
 
     // Local prediction of native layer state. Initialized from a one-shot
     // read after the GL thread has had a chance to load tiles from disk.
@@ -175,6 +177,20 @@ class MainActivity : AppCompatActivity() {
         }
         panel.addView(gridButton, panelChildParams())
 
+        val deleteButton = Button(this).apply {
+            text = "Delete"
+            alpha = 0.92f
+            setOnClickListener { userDeleteSelection() }
+        }
+        panel.addView(deleteButton, panelChildParams())
+
+        snapButton = Button(this).apply {
+            text = "Snap: on"
+            alpha = 0.92f
+            setOnClickListener { toggleSnap() }
+        }
+        panel.addView(snapButton, panelChildParams())
+
         panel.addView(buildColorGrid(), panelChildParams())
 
         return panel
@@ -250,9 +266,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateToolButton(tool: Tool) {
         toolButton.text = when (tool) {
-            Tool.BRUSH  -> "Brush"
-            Tool.ERASER -> "Eraser"
-            Tool.LINE   -> "Line"
+            Tool.BRUSH     -> "Brush"
+            Tool.ERASER    -> "Eraser"
+            Tool.LINE      -> "Line"
+            Tool.RECTANGLE -> "Rect"
+            Tool.CIRCLE    -> "Circle"
+            Tool.ELLIPSE   -> "Ellipse"
+            Tool.SELECT    -> "Select"
         }
     }
 
@@ -286,6 +306,19 @@ class MainActivity : AppCompatActivity() {
         // Force a multi-buffer redraw so the cleared state shows up right
         // away (otherwise it only appears after the next stroke commit).
         drawingView?.forceRedraw()
+    }
+
+    private fun userDeleteSelection() {
+        if (NativeRenderer.hasSelection()) {
+            NativeRenderer.deleteSelection()
+            drawingView?.forceRedraw()
+        }
+    }
+
+    private fun toggleSnap() {
+        snapEnabled = !snapEnabled
+        NativeRenderer.setSnapEnabled(snapEnabled)
+        snapButton.text = if (snapEnabled) "Snap: on" else "Snap: off"
     }
 
     // ---- Helpers ---------------------------------------------------------

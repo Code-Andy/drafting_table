@@ -342,7 +342,9 @@ struct Tile {
     GLuint fbo     = 0;
 };
 
-// Vector-layer primitives. All coordinates are in document pixels.
+// Vector-layer primitives. All coordinates are in document pixels. Each
+// struct is plain-old-data so we can fwrite it byte-for-byte during
+// persistence. If you change a layout, bump kShapesMagic.
 enum class LayerType : int { Raster = 0, Vector = 1 };
 
 struct Line {
@@ -352,10 +354,39 @@ struct Line {
     float    width;     // full line width in doc pixels
 };
 
+struct Rect {
+    float    x0, y0;    // axis-aligned bbox in shape-local frame (rotation
+    float    x1, y1;    //   = 0 means these are also world-space corners).
+    float    rotation;  // radians, applied around the bbox center.
+    uint32_t color;
+    float    width;
+};
+
+struct Ellipse {
+    float    cx, cy;    // center
+    float    rx, ry;    // semi-axes (in shape-local frame)
+    float    rotation;  // radians, applied around the center
+    uint32_t color;
+    float    width;
+};
+
+struct Circle {
+    float    cx, cy;    // center
+    float    radius;
+    uint32_t color;
+    float    width;
+};
+
 struct Layer {
     LayerType type = LayerType::Raster;
     std::unordered_map<int64_t, Tile> tiles;   // populated for raster
-    std::vector<Line> lines;                   // populated for vector
+    // Vector-layer shape lists (populated for vector). Kept as separate
+    // typed vectors rather than a tagged union — shape counts are small
+    // and per-type iteration in the compositor is cleaner.
+    std::vector<Line>    lines;
+    std::vector<Rect>    rects;
+    std::vector<Ellipse> ellipses;
+    std::vector<Circle>  circles;
 };
 
 struct DabProg {
@@ -431,6 +462,13 @@ bool        g_inited  = false;
 std::atomic<int> g_gridEnabled{0};   // 0 = off, 1 = on
 std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
 
+// Snapping is on by default. Settable from any thread.
+std::atomic<int> g_snapEnabled{1};
+
+constexpr float    kSnapRadius      = 20.0f;          // doc px
+constexpr uint32_t kSnapMarkerColor = 0xFFC020u;      // amber
+constexpr float    kSnapMarkerR     = 9.0f;           // ring radius (doc px)
+
 constexpr float kGridSpacing      = 50.0f;       // doc pixels between minor lines
 constexpr float kGridSubdivisions = 5.0f;        // major every Nth minor
 // Half-widths in doc pixels. Lines look fine at sub-pixel widths since they're
@@ -485,11 +523,69 @@ constexpr int kActionCycleActive    = 2;
 constexpr int kActionClearActive    = 3;
 constexpr int kActionAddVectorLayer = 4;
 
-// Lines added from the UI thread are queued separately because they
-// carry data (the Line struct) that doesn't fit in the int-tagged action
-// queue. Drained on the GL thread alongside the layer-action queue.
-std::mutex        g_pendingLineMutex;
-std::vector<Line> g_pendingLines;
+// Shapes added from the UI thread are queued separately because they
+// carry per-shape data that doesn't fit in the int-tagged action queue.
+// Drained on the GL thread alongside the layer-action queue. One mutex
+// covers all four queues — adds are infrequent and the lock is brief.
+std::mutex           g_pendingShapesMutex;
+std::vector<Line>    g_pendingLines;
+std::vector<Rect>    g_pendingRects;
+std::vector<Ellipse> g_pendingEllipses;
+std::vector<Circle>  g_pendingCircles;
+
+// Current selection — at most one shape on a vector layer. Mutated from
+// the UI thread (tap to select) and read from the GL thread (highlight
+// on composite, transforms during drag). Mutex-protected.
+enum class ShapeKind : int {
+    None = 0,
+    Line = 1,
+    Rect = 2,
+    Ellipse = 3,
+    Circle = 4,
+};
+
+struct Selection {
+    ShapeKind kind     = ShapeKind::None;
+    size_t    layerIdx = 0;
+    size_t    shapeIdx = 0;
+};
+
+std::mutex g_selectionMutex;
+Selection  g_selection;
+
+// Active drag interaction state (for SELECT-tool gestures). Only valid
+// when g_selection.kind != None and an interaction is in progress.
+// Mutex-protected by g_selectionMutex.
+enum class DragMode : int {
+    None = 0,
+    Move = 1,
+    Scale = 2,
+    Rotate = 3,
+};
+struct DragState {
+    DragMode mode = DragMode::None;
+    int      handleIdx = 0;          // for Scale: 0..3 (or 0..1 for Line)
+    // Scale: world-space anchor (opposite handle) and initial OBB
+    // rotation, snapshotted at drag start so subsequent moves don't
+    // accumulate float drift.
+    float    anchorX = 0.0f, anchorY = 0.0f;
+    float    initialRotation = 0.0f;
+    // Rotate: shape center (fixed), initial pen-to-center angle, and the
+    // shape's initial rotation. Also a snapshot of the initial Line
+    // endpoints (for rotating Lines, which have no rotation field).
+    float    centerX = 0.0f, centerY = 0.0f;
+    float    initialPenAngle = 0.0f;
+    Line     initialLine{};
+    // Move: offset from pen to shape center, captured at drag start.
+    // The shape's center tracks (pen − offset) so the user's grab-point
+    // follows the pen. Snap is applied to the would-be center.
+    float    moveOffsetX = 0.0f, moveOffsetY = 0.0f;
+    // Snap indicator state, set by transforms when a snap is engaged.
+    // Read by compositeAllLayers to draw an amber marker.
+    bool     snapActive = false;
+    float    snapX = 0.0f, snapY = 0.0f;
+};
+DragState g_drag;
 
 constexpr float kDefaultLineWidth = 2.0f;
 
@@ -566,9 +662,15 @@ struct DabEmitter {
 
 DabEmitter g_liveEmitter;
 
-// Forward declarations; defined down with the persistence helpers.
+// Forward declarations; defined down with the persistence and composite
+// helpers.
 void saveVectorLayer(size_t layerIdx, const Layer& layer);
 void loadVectorLayerShapes(Layer& layer, const std::string& dir);
+void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
+                                 jfloatArray transform);
+void compositeRasterLayer(const Layer& layer);
+void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
+                          jint width, jint height, jfloatArray transform);
 
 // ---- Pending layer actions ------------------------------------------------
 
@@ -614,8 +716,11 @@ void applyPendingLayerActions() {
                 if (kv.second.texture) glDeleteTextures(1, &kv.second.texture);
             }
             layer.tiles.clear();
-            // Drop vector shapes too.
+            // Drop all vector shapes too.
             layer.lines.clear();
+            layer.rects.clear();
+            layer.ellipses.clear();
+            layer.circles.clear();
             // Wipe the on-disk copy so the cleared state persists.
             if (!g_docDir.empty()) {
                 std::string layerDir = g_docDir + "/layer_"
@@ -849,9 +954,11 @@ void ensureViewFbo(ViewFbo& v, int width, int height) {
     v.height = height;
 }
 
-// Composite the layers in [startIdx, endExclusive) into target FBO. If
-// clearWhite is true, the FBO is first cleared to opaque paper-white;
-// otherwise to transparent. Result is premultiplied either way.
+// Composite the layers in [startIdx, endExclusive) into target FBO,
+// dispatching by layer type so both raster tiles and vector shapes get
+// rendered. If clearWhite is true the FBO is first cleared to opaque
+// paper-white; otherwise to transparent. Result is premultiplied either
+// way. Blends with GL_ONE / GL_ONE_MINUS_SRC_ALPHA throughout.
 void renderLayerRangeIntoFbo(JNIEnv* env, ViewFbo& target,
                              size_t startIdx, size_t endExclusive,
                              int width, int height, jfloatArray transform,
@@ -868,25 +975,19 @@ void renderLayerRangeIntoFbo(JNIEnv* env, ViewFbo& target,
 
     if (startIdx >= endExclusive) return;
 
+    glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(g_comp.program);
-    glBindVertexArray(g_quadVao);
-    uploadMat4(env, g_comp.uTransform, transform);
-    glUniform2f(g_comp.uScreen, (float)width, (float)height);
-    glUniform1f(g_comp.uTileHalf, kTileHalfF);
-    glUniform1i(g_comp.uTileTex, 0);
-    glActiveTexture(GL_TEXTURE0);
+    bindRasterCompositePipeline(env, width, height, transform);
 
     for (size_t i = startIdx; i < endExclusive && i < g_layers.size(); ++i) {
         if (!g_layers[i]) continue;
-        for (const auto& kv : g_layers[i]->tiles) {
-            int tx, ty;
-            unpackTileKey(kv.first, tx, ty);
-            float cx = tx * kTileSizeF + kTileHalfF;
-            float cy = ty * kTileSizeF + kTileHalfF;
-            glBindTexture(GL_TEXTURE_2D, kv.second.texture);
-            glUniform2f(g_comp.uTileCenter, cx, cy);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        if (g_layers[i]->type == LayerType::Raster) {
+            compositeRasterLayer(*g_layers[i]);
+        } else { // Vector
+            compositeVectorLayer(env, *g_layers[i], i, width, height, transform);
+            // compositeVectorLayer leaves the line program bound; restore
+            // the raster pipeline for the next iteration.
+            bindRasterCompositePipeline(env, width, height, transform);
         }
     }
 
@@ -1081,8 +1182,27 @@ void ensureLoaded() {
 // layer as Vector vs Raster, so we always write at least the header
 // (4-byte magic + 4-byte shape count) — even for an empty vector layer.
 
-constexpr uint32_t kShapesMagic = 0x30434556u;   // "VEC0" little-endian
-constexpr uint8_t  kShapeTypeLine = 1;
+constexpr uint32_t kShapesMagicV0   = 0x30434556u;   // "VEC0" — pre-rotation
+constexpr uint32_t kShapesMagicV1   = 0x31434556u;   // "VEC1" — Rect/Ellipse have rotation
+constexpr uint8_t  kShapeTypeLine    = 1;
+constexpr uint8_t  kShapeTypeRect    = 2;
+constexpr uint8_t  kShapeTypeEllipse = 3;
+constexpr uint8_t  kShapeTypeCircle  = 4;
+
+// Pre-rotation struct layouts, used only for migrating V0 files. Keep
+// these byte-for-byte identical to what V0 was writing.
+struct RectV0 {
+    float    x0, y0;
+    float    x1, y1;
+    uint32_t color;
+    float    width;
+};
+struct EllipseV0 {
+    float    cx, cy;
+    float    rx, ry;
+    uint32_t color;
+    float    width;
+};
 
 void saveVectorLayer(size_t layerIdx, const Layer& layer) {
     if (g_docDir.empty()) return;
@@ -1101,14 +1221,23 @@ void saveVectorLayer(size_t layerIdx, const Layer& layer) {
         LOGE("save vector layer %zu: fopen failed", layerIdx);
         return;
     }
-    uint32_t magic = kShapesMagic;
-    uint32_t count = static_cast<uint32_t>(layer.lines.size());
+    uint32_t magic = kShapesMagicV1;
+    uint32_t count = static_cast<uint32_t>(
+        layer.lines.size() + layer.rects.size()
+        + layer.ellipses.size() + layer.circles.size());
     fwrite(&magic, sizeof(magic), 1, f);
     fwrite(&count, sizeof(count), 1, f);
     for (const auto& l : layer.lines) {
-        uint8_t type = kShapeTypeLine;
-        fwrite(&type, sizeof(type), 1, f);
-        fwrite(&l, sizeof(Line), 1, f);
+        uint8_t t = kShapeTypeLine;    fwrite(&t, 1, 1, f); fwrite(&l, sizeof(Line),    1, f);
+    }
+    for (const auto& r : layer.rects) {
+        uint8_t t = kShapeTypeRect;    fwrite(&t, 1, 1, f); fwrite(&r, sizeof(Rect),    1, f);
+    }
+    for (const auto& e : layer.ellipses) {
+        uint8_t t = kShapeTypeEllipse; fwrite(&t, 1, 1, f); fwrite(&e, sizeof(Ellipse), 1, f);
+    }
+    for (const auto& c : layer.circles) {
+        uint8_t t = kShapeTypeCircle;  fwrite(&t, 1, 1, f); fwrite(&c, sizeof(Circle),  1, f);
     }
     fclose(f);
     if (rename(tmpPath.c_str(), path.c_str()) != 0) {
@@ -1122,56 +1251,85 @@ void loadVectorLayerShapes(Layer& layer, const std::string& dir) {
     if (!f) return;
 
     uint32_t magic = 0, count = 0;
-    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != kShapesMagic) {
-        LOGE("vector layer at %s: bad magic", dir.c_str());
+    if (fread(&magic, sizeof(magic), 1, f) != 1
+        || (magic != kShapesMagicV0 && magic != kShapesMagicV1)) {
+        LOGE("vector layer at %s: bad magic 0x%x", dir.c_str(), magic);
         fclose(f);
         return;
     }
+    bool migrate = (magic == kShapesMagicV0);
     if (fread(&count, sizeof(count), 1, f) != 1) {
         fclose(f);
         return;
     }
-    layer.lines.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         uint8_t type = 0;
         if (fread(&type, sizeof(type), 1, f) != 1) break;
         if (type == kShapeTypeLine) {
-            Line l;
-            if (fread(&l, sizeof(Line), 1, f) != 1) break;
-            layer.lines.push_back(l);
+            Line l;    if (fread(&l, sizeof(Line),    1, f) != 1) break; layer.lines.push_back(l);
+        } else if (type == kShapeTypeRect) {
+            if (migrate) {
+                RectV0 v0; if (fread(&v0, sizeof(RectV0), 1, f) != 1) break;
+                Rect r{ v0.x0, v0.y0, v0.x1, v0.y1, /*rotation*/ 0.0f, v0.color, v0.width };
+                layer.rects.push_back(r);
+            } else {
+                Rect r;    if (fread(&r, sizeof(Rect),    1, f) != 1) break; layer.rects.push_back(r);
+            }
+        } else if (type == kShapeTypeEllipse) {
+            if (migrate) {
+                EllipseV0 v0; if (fread(&v0, sizeof(EllipseV0), 1, f) != 1) break;
+                Ellipse e{ v0.cx, v0.cy, v0.rx, v0.ry, /*rotation*/ 0.0f, v0.color, v0.width };
+                layer.ellipses.push_back(e);
+            } else {
+                Ellipse e; if (fread(&e, sizeof(Ellipse), 1, f) != 1) break; layer.ellipses.push_back(e);
+            }
+        } else if (type == kShapeTypeCircle) {
+            Circle c;  if (fread(&c, sizeof(Circle),  1, f) != 1) break; layer.circles.push_back(c);
         } else {
-            // Unknown shape type — bail rather than mis-parse downstream.
             LOGE("vector layer at %s: unknown shape type %d", dir.c_str(), type);
             break;
         }
     }
     fclose(f);
-    LOGI("loaded %zu shapes from %s", layer.lines.size(), dir.c_str());
+    // After migrating, rewrite in V1 format so subsequent loads are clean.
+    // Caller will trigger save naturally on next stroke; but write here too.
+    // (No-op for V1 files since we'd just overwrite identical content.)
+    LOGI("loaded %zu lines + %zu rects + %zu ellipses + %zu circles from %s",
+         layer.lines.size(), layer.rects.size(),
+         layer.ellipses.size(), layer.circles.size(), dir.c_str());
 }
 
-// ---- Pending vector-layer line additions ---------------------------------
+// ---- Pending vector-layer shape additions --------------------------------
 
-void applyPendingLines() {
-    std::vector<Line> lines;
+void applyPendingShapes() {
+    std::vector<Line>    lines;
+    std::vector<Rect>    rects;
+    std::vector<Ellipse> ellipses;
+    std::vector<Circle>  circles;
     {
-        std::lock_guard<std::mutex> lock(g_pendingLineMutex);
+        std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
         lines.swap(g_pendingLines);
+        rects.swap(g_pendingRects);
+        ellipses.swap(g_pendingEllipses);
+        circles.swap(g_pendingCircles);
     }
-    if (lines.empty()) return;
+    if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty())
+        return;
 
-    // Lines append to whichever layer is active when applied. If the
-    // active layer isn't vector, drop them (the line tool shouldn't have
-    // committed in the first place; user UI can prevent this).
+    // Shapes append to whichever layer is active when applied. If the
+    // active layer isn't vector, drop them (the shape tools shouldn't
+    // have committed in the first place; UI can prevent this).
     if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return;
     Layer& layer = *g_layers[g_activeLayer];
     if (layer.type != LayerType::Vector) {
-        LOGE("dropping %zu queued lines: active layer %zu is not vector",
-             lines.size(), g_activeLayer);
+        LOGE("dropping queued shapes: active layer %zu is not vector",
+             g_activeLayer);
         return;
     }
-    for (const Line& l : lines) {
-        layer.lines.push_back(l);
-    }
+    for (const auto& s : lines)    layer.lines.push_back(s);
+    for (const auto& s : rects)    layer.rects.push_back(s);
+    for (const auto& s : ellipses) layer.ellipses.push_back(s);
+    for (const auto& s : circles)  layer.circles.push_back(s);
     saveVectorLayer(g_activeLayer, layer);
 }
 
@@ -1327,24 +1485,487 @@ void compositeRasterLayer(const Layer& layer) {
     }
 }
 
-void compositeVectorLayer(JNIEnv* env, const Layer& layer,
+// Draws one line segment using the line program (caller has already
+// bound the program, VAO, and set uTransform / uScreen).
+void drawLineSegment(float x0, float y0, float x1, float y1,
+                     uint32_t rgb, float width, float alpha) {
+    glUniform2f(g_lineProg.uP0, x0, y0);
+    glUniform2f(g_lineProg.uP1, x1, y1);
+    glUniform1f(g_lineProg.uHalfWidth, width * 0.5f);
+    float r = ((rgb >> 16) & 0xFFu) / 255.0f;
+    float g = ((rgb >>  8) & 0xFFu) / 255.0f;
+    float b = ( rgb        & 0xFFu) / 255.0f;
+    float c[4] = { r, g, b, alpha };
+    glUniform4fv(g_lineProg.uColor, 1, c);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+constexpr uint32_t kHandleColor       = 0x4080FFu;   // blue
+constexpr float    kHandleSize        = 14.0f;       // doc-pixel side length
+constexpr float    kHandleHitRadius   = 18.0f;       // tap tolerance for handles
+constexpr float    kRotateHandleOffset = 28.0f;      // distance above OBB top
+constexpr float    kSelectionOutlineWidth = 1.5f;
+
+// Oriented bounding box for a shape, in doc-pixel space. Defined before
+// the handle-rendering helpers (which take it by reference) and before
+// hit-testing helpers; the obbFor* dispatchers are defined alongside.
+struct Obb {
+    float cx, cy;     // center
+    float hw, hh;     // half-extents (in shape-local frame)
+    float rotation;   // radians
+};
+
+inline void rotateLocalToWorld(const Obb& o, float lx, float ly,
+                               float& wx, float& wy) {
+    float c = std::cos(o.rotation), s = std::sin(o.rotation);
+    wx = o.cx + lx * c - ly * s;
+    wy = o.cy + lx * s + ly * c;
+}
+
+inline void rotateWorldToLocal(const Obb& o, float wx, float wy,
+                               float& lx, float& ly) {
+    float c = std::cos(-o.rotation), s = std::sin(-o.rotation);
+    float dx = wx - o.cx, dy = wy - o.cy;
+    lx = dx * c - dy * s;
+    ly = dx * s + dy * c;
+}
+
+Obb obbForLine(const Line& l) {
+    float cx = (l.x0 + l.x1) * 0.5f;
+    float cy = (l.y0 + l.y1) * 0.5f;
+    float dx = l.x1 - l.x0;
+    float dy = l.y1 - l.y0;
+    float len = std::sqrt(dx*dx + dy*dy);
+    float angle = (len > 1e-6f) ? std::atan2(dy, dx) : 0.0f;
+    float hh = std::max(l.width * 0.5f, 6.0f);
+    return { cx, cy, len * 0.5f, hh, angle };
+}
+
+Obb obbForRect(const Rect& r) {
+    float cx = (r.x0 + r.x1) * 0.5f;
+    float cy = (r.y0 + r.y1) * 0.5f;
+    float hw = std::fabs(r.x1 - r.x0) * 0.5f;
+    float hh = std::fabs(r.y1 - r.y0) * 0.5f;
+    return { cx, cy, hw, hh, r.rotation };
+}
+
+Obb obbForEllipse(const Ellipse& e) {
+    return { e.cx, e.cy, e.rx, e.ry, e.rotation };
+}
+
+Obb obbForCircle(const Circle& c) {
+    return { c.cx, c.cy, c.radius, c.radius, 0.0f };
+}
+
+bool obbForSelection(const Selection& sel, Obb& out) {
+    if (sel.kind == ShapeKind::None) return false;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return false;
+    const Layer& layer = *g_layers[sel.layerIdx];
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx < layer.lines.size())   { out = obbForLine(layer.lines[sel.shapeIdx]);   return true; }
+            break;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx < layer.rects.size())   { out = obbForRect(layer.rects[sel.shapeIdx]);   return true; }
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx < layer.ellipses.size()){ out = obbForEllipse(layer.ellipses[sel.shapeIdx]); return true; }
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx < layer.circles.size()) { out = obbForCircle(layer.circles[sel.shapeIdx]); return true; }
+            break;
+        case ShapeKind::None:
+            break;
+    }
+    return false;
+}
+
+// ---- Snapping ------------------------------------------------------------
+
+// Visit every snap-target point in every vector layer with the given
+// callback. Each shape contributes its natural anchor points:
+//   Line:    p0, p1, midpoint
+//   Rect:    4 (rotated) corners + center
+//   Ellipse: center + 4 cardinal points (rotated)
+//   Circle:  center + 4 cardinal points
+//
+// `exclude`, if non-null, skips that exact (layer, kind, shapeIdx) so a
+// shape can't snap to its own vertices during a transform drag.
+template <typename F>
+void forEachShapeSnapTarget(const F& cb, const Selection* exclude = nullptr) {
+    for (size_t li = 0; li < g_layers.size(); ++li) {
+        const auto& layer = g_layers[li];
+        if (!layer || layer->type != LayerType::Vector) continue;
+        auto skip = [&](ShapeKind k, size_t i) {
+            return exclude && exclude->kind == k
+                && exclude->layerIdx == li && exclude->shapeIdx == i;
+        };
+        for (size_t i = 0; i < layer->lines.size(); ++i) {
+            if (skip(ShapeKind::Line, i)) continue;
+            const auto& l = layer->lines[i];
+            cb(l.x0, l.y0);
+            cb(l.x1, l.y1);
+            cb((l.x0 + l.x1) * 0.5f, (l.y0 + l.y1) * 0.5f);
+        }
+        for (size_t i = 0; i < layer->rects.size(); ++i) {
+            if (skip(ShapeKind::Rect, i)) continue;
+            Obb o = obbForRect(layer->rects[i]);
+            float cx, cy;
+            // Corners.
+            rotateLocalToWorld(o, -o.hw, -o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, +o.hw, -o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, +o.hw, +o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, -o.hw, +o.hh, cx, cy); cb(cx, cy);
+            // Edge midpoints (rotated).
+            rotateLocalToWorld(o, 0,     -o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, +o.hw, 0,     cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, 0,     +o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, -o.hw, 0,     cx, cy); cb(cx, cy);
+            cb(o.cx, o.cy);
+        }
+        for (size_t i = 0; i < layer->ellipses.size(); ++i) {
+            if (skip(ShapeKind::Ellipse, i)) continue;
+            Obb o = obbForEllipse(layer->ellipses[i]);
+            cb(o.cx, o.cy);
+            float cx, cy;
+            rotateLocalToWorld(o, +o.hw, 0,      cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, -o.hw, 0,      cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, 0,     +o.hh,  cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, 0,     -o.hh,  cx, cy); cb(cx, cy);
+        }
+        for (size_t i = 0; i < layer->circles.size(); ++i) {
+            if (skip(ShapeKind::Circle, i)) continue;
+            const auto& c = layer->circles[i];
+            cb(c.cx, c.cy);
+            cb(c.cx + c.radius, c.cy);
+            cb(c.cx - c.radius, c.cy);
+            cb(c.cx, c.cy + c.radius);
+            cb(c.cx, c.cy - c.radius);
+        }
+    }
+}
+
+// Returns the nearest snap target to (x, y) within kSnapRadius. Falls
+// back to the nearest grid intersection when the grid is on and no shape
+// target qualifies.
+struct SnapHit { float x, y; bool found; };
+
+SnapHit findSnap(float x, float y, const Selection* exclude = nullptr) {
+    if (g_snapEnabled.load() == 0) return { x, y, false };
+
+    SnapHit best = { x, y, false };
+    float bestDist2 = kSnapRadius * kSnapRadius;
+
+    forEachShapeSnapTarget([&](float tx, float ty) {
+        float dx = tx - x, dy = ty - y;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < bestDist2) {
+            bestDist2 = d2;
+            best = { tx, ty, true };
+        }
+    }, exclude);
+
+    if (!best.found && g_gridEnabled.load() != 0) {
+        float gx = std::round(x / kGridSpacing) * kGridSpacing;
+        float gy = std::round(y / kGridSpacing) * kGridSpacing;
+        float dx = gx - x, dy = gy - y;
+        if (dx * dx + dy * dy < kSnapRadius * kSnapRadius) {
+            best = { gx, gy, true };
+        }
+    }
+    return best;
+}
+
+// Forward decl; defined below in the shape-rendering helpers section.
+void drawEllipseAsLines(float cx, float cy, float rx, float ry, float rotation,
+                        uint32_t rgb, float width, float alpha);
+
+// Draw a small ring + crosshair at (x, y) — the visual indicator for an
+// active snap. Caller has already bound the line program.
+void drawSnapMarker(float x, float y) {
+    drawEllipseAsLines(x, y, kSnapMarkerR, kSnapMarkerR, /*rotation*/ 0.0f,
+                       kSnapMarkerColor, 1.5f, 1.0f);
+    float h = kSnapMarkerR;
+    drawLineSegment(x - h, y, x + h, y, kSnapMarkerColor, 1.5f, 1.0f);
+    drawLineSegment(x, y - h, x, y + h, kSnapMarkerColor, 1.5f, 1.0f);
+}
+
+// Draw a small square handle (4 line segments) centered at (x, y).
+void drawHandle(float x, float y, float size, uint32_t color) {
+    float h = size * 0.5f;
+    drawLineSegment(x - h, y - h, x + h, y - h, color, 1.5f, 1.0f);
+    drawLineSegment(x + h, y - h, x + h, y + h, color, 1.5f, 1.0f);
+    drawLineSegment(x + h, y + h, x - h, y + h, color, 1.5f, 1.0f);
+    drawLineSegment(x - h, y + h, x - h, y - h, color, 1.5f, 1.0f);
+}
+
+// Compute the world position of one of the four scale handles. handleIdx:
+// 0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left.
+// For a Line (kind==Line) we emit only handles 0 (left endpoint) and 1
+// (right endpoint), at the midpoints of the OBB's left/right sides.
+void scaleHandlePosition(const Obb& o, ShapeKind kind, int handleIdx,
+                         float& outX, float& outY) {
+    float lx = 0.0f, ly = 0.0f;
+    if (kind == ShapeKind::Line) {
+        lx = (handleIdx == 0) ? -o.hw : +o.hw;
+        ly = 0.0f;
+    } else {
+        lx = (handleIdx == 0 || handleIdx == 3) ? -o.hw : +o.hw;
+        ly = (handleIdx == 0 || handleIdx == 1) ? -o.hh : +o.hh;
+    }
+    rotateLocalToWorld(o, lx, ly, outX, outY);
+}
+
+// Rotate handle is offset above the OBB top-center.
+void rotateHandlePosition(const Obb& o, float& outX, float& outY) {
+    rotateLocalToWorld(o, 0.0f, -o.hh - kRotateHandleOffset, outX, outY);
+}
+
+// Number of scale handles for the shape (2 for Line, 4 for others).
+int scaleHandleCount(ShapeKind kind) {
+    return (kind == ShapeKind::Line) ? 2 : 4;
+}
+
+// Renders the OBB outline + scale handles + rotate handle for the given
+// selection. Caller must already have the line program / VAO bound.
+void renderSelectionOverlay(const Selection& sel) {
+    Obb obb;
+    if (!obbForSelection(sel, obb)) return;
+
+    // OBB outline — 4 corners of the box (rotated).
+    float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
+    rotateLocalToWorld(obb, -obb.hw, -obb.hh, c0x, c0y);
+    rotateLocalToWorld(obb, +obb.hw, -obb.hh, c1x, c1y);
+    rotateLocalToWorld(obb, +obb.hw, +obb.hh, c2x, c2y);
+    rotateLocalToWorld(obb, -obb.hw, +obb.hh, c3x, c3y);
+    drawLineSegment(c0x, c0y, c1x, c1y, kHandleColor, kSelectionOutlineWidth, 1.0f);
+    drawLineSegment(c1x, c1y, c2x, c2y, kHandleColor, kSelectionOutlineWidth, 1.0f);
+    drawLineSegment(c2x, c2y, c3x, c3y, kHandleColor, kSelectionOutlineWidth, 1.0f);
+    drawLineSegment(c3x, c3y, c0x, c0y, kHandleColor, kSelectionOutlineWidth, 1.0f);
+
+    // Scale handles.
+    int n = scaleHandleCount(sel.kind);
+    for (int i = 0; i < n; ++i) {
+        float hx, hy;
+        scaleHandlePosition(obb, sel.kind, i, hx, hy);
+        drawHandle(hx, hy, kHandleSize, kHandleColor);
+    }
+
+    // Rotate handle (skip for circles — rotation is invariant).
+    if (sel.kind != ShapeKind::Circle) {
+        float anchorX, anchorY;
+        rotateLocalToWorld(obb, 0.0f, -obb.hh, anchorX, anchorY);
+        float rhX, rhY;
+        rotateHandlePosition(obb, rhX, rhY);
+        drawLineSegment(anchorX, anchorY, rhX, rhY,
+                        kHandleColor, kSelectionOutlineWidth, 1.0f);
+        drawHandle(rhX, rhY, kHandleSize, kHandleColor);
+    }
+}
+
+// Helper: rotate (lx, ly) around (cx, cy) by `rotation` radians.
+inline void rotateAround(float cx, float cy, float lx, float ly, float rotation,
+                         float& outX, float& outY) {
+    float c = std::cos(rotation), s = std::sin(rotation);
+    float dx = lx - cx, dy = ly - cy;
+    outX = cx + dx * c - dy * s;
+    outY = cy + dx * s + dy * c;
+}
+
+void drawRectangleAsLines(float x0, float y0, float x1, float y1, float rotation,
+                          uint32_t rgb, float width, float alpha) {
+    float cx = (x0 + x1) * 0.5f;
+    float cy = (y0 + y1) * 0.5f;
+    float ax, ay, bx, by, cx_, cy_, dx, dy;
+    rotateAround(cx, cy, x0, y0, rotation, ax, ay);
+    rotateAround(cx, cy, x1, y0, rotation, bx, by);
+    rotateAround(cx, cy, x1, y1, rotation, cx_, cy_);
+    rotateAround(cx, cy, x0, y1, rotation, dx, dy);
+    drawLineSegment(ax, ay, bx, by, rgb, width, alpha);
+    drawLineSegment(bx, by, cx_, cy_, rgb, width, alpha);
+    drawLineSegment(cx_, cy_, dx, dy, rgb, width, alpha);
+    drawLineSegment(dx, dy, ax, ay, rgb, width, alpha);
+}
+
+void drawEllipseAsLines(float cx, float cy, float rx, float ry, float rotation,
+                        uint32_t rgb, float width, float alpha) {
+    constexpr int   kSegments = 32;
+    constexpr float kTau      = 6.283185307179586f;
+    float c = std::cos(rotation), s = std::sin(rotation);
+    auto pointAt = [&](float a, float& x, float& y) {
+        float lx = std::cos(a) * rx;
+        float ly = std::sin(a) * ry;
+        x = cx + lx * c - ly * s;
+        y = cy + lx * s + ly * c;
+    };
+    float prevX, prevY;
+    pointAt(0.0f, prevX, prevY);
+    for (int i = 1; i <= kSegments; ++i) {
+        float a = (float)i / (float)kSegments * kTau;
+        float x, y;
+        pointAt(a, x, y);
+        drawLineSegment(prevX, prevY, x, y, rgb, width, alpha);
+        prevX = x;
+        prevY = y;
+    }
+}
+
+// ---- Selection helpers ---------------------------------------------------
+
+constexpr float kSelectionHaloPad = 3.0f;            // extra half-width
+constexpr uint32_t kSelectionHaloColor = 0xFF8030u;  // orange
+constexpr float kSelectionHaloAlpha = 0.55f;
+constexpr float kHitThresholdPad = 6.0f;             // tap tolerance, doc px
+
+inline bool isShapeSelected(const Selection& sel, size_t layerIdx,
+                            ShapeKind kind, size_t shapeIdx) {
+    return sel.kind == kind && sel.layerIdx == layerIdx
+        && sel.shapeIdx == shapeIdx;
+}
+
+float distToSegment(float px, float py,
+                    float ax, float ay, float bx, float by) {
+    float abx = bx - ax, aby = by - ay;
+    float apx = px - ax, apy = py - ay;
+    float ab2 = abx*abx + aby*aby;
+    float t = (ab2 > 1e-6f) ? (apx*abx + apy*aby) / ab2 : 0.0f;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    float cx = ax + abx * t, cy = ay + aby * t;
+    float dx = px - cx, dy = py - cy;
+    return std::sqrt(dx*dx + dy*dy);
+}
+
+float distToRectOutline(float px, float py,
+                        float x0, float y0, float x1, float y1) {
+    float d1 = distToSegment(px, py, x0, y0, x1, y0);
+    float d2 = distToSegment(px, py, x1, y0, x1, y1);
+    float d3 = distToSegment(px, py, x1, y1, x0, y1);
+    float d4 = distToSegment(px, py, x0, y1, x0, y0);
+    return std::min(std::min(d1, d2), std::min(d3, d4));
+}
+
+float distToCircleOutline(float px, float py,
+                          float cx, float cy, float r) {
+    float dx = px - cx, dy = py - cy;
+    return std::fabs(std::sqrt(dx*dx + dy*dy) - r);
+}
+
+// Approximate distance from point to ellipse outline. Scales to a unit
+// circle, computes distance there, then scales back by the average
+// radius. Good enough for tap-to-select.
+float distToEllipseOutline(float px, float py,
+                           float cx, float cy, float rx, float ry) {
+    if (rx < 1e-3f || ry < 1e-3f) return 1e9f;
+    float dx = (px - cx) / rx, dy = (py - cy) / ry;
+    float lenScaled = std::sqrt(dx*dx + dy*dy);
+    float avg = (rx + ry) * 0.5f;
+    return std::fabs(lenScaled - 1.0f) * avg;
+}
+
+// Hit-test the active layer at (x, y); on hit, set g_selection. Returns
+// true if a shape was selected, false if no shape was hit (and clears
+// any prior selection). Searches in render order so the topmost shape
+// wins on overlap.
+bool hitTestActiveVectorLayer(float x, float y) {
+    if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return false;
+    Layer& layer = *g_layers[g_activeLayer];
+    if (layer.type != LayerType::Vector) return false;
+
+    ShapeKind hitKind = ShapeKind::None;
+    size_t    hitIdx  = 0;
+
+    for (size_t i = 0; i < layer.lines.size(); ++i) {
+        const auto& l = layer.lines[i];
+        float thr = l.width * 0.5f + kHitThresholdPad;
+        if (distToSegment(x, y, l.x0, l.y0, l.x1, l.y1) <= thr) {
+            hitKind = ShapeKind::Line; hitIdx = i;
+        }
+    }
+    for (size_t i = 0; i < layer.rects.size(); ++i) {
+        const auto& r = layer.rects[i];
+        float thr = r.width * 0.5f + kHitThresholdPad;
+        if (distToRectOutline(x, y, r.x0, r.y0, r.x1, r.y1) <= thr) {
+            hitKind = ShapeKind::Rect; hitIdx = i;
+        }
+    }
+    for (size_t i = 0; i < layer.ellipses.size(); ++i) {
+        const auto& e = layer.ellipses[i];
+        float thr = e.width * 0.5f + kHitThresholdPad;
+        if (distToEllipseOutline(x, y, e.cx, e.cy, e.rx, e.ry) <= thr) {
+            hitKind = ShapeKind::Ellipse; hitIdx = i;
+        }
+    }
+    for (size_t i = 0; i < layer.circles.size(); ++i) {
+        const auto& c = layer.circles[i];
+        float thr = c.width * 0.5f + kHitThresholdPad;
+        if (distToCircleOutline(x, y, c.cx, c.cy, c.radius) <= thr) {
+            hitKind = ShapeKind::Circle; hitIdx = i;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    if (hitKind == ShapeKind::None) {
+        g_selection = Selection{};
+        return false;
+    }
+    g_selection.kind     = hitKind;
+    g_selection.layerIdx = g_activeLayer;
+    g_selection.shapeIdx = hitIdx;
+    return true;
+}
+
+void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
                           jint width, jint height, jfloatArray transform) {
-    if (layer.lines.empty()) return;
+    if (layer.lines.empty() && layer.rects.empty()
+        && layer.ellipses.empty() && layer.circles.empty()) return;
+
+    // Snapshot selection for this composite pass.
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+    }
+
     glUseProgram(g_lineProg.program);
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_lineProg.uTransform, transform);
     glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
 
-    for (const auto& l : layer.lines) {
-        glUniform2f(g_lineProg.uP0, l.x0, l.y0);
-        glUniform2f(g_lineProg.uP1, l.x1, l.y1);
-        glUniform1f(g_lineProg.uHalfWidth, l.width * 0.5f);
-        float r = ((l.color >> 16) & 0xFFu) / 255.0f;
-        float g = ((l.color >>  8) & 0xFFu) / 255.0f;
-        float b = ( l.color        & 0xFFu) / 255.0f;
-        float c[4] = { r, g, b, 1.0f };
-        glUniform4fv(g_lineProg.uColor, 1, c);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    for (size_t i = 0; i < layer.lines.size(); ++i) {
+        const auto& l = layer.lines[i];
+        if (isShapeSelected(sel, layerIdx, ShapeKind::Line, i)) {
+            drawLineSegment(l.x0, l.y0, l.x1, l.y1,
+                            kSelectionHaloColor, l.width + kSelectionHaloPad * 2.0f,
+                            kSelectionHaloAlpha);
+        }
+        drawLineSegment(l.x0, l.y0, l.x1, l.y1, l.color, l.width, 1.0f);
+    }
+    for (size_t i = 0; i < layer.rects.size(); ++i) {
+        const auto& r = layer.rects[i];
+        if (isShapeSelected(sel, layerIdx, ShapeKind::Rect, i)) {
+            drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation,
+                                 kSelectionHaloColor, r.width + kSelectionHaloPad * 2.0f,
+                                 kSelectionHaloAlpha);
+        }
+        drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation, r.color, r.width, 1.0f);
+    }
+    for (size_t i = 0; i < layer.ellipses.size(); ++i) {
+        const auto& e = layer.ellipses[i];
+        if (isShapeSelected(sel, layerIdx, ShapeKind::Ellipse, i)) {
+            drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation,
+                               kSelectionHaloColor, e.width + kSelectionHaloPad * 2.0f,
+                               kSelectionHaloAlpha);
+        }
+        drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation, e.color, e.width, 1.0f);
+    }
+    for (size_t i = 0; i < layer.circles.size(); ++i) {
+        const auto& c = layer.circles[i];
+        if (isShapeSelected(sel, layerIdx, ShapeKind::Circle, i)) {
+            drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f,
+                               kSelectionHaloColor, c.width + kSelectionHaloPad * 2.0f,
+                               kSelectionHaloAlpha);
+        }
+        drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f, c.color, c.width, 1.0f);
     }
 }
 
@@ -1367,14 +1988,38 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
 
     bindRasterCompositePipeline(env, width, height, transform);
 
-    for (const auto& layer : g_layers) {
+    for (size_t i = 0; i < g_layers.size(); ++i) {
+        const auto& layer = g_layers[i];
         if (!layer) continue;
         if (layer->type == LayerType::Raster) {
             compositeRasterLayer(*layer);
         } else { // Vector
-            compositeVectorLayer(env, *layer, width, height, transform);
+            compositeVectorLayer(env, *layer, i, width, height, transform);
             // Switch back to raster pipeline for the next raster layer.
             bindRasterCompositePipeline(env, width, height, transform);
+        }
+    }
+
+    // Selection overlay (OBB + handles) — drawn on top of everything so
+    // it's visible regardless of which layer the selected shape lives on.
+    Selection sel;
+    bool  snapActive = false;
+    float snapMx = 0.0f, snapMy = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+        snapActive = g_drag.snapActive;
+        snapMx = g_drag.snapX;
+        snapMy = g_drag.snapY;
+    }
+    if (sel.kind != ShapeKind::None) {
+        glUseProgram(g_lineProg.program);
+        glBindVertexArray(g_quadVao);
+        uploadMat4(env, g_lineProg.uTransform, transform);
+        glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+        renderSelectionOverlay(sel);
+        if (snapActive) {
+            drawSnapMarker(snapMx, snapMy);
         }
     }
 
@@ -1382,13 +2027,21 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
     glBindVertexArray(0);
 }
 
-// Renders a single line into the currently-bound framebuffer, used for
-// the live preview during the line tool's drag. Clears the buffer first
-// so successive previews replace rather than accumulate.
-void renderLinePreviewToFront(JNIEnv* env, jint width, jint height,
-                              jfloatArray transform,
-                              float x0, float y0, float x1, float y1,
-                              uint32_t rgb, float lineWidth, float alpha) {
+// Renders a shape preview into the currently-bound framebuffer (the
+// front-buffered layer when called from the framework callback). Clears
+// the buffer first so successive previews replace rather than accumulate.
+//
+// Shape types and their (x0, y0, x1, y1) interpretation:
+//   0  Line:       endpoints
+//   1  Rectangle:  bbox corners (any two opposite corners)
+//   2  Circle:     p0 = center, p1 = point on circle (radius = distance)
+//   3  Ellipse:    bbox corners (oval inscribed in the bbox)
+void renderShapePreviewToFront(JNIEnv* env, jint width, jint height,
+                               jfloatArray transform,
+                               int shapeType,
+                               float x0, float y0, float x1, float y1,
+                               uint32_t rgb, float lineWidth, float alpha,
+                               bool snapped) {
     glViewport(0, 0, width, height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1399,16 +2052,38 @@ void renderLinePreviewToFront(JNIEnv* env, jint width, jint height,
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_lineProg.uTransform, transform);
     glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
-    glUniform2f(g_lineProg.uP0, x0, y0);
-    glUniform2f(g_lineProg.uP1, x1, y1);
-    glUniform1f(g_lineProg.uHalfWidth, lineWidth * 0.5f);
-    float r = ((rgb >> 16) & 0xFFu) / 255.0f;
-    float g = ((rgb >>  8) & 0xFFu) / 255.0f;
-    float b = ( rgb        & 0xFFu) / 255.0f;
-    float c[4] = { r, g, b, alpha };
-    glUniform4fv(g_lineProg.uColor, 1, c);
 
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    switch (shapeType) {
+        case 0:
+            drawLineSegment(x0, y0, x1, y1, rgb, lineWidth, alpha);
+            break;
+        case 1:
+            drawRectangleAsLines(x0, y0, x1, y1, /*rotation*/ 0.0f,
+                                 rgb, lineWidth, alpha);
+            break;
+        case 2: {
+            float dx = x1 - x0;
+            float dy = y1 - y0;
+            float radius = std::sqrt(dx * dx + dy * dy);
+            drawEllipseAsLines(x0, y0, radius, radius, /*rotation*/ 0.0f,
+                               rgb, lineWidth, alpha);
+            break;
+        }
+        case 3: {
+            float cx = (x0 + x1) * 0.5f;
+            float cy = (y0 + y1) * 0.5f;
+            float rx = std::fabs(x1 - x0) * 0.5f;
+            float ry = std::fabs(y1 - y0) * 0.5f;
+            drawEllipseAsLines(cx, cy, rx, ry, /*rotation*/ 0.0f,
+                               rgb, lineWidth, alpha);
+            break;
+        }
+    }
+    // If the dragged endpoint is currently snapped, draw the indicator
+    // at that endpoint so the user can see what they snapped to.
+    if (snapped) {
+        drawSnapMarker(x1, y1);
+    }
     glBindVertexArray(0);
 }
 
@@ -1469,8 +2144,10 @@ Java_com_bk_drawing_NativeRenderer_addVectorLayer(JNIEnv*, jobject) {
     enqueuePendingAction(kActionAddVectorLayer);
 }
 
-// Append a line to the active vector layer. Color (0xRRGGBB) and width
-// default to the brush color and a fixed line width if Kotlin passes 0.
+// Each addXxx packs the user's drag into a shape struct, picks up the
+// current brush color and a default line width, and queues it for the
+// GL thread to apply on the next render.
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_addLine(
         JNIEnv*, jobject,
@@ -1480,27 +2157,599 @@ Java_com_bk_drawing_NativeRenderer_addLine(
     l.x1 = x1; l.y1 = y1;
     l.color = g_currentBrushColor.load();
     l.width = kDefaultLineWidth;
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingLines.push_back(l);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_addRectangle(
+        JNIEnv*, jobject,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    Rect r;
+    r.x0 = x0; r.y0 = y0;
+    r.x1 = x1; r.y1 = y1;
+    r.rotation = 0.0f;
+    r.color = g_currentBrushColor.load();
+    r.width = kDefaultLineWidth;
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingRects.push_back(r);
+}
+
+// Ellipse from bbox: center at midpoint, semi-axes from half-extents.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_addEllipse(
+        JNIEnv*, jobject,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    Ellipse e;
+    e.cx = (x0 + x1) * 0.5f;
+    e.cy = (y0 + y1) * 0.5f;
+    e.rx = std::fabs(x1 - x0) * 0.5f;
+    e.ry = std::fabs(y1 - y0) * 0.5f;
+    e.rotation = 0.0f;
+    e.color = g_currentBrushColor.load();
+    e.width = kDefaultLineWidth;
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingEllipses.push_back(e);
+}
+
+// Circle from center+radius: p0 is the center, p1 is a point on the
+// circle. Radius = distance(p0, p1). Different gesture from ellipse/rect
+// because dragging a circle from its center reads more naturally.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_addCircle(
+        JNIEnv*, jobject,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    Circle c;
+    c.cx = x0;
+    c.cy = y0;
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    c.radius = std::sqrt(dx * dx + dy * dy);
+    c.color = g_currentBrushColor.load();
+    c.width = kDefaultLineWidth;
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingCircles.push_back(c);
+}
+
+// Hit-test the active vector layer at (x, y); on hit, set g_selection
+// and return true. On miss, clear any prior selection and return false.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_selectShapeAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    return hitTestActiveVectorLayer(x, y) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Test if (x, y) hits any of the current selection's handles. Returns:
+//   -2 = rotate handle
+//   0..3 = scale handle (corner index)
+//   -1 = no handle hit
+int hitTestSelectionHandle(float x, float y) {
+    Selection sel;
     {
-        std::lock_guard<std::mutex> lock(g_pendingLineMutex);
-        g_pendingLines.push_back(l);
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+    }
+    if (sel.kind == ShapeKind::None) return -1;
+    Obb obb;
+    if (!obbForSelection(sel, obb)) return -1;
+
+    // Rotate handle (skip for circles).
+    if (sel.kind != ShapeKind::Circle) {
+        float rhX, rhY;
+        rotateHandlePosition(obb, rhX, rhY);
+        float dx = x - rhX, dy = y - rhY;
+        if (dx*dx + dy*dy <= kHandleHitRadius * kHandleHitRadius) {
+            return -2;
+        }
+    }
+
+    // Scale handles.
+    int n = scaleHandleCount(sel.kind);
+    for (int i = 0; i < n; ++i) {
+        float hx, hy;
+        scaleHandlePosition(obb, sel.kind, i, hx, hy);
+        float dx = x - hx, dy = y - hy;
+        if (dx*dx + dy*dy <= kHandleHitRadius * kHandleHitRadius) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool isPointInsideObb(const Obb& o, float x, float y) {
+    float lx, ly;
+    rotateWorldToLocal(o, x, y, lx, ly);
+    return std::fabs(lx) <= o.hw && std::fabs(ly) <= o.hh;
+}
+
+// Begin an interaction at (x, y). Tries handles first, then shape body
+// (re-hit-test if no current selection or tap is outside selected OBB).
+// Returns drag mode: 0=none, 1=move, 2=scale, 3=rotate.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    int handleHit = hitTestSelectionHandle(x, y);
+
+    if (handleHit == -2) {
+        // Rotate handle. Capture initial state.
+        Selection sel;
+        Obb obb;
+        {
+            std::lock_guard<std::mutex> lock(g_selectionMutex);
+            sel = g_selection;
+        }
+        if (!obbForSelection(sel, obb)) return 0;
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.mode = DragMode::Rotate;
+        g_drag.centerX = obb.cx;
+        g_drag.centerY = obb.cy;
+        g_drag.initialPenAngle = std::atan2(y - obb.cy, x - obb.cx);
+        g_drag.initialRotation = obb.rotation;
+        // Lines don't have a rotation field; snapshot initial endpoints
+        // so we can recompute from initial + delta on each update.
+        if (sel.kind == ShapeKind::Line
+            && sel.layerIdx < g_layers.size()
+            && g_layers[sel.layerIdx]
+            && sel.shapeIdx < g_layers[sel.layerIdx]->lines.size()) {
+            g_drag.initialLine = g_layers[sel.layerIdx]->lines[sel.shapeIdx];
+        }
+        return 3;
+    }
+
+    if (handleHit >= 0) {
+        // Scale handle. Anchor = opposite handle's world position.
+        Selection sel;
+        Obb obb;
+        {
+            std::lock_guard<std::mutex> lock(g_selectionMutex);
+            sel = g_selection;
+        }
+        if (!obbForSelection(sel, obb)) return 0;
+        int anchorIdx;
+        if (sel.kind == ShapeKind::Line) {
+            anchorIdx = (handleHit == 0) ? 1 : 0;
+        } else {
+            anchorIdx = (handleHit + 2) % 4;   // diagonally opposite
+        }
+        float ax, ay;
+        scaleHandlePosition(obb, sel.kind, anchorIdx, ax, ay);
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.mode = DragMode::Scale;
+        g_drag.handleIdx = handleHit;
+        g_drag.anchorX = ax;
+        g_drag.anchorY = ay;
+        g_drag.initialRotation = obb.rotation;
+        return 2;
+    }
+
+    // No handle hit. Decide between "move existing selection if tap is
+    // inside its OBB" vs "re-hit-test for a new shape selection".
+    {
+        Selection sel;
+        Obb obb;
+        {
+            std::lock_guard<std::mutex> lock(g_selectionMutex);
+            sel = g_selection;
+        }
+        if (sel.kind != ShapeKind::None
+            && obbForSelection(sel, obb)
+            && isPointInsideObb(obb, x, y)) {
+            std::lock_guard<std::mutex> lock(g_selectionMutex);
+            g_drag.mode = DragMode::Move;
+            g_drag.moveOffsetX = x - obb.cx;
+            g_drag.moveOffsetY = y - obb.cy;
+            return 1;
+        }
+    }
+    if (hitTestActiveVectorLayer(x, y)) {
+        // Recover the new selection's center to capture the move offset.
+        Selection sel;
+        Obb obb;
+        {
+            std::lock_guard<std::mutex> lock(g_selectionMutex);
+            sel = g_selection;
+        }
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.mode = DragMode::Move;
+        if (obbForSelection(sel, obb)) {
+            g_drag.moveOffsetX = x - obb.cx;
+            g_drag.moveOffsetY = y - obb.cy;
+        } else {
+            g_drag.moveOffsetX = 0.0f;
+            g_drag.moveOffsetY = 0.0f;
+        }
+        return 1;
+    }
+    // Empty tap — selection cleared by hitTestActiveVectorLayer.
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    g_drag.mode = DragMode::None;
+    return 0;
+}
+
+// Translate the given selection's shape by (dx, dy). Caller must hold
+// any necessary locks and have validated layer/index. Used by both
+// translateSelection (incremental) and applyMoveTo (snap-aware).
+void translateShape(Layer& layer, const Selection& sel, float dx, float dy) {
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx < layer.lines.size()) {
+                auto& l = layer.lines[sel.shapeIdx];
+                l.x0 += dx; l.y0 += dy;
+                l.x1 += dx; l.y1 += dy;
+            }
+            break;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx < layer.rects.size()) {
+                auto& r = layer.rects[sel.shapeIdx];
+                r.x0 += dx; r.y0 += dy;
+                r.x1 += dx; r.y1 += dy;
+            }
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx < layer.ellipses.size()) {
+                auto& e = layer.ellipses[sel.shapeIdx];
+                e.cx += dx; e.cy += dy;
+            }
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx < layer.circles.size()) {
+                auto& c = layer.circles[sel.shapeIdx];
+                c.cx += dx; c.cy += dy;
+            }
+            break;
+        case ShapeKind::None:
+            break;
     }
 }
 
-// Live preview during line-tool drag: renders into the currently-bound
-// framebuffer (the front-buffered layer when called from the framework
-// callback). Color follows the current brush color.
+// Apply a move interaction: snap-aware absolute drag. Computes the
+// would-be center (penX − captured offset), snaps that against other
+// shapes' targets (excluding self), then translates so the shape's
+// center matches the snapped position.
+void applyMoveTo(float x, float y) {
+    Selection sel;
+    DragState d;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+        d   = g_drag;
+    }
+    if (d.mode != DragMode::Move || sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
+    Layer& layer = *g_layers[sel.layerIdx];
+    if (layer.type != LayerType::Vector) return;
+
+    Obb obb;
+    if (!obbForSelection(sel, obb)) return;
+
+    float targetCx = x - d.moveOffsetX;
+    float targetCy = y - d.moveOffsetY;
+
+    SnapHit snap = findSnap(targetCx, targetCy, &sel);
+    if (snap.found) {
+        targetCx = snap.x;
+        targetCy = snap.y;
+    }
+
+    float dx = targetCx - obb.cx;
+    float dy = targetCy - obb.cy;
+    translateShape(layer, sel, dx, dy);
+
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.snapActive = snap.found;
+        g_drag.snapX = snap.x;
+        g_drag.snapY = snap.y;
+    }
+}
+
+// Apply a scale interaction: drag of handle to (x, y). Anchor (opposite
+// corner) stays fixed in world space. Computes new local extents from
+// the (anchor → pen) vector rotated into shape-local frame.
+void applyScaleTo(float x, float y) {
+    Selection sel;
+    DragState d;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+        d   = g_drag;
+    }
+    if (d.mode != DragMode::Scale || sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
+    Layer& layer = *g_layers[sel.layerIdx];
+
+    // Snap the dragged handle's pen position against other shapes'
+    // targets (excluding self) before recomputing extents.
+    SnapHit snap = findSnap(x, y, &sel);
+    if (snap.found) {
+        x = snap.x;
+        y = snap.y;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.snapActive = snap.found;
+        g_drag.snapX = snap.x;
+        g_drag.snapY = snap.y;
+    }
+
+    // New center is midpoint of anchor and pen in world.
+    float newCx = (d.anchorX + x) * 0.5f;
+    float newCy = (d.anchorY + y) * 0.5f;
+    // Diagonal vector in world, rotated into shape-local frame to recover
+    // (full-)width and -height.
+    float c = std::cos(-d.initialRotation), s = std::sin(-d.initialRotation);
+    float wdx = x - d.anchorX;
+    float wdy = y - d.anchorY;
+    float ldx = wdx * c - wdy * s;
+    float ldy = wdx * s + wdy * c;
+    float newHw = std::fabs(ldx) * 0.5f;
+    float newHh = std::fabs(ldy) * 0.5f;
+    if (newHw < 0.5f) newHw = 0.5f;
+    if (newHh < 0.5f) newHh = 0.5f;
+
+    switch (sel.kind) {
+        case ShapeKind::Rect:
+            if (sel.shapeIdx < layer.rects.size()) {
+                auto& r = layer.rects[sel.shapeIdx];
+                r.x0 = newCx - newHw; r.y0 = newCy - newHh;
+                r.x1 = newCx + newHw; r.y1 = newCy + newHh;
+                // rotation unchanged
+            }
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx < layer.ellipses.size()) {
+                auto& e = layer.ellipses[sel.shapeIdx];
+                e.cx = newCx; e.cy = newCy;
+                e.rx = newHw; e.ry = newHh;
+            }
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx < layer.circles.size()) {
+                auto& cir = layer.circles[sel.shapeIdx];
+                // For a circle, drag any handle = scale uniformly. Use
+                // distance from anchor to pen as the diameter.
+                float dx = x - d.anchorX, dy = y - d.anchorY;
+                float diam = std::sqrt(dx*dx + dy*dy);
+                cir.cx = newCx; cir.cy = newCy;
+                cir.radius = std::max(diam * 0.5f, 0.5f);
+            }
+            break;
+        case ShapeKind::Line:
+            if (sel.shapeIdx < layer.lines.size()) {
+                auto& l = layer.lines[sel.shapeIdx];
+                // For Line, the dragged handle is one endpoint, the
+                // anchor is the other. Just move that endpoint.
+                if (d.handleIdx == 0) {
+                    l.x0 = x; l.y0 = y;
+                } else {
+                    l.x1 = x; l.y1 = y;
+                }
+            }
+            break;
+        case ShapeKind::None:
+            break;
+    }
+}
+
+// Apply a rotate interaction: drag of rotate handle to (x, y). Computes
+// new rotation = initialRotation + (current pen angle − initial pen angle).
+void applyRotateTo(float x, float y) {
+    Selection sel;
+    DragState d;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+        d   = g_drag;
+    }
+    if (d.mode != DragMode::Rotate || sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
+    Layer& layer = *g_layers[sel.layerIdx];
+
+    float curAngle = std::atan2(y - d.centerY, x - d.centerX);
+    float delta = curAngle - d.initialPenAngle;
+    float newRotation = d.initialRotation + delta;
+
+    // Snap to multiples of 15 deg within a 5 deg window when snap is on.
+    if (g_snapEnabled.load() != 0) {
+        constexpr float kStep = 3.14159265358979323846f / 12.0f;  // 15 deg
+        constexpr float kTol  = 5.0f * 3.14159265358979323846f / 180.0f;
+        float k = std::round(newRotation / kStep);
+        float snapped = k * kStep;
+        if (std::fabs(newRotation - snapped) <= kTol) {
+            // Re-derive delta so Line endpoints (which compute from
+            // initialLine + delta) match the snapped rotation exactly.
+            delta = snapped - d.initialRotation;
+            newRotation = snapped;
+        }
+    }
+    // Rotate has no on-canvas marker target, so no snapActive flag here.
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.snapActive = false;
+    }
+
+    switch (sel.kind) {
+        case ShapeKind::Rect:
+            if (sel.shapeIdx < layer.rects.size())
+                layer.rects[sel.shapeIdx].rotation = newRotation;
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx < layer.ellipses.size())
+                layer.ellipses[sel.shapeIdx].rotation = newRotation;
+            break;
+        case ShapeKind::Line:
+            if (sel.shapeIdx < layer.lines.size()) {
+                // Rotate p0, p1 around the line's midpoint by `delta`
+                // (relative to initial endpoints, so we don't accumulate
+                // float drift across many move events).
+                auto& l = layer.lines[sel.shapeIdx];
+                float cx = (d.initialLine.x0 + d.initialLine.x1) * 0.5f;
+                float cy = (d.initialLine.y0 + d.initialLine.y1) * 0.5f;
+                float c = std::cos(delta), s = std::sin(delta);
+                auto rot = [&](float px, float py, float& ox, float& oy) {
+                    float dx = px - cx, dy = py - cy;
+                    ox = cx + dx * c - dy * s;
+                    oy = cy + dx * s + dy * c;
+                };
+                rot(d.initialLine.x0, d.initialLine.y0, l.x0, l.y0);
+                rot(d.initialLine.x1, d.initialLine.y1, l.x1, l.y1);
+            }
+            break;
+        case ShapeKind::Circle:
+        case ShapeKind::None:
+            break;
+    }
+}
+
 JNIEXPORT void JNICALL
-Java_com_bk_drawing_NativeRenderer_renderLinePreview(
+Java_com_bk_drawing_NativeRenderer_updateInteractionAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    DragMode mode;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        mode = g_drag.mode;
+    }
+    if (mode == DragMode::Scale) {
+        applyScaleTo(x, y);
+    } else if (mode == DragMode::Rotate) {
+        applyRotateTo(x, y);
+    } else if (mode == DragMode::Move) {
+        applyMoveTo(x, y);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    g_drag.mode = DragMode::None;
+    g_drag.snapActive = false;
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_clearSelection(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    g_selection = Selection{};
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_hasSelection(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    return g_selection.kind != ShapeKind::None ? JNI_TRUE : JNI_FALSE;
+}
+
+// Translate the currently selected shape by (dx, dy) doc-pixels. No-op
+// if there's no selection or the layer is gone.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_translateSelection(
+        JNIEnv*, jobject, jfloat dx, jfloat dy) {
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+    }
+    if (sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
+    Layer& layer = *g_layers[sel.layerIdx];
+    if (layer.type != LayerType::Vector) return;
+    translateShape(layer, sel, dx, dy);
+}
+
+// Snap-aware absolute move: drives an in-progress Move drag with the
+// pen's current position. Uses the captured moveOffset (snapshotted in
+// beginInteractionAt) so the user's grab-point follows the pen, and
+// snaps the would-be center against other shapes' targets / grid.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_moveSelectionTo(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    applyMoveTo(x, y);
+}
+
+// Remove the currently selected shape from its layer. Clears selection.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+        g_selection = Selection{};
+    }
+    if (sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
+    Layer& layer = *g_layers[sel.layerIdx];
+    if (layer.type != LayerType::Vector) return;
+
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx < layer.lines.size())
+                layer.lines.erase(layer.lines.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx < layer.rects.size())
+                layer.rects.erase(layer.rects.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx < layer.ellipses.size())
+                layer.ellipses.erase(layer.ellipses.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx < layer.circles.size())
+                layer.circles.erase(layer.circles.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::None:
+            break;
+    }
+    saveVectorLayer(sel.layerIdx, layer);
+}
+
+// Persist the active vector layer to disk. Used after a transform-drag
+// completes so the move/scale/rotate is durable.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_persistActiveVectorLayer(
+        JNIEnv*, jobject) {
+    if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return;
+    if (g_layers[g_activeLayer]->type != LayerType::Vector) return;
+    saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
+}
+
+// Live preview during shape-tool drag. Color follows the current brush
+// color; width follows kDefaultLineWidth. shapeType matches the
+// addXxx-call shape semantics in renderShapePreviewToFront. If
+// `snapped` is true, also draws a snap-marker overlay at (x1, y1).
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_renderShapePreview(
         JNIEnv* env, jobject,
         jint width, jint height,
         jfloatArray transform,
-        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+        jint shapeType,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1,
+        jboolean snapped) {
     ensureInited();
     uint32_t rgb = g_currentBrushColor.load();
-    // Slightly translucent so the preview reads as "in progress".
-    renderLinePreviewToFront(env, width, height, transform,
-                             x0, y0, x1, y1,
-                             rgb, kDefaultLineWidth, /*alpha=*/0.7f);
+    renderShapePreviewToFront(env, width, height, transform,
+                              shapeType, x0, y0, x1, y1,
+                              rgb, kDefaultLineWidth, /*alpha=*/0.7f,
+                              snapped == JNI_TRUE);
+}
+
+// Find nearest snap target for (x, y); fills output[0..2] with
+// [snapX, snapY, didSnap (1.0/0.0)]. If no target within range, output
+// is (x, y, 0). Output array must have length >= 3.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_snapPoint(
+        JNIEnv* env, jobject,
+        jfloat x, jfloat y, jfloatArray output) {
+    SnapHit h = findSnap(x, y);
+    jfloat* arr = env->GetFloatArrayElements(output, nullptr);
+    arr[0] = h.x;
+    arr[1] = h.y;
+    arr[2] = h.found ? 1.0f : 0.0f;
+    env->ReleaseFloatArrayElements(output, arr, 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setSnapEnabled(
+        JNIEnv*, jobject, jboolean enabled) {
+    g_snapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
 }
 
 // Read accessors for UI display. Called from the UI thread; the values may
@@ -1522,7 +2771,7 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     ensureInited();
     ensureLoaded();
     applyPendingLayerActions();
-    applyPendingLines();
+    applyPendingShapes();
     ensureAtLeastOneLayer();
 
     g_strokeTarget = g_activeLayer;
@@ -1622,7 +2871,7 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
 
     ensureLoaded();
     applyPendingLayerActions();
-    applyPendingLines();
+    applyPendingShapes();
     ensureAtLeastOneLayer();
 
     size_t layerIdx = g_strokeTarget < g_layers.size() ? g_strokeTarget
@@ -1647,7 +2896,7 @@ Java_com_bk_drawing_NativeRenderer_renderDocument(
     ensureInited();
     ensureLoaded();
     applyPendingLayerActions();
-    applyPendingLines();
+    applyPendingShapes();
     compositeAllLayers(env, width, height, transform);
 }
 

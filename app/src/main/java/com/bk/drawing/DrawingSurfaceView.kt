@@ -10,24 +10,48 @@ import androidx.graphics.lowlatency.GLFrontBufferedRenderer
 import androidx.graphics.opengl.egl.EGLManager
 
 // Param type for the front-buffered renderer. Brush/eraser strokes flow
-// through Sample (a stream per stroke); the line tool flows through
-// LinePreview (one entry per pen position during the drag).
+// through Sample (a stream per stroke); the shape tools (line, rect,
+// circle, ellipse) flow through ShapePreview (one entry per pen position
+// during the drag), with shapeType selecting which shape to render.
 sealed class StrokeAction {
     data class Sample(
         val x: Float, val y: Float, val pressure: Float,
         val isNewStroke: Boolean
     ) : StrokeAction()
 
-    data class LinePreview(
+    data class ShapePreview(
+        val shapeType: Int,             // matches NativeRenderer.renderShapePreview
         val x0: Float, val y0: Float,
-        val x1: Float, val y1: Float
+        val x1: Float, val y1: Float,
+        val snapped: Boolean            // shows snap marker at (x1, y1)
     ) : StrokeAction()
 }
 
-// LINE doesn't correspond to a native "stroke tool" (it doesn't flow
-// through beginStroke / extendStroke / commitStroke); its nativeId is
-// unused but kept consistent with the others for symmetry.
-enum class Tool(val nativeId: Int) { BRUSH(0), ERASER(1), LINE(2) }
+// Only BRUSH and ERASER correspond to native "stroke tools" (running
+// through beginStroke / extendStroke / commitStroke). The shape tools
+// have their own gesture path and don't update the native stroke tool.
+enum class Tool(val nativeId: Int) {
+    BRUSH    (0),
+    ERASER   (1),
+    LINE     (2),
+    RECTANGLE(3),
+    CIRCLE   (4),
+    ELLIPSE  (5),
+    SELECT   (6);
+
+    /** Shape-type code passed to NativeRenderer for shape tools. */
+    val shapeType: Int
+        get() = when (this) {
+            LINE      -> 0
+            RECTANGLE -> 1
+            CIRCLE    -> 2
+            ELLIPSE   -> 3
+            else      -> -1
+        }
+
+    val isShape: Boolean
+        get() = this == LINE || this == RECTANGLE || this == CIRCLE || this == ELLIPSE
+}
 
 class DrawingSurfaceView @JvmOverloads constructor(
     context: Context,
@@ -54,11 +78,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         param.x, param.y, param.pressure
                     )
                 }
-                is StrokeAction.LinePreview -> {
-                    NativeRenderer.renderLinePreview(
+                is StrokeAction.ShapePreview -> {
+                    NativeRenderer.renderShapePreview(
                         bufferInfo.width, bufferInfo.height,
                         transform,
-                        param.x0, param.y0, param.x1, param.y1
+                        param.shapeType,
+                        param.x0, param.y0, param.x1, param.y1,
+                        param.snapped
                     )
                 }
             }
@@ -90,11 +116,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
         GLFrontBufferedRenderer(this, callback)
 
-    // Line-tool drag state (in view-space pixels).
-    private var lineP0X = 0f
-    private var lineP0Y = 0f
-    private var lineP1X = 0f
-    private var lineP1Y = 0f
+    // Shape-tool drag state (in view-space pixels). Shared by Line,
+    // Rectangle, Circle, Ellipse — only the interpretation differs.
+    private var shapeP0X = 0f
+    private var shapeP0Y = 0f
+    private var shapeP1X = 0f
+    private var shapeP1Y = 0f
 
     private var currentTool = Tool.BRUSH
 
@@ -104,18 +131,21 @@ class DrawingSurfaceView @JvmOverloads constructor(
     var onToolChanged: ((Tool) -> Unit)? = null
 
     /** Public so MainActivity's tool button can route through the same
-     *  code path the stylus side-button uses. Cycles brush → eraser →
-     *  line → brush. */
+     *  code path the stylus side-button uses. Cycles through every tool. */
     fun toggleTool() {
         currentTool = when (currentTool) {
-            Tool.BRUSH  -> Tool.ERASER
-            Tool.ERASER -> Tool.LINE
-            Tool.LINE   -> Tool.BRUSH
+            Tool.BRUSH     -> Tool.ERASER
+            Tool.ERASER    -> Tool.LINE
+            Tool.LINE      -> Tool.RECTANGLE
+            Tool.RECTANGLE -> Tool.CIRCLE
+            Tool.CIRCLE    -> Tool.ELLIPSE
+            Tool.ELLIPSE   -> Tool.SELECT
+            Tool.SELECT    -> Tool.BRUSH
         }
         // Native only knows about the raster stroke tools (brush/eraser);
-        // LINE is handled entirely on the Kotlin side via the line tool
-        // gesture path, so we don't update the native tool state for it.
-        if (currentTool != Tool.LINE) {
+        // shape and select tools are handled entirely on the Kotlin side
+        // via their own gesture paths.
+        if (currentTool == Tool.BRUSH || currentTool == Tool.ERASER) {
             NativeRenderer.setTool(currentTool.nativeId)
         }
         Log.i("DrawingApp", "tool -> ${currentTool.name.lowercase()}")
@@ -179,8 +209,46 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
         return when (currentTool) {
             Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
-            Tool.LINE               -> handleLineEvent(r, event)
+            Tool.SELECT             -> handleSelectEvent(event)
+            else                    -> handleShapeEvent(r, event, currentTool.shapeType)
         }
+    }
+
+    // Drag state for the SELECT tool.
+    private var selectMode = 0          // 0=none, 1=move, 2=scale, 3=rotate
+    private var selectChanged = false   // true if we should persist on UP
+
+    private fun handleSelectEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                selectMode = NativeRenderer.beginInteractionAt(event.x, event.y)
+                selectChanged = false
+                forceRedraw()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                when (selectMode) {
+                    1 -> { // move — snap-aware absolute, native uses captured offset
+                        NativeRenderer.moveSelectionTo(event.x, event.y)
+                        selectChanged = true
+                        forceRedraw()
+                    }
+                    2, 3 -> { // scale / rotate — absolute pen position
+                        NativeRenderer.updateInteractionAt(event.x, event.y)
+                        selectChanged = true
+                        forceRedraw()
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                NativeRenderer.endInteraction()
+                if (selectChanged) {
+                    NativeRenderer.persistActiveVectorLayer()
+                }
+                selectMode = 0
+                selectChanged = false
+            }
+        }
+        return true
     }
 
     private fun handleStrokeEvent(
@@ -217,33 +285,58 @@ class DrawingSurfaceView @JvmOverloads constructor(
         return true
     }
 
-    private fun handleLineEvent(
+    // Reused output buffer for NativeRenderer.snapPoint — avoids
+    // allocating a fresh FloatArray per pen sample.
+    private val snapOut = FloatArray(3)
+    private var p1Snapped = false
+
+    /** Snap the given pen position to the nearest snap target if any.
+     *  Updates p1Snapped as a side effect. */
+    private fun snap(x: Float, y: Float): Pair<Float, Float> {
+        NativeRenderer.snapPoint(x, y, snapOut)
+        p1Snapped = snapOut[2] > 0.5f
+        return if (p1Snapped) Pair(snapOut[0], snapOut[1]) else Pair(x, y)
+    }
+
+    private fun handleShapeEvent(
         r: GLFrontBufferedRenderer<StrokeAction>,
-        event: MotionEvent
+        event: MotionEvent,
+        shapeType: Int
     ): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                lineP0X = event.x; lineP0Y = event.y
-                lineP1X = event.x; lineP1Y = event.y
+                val (sx, sy) = snap(event.x, event.y)
+                shapeP0X = sx; shapeP0Y = sy
+                shapeP1X = sx; shapeP1Y = sy
                 r.renderFrontBufferedLayer(
-                    StrokeAction.LinePreview(lineP0X, lineP0Y, lineP1X, lineP1Y)
+                    StrokeAction.ShapePreview(shapeType,
+                        shapeP0X, shapeP0Y, shapeP1X, shapeP1Y, p1Snapped)
                 )
             }
             MotionEvent.ACTION_MOVE -> {
-                lineP1X = event.x; lineP1Y = event.y
+                val (sx, sy) = snap(event.x, event.y)
+                shapeP1X = sx; shapeP1Y = sy
                 r.renderFrontBufferedLayer(
-                    StrokeAction.LinePreview(lineP0X, lineP0Y, lineP1X, lineP1Y)
+                    StrokeAction.ShapePreview(shapeType,
+                        shapeP0X, shapeP0Y, shapeP1X, shapeP1Y, p1Snapped)
                 )
             }
             MotionEvent.ACTION_UP -> {
-                NativeRenderer.addLine(lineP0X, lineP0Y, lineP1X, lineP1Y)
-                // commit() clears the front buffer's preview and triggers a
+                when (shapeType) {
+                    0 -> NativeRenderer.addLine     (shapeP0X, shapeP0Y, shapeP1X, shapeP1Y)
+                    1 -> NativeRenderer.addRectangle(shapeP0X, shapeP0Y, shapeP1X, shapeP1Y)
+                    2 -> NativeRenderer.addCircle   (shapeP0X, shapeP0Y, shapeP1X, shapeP1Y)
+                    3 -> NativeRenderer.addEllipse  (shapeP0X, shapeP0Y, shapeP1X, shapeP1Y)
+                }
+                // commit() clears the front buffer preview and triggers a
                 // multi-buffer redraw via onDrawMultiBufferedLayer, which
-                // applies the queued line and re-renders the document.
+                // applies the queued shape and re-renders the document.
                 r.commit()
+                p1Snapped = false
             }
             MotionEvent.ACTION_CANCEL -> {
                 r.commit()
+                p1Snapped = false
             }
         }
         return true

@@ -66,23 +66,90 @@ object NativeRenderer {
     external fun addVectorLayer()
 
     /**
-     * Append a line shape to the active layer (only effective if the
-     * active layer is a vector layer). Color and width follow the current
-     * brush color and a fixed line width. Safe to call from any thread.
+     * Append shapes to the active layer (only effective if the active
+     * layer is a vector layer). Color and width follow the current brush
+     * color and a fixed line width. Each gesture's (x0, y0, x1, y1)
+     * interpretation:
+     *   addLine:      endpoints
+     *   addRectangle: opposite bbox corners
+     *   addEllipse:   opposite bbox corners (oval inscribed)
+     *   addCircle:    p0 = center, p1 = point on circle
+     * Safe to call from any thread; takes effect on the next render.
      */
-    external fun addLine(x0: Float, y0: Float, x1: Float, y1: Float)
+    external fun addLine     (x0: Float, y0: Float, x1: Float, y1: Float)
+    external fun addRectangle(x0: Float, y0: Float, x1: Float, y1: Float)
+    external fun addEllipse  (x0: Float, y0: Float, x1: Float, y1: Float)
+    external fun addCircle   (x0: Float, y0: Float, x1: Float, y1: Float)
 
     /**
-     * Live preview for the line tool — renders a single line into the
-     * currently-bound framebuffer (intended to be the front-buffered
-     * layer, called from inside onDrawFrontBufferedLayer). Clears the
-     * buffer first so successive previews replace rather than accumulate.
+     * Live preview for the shape tools. shapeType:
+     *   0 = line, 1 = rectangle, 2 = circle, 3 = ellipse
+     * Renders into the currently-bound framebuffer (intended to be the
+     * front-buffered layer, called from inside onDrawFrontBufferedLayer).
+     * Clears the buffer first so successive previews replace rather than
+     * accumulate.
      */
-    external fun renderLinePreview(
+    external fun renderShapePreview(
         width: Int, height: Int,
         transform: FloatArray,
-        x0: Float, y0: Float, x1: Float, y1: Float
+        shapeType: Int,
+        x0: Float, y0: Float, x1: Float, y1: Float,
+        snapped: Boolean
     )
+
+    /**
+     * Find the nearest snap target to (x, y) within the snap radius.
+     * Fills output[0..2] with [snapX, snapY, didSnap (1.0/0.0)]. Output
+     * is overwritten in place; pre-allocate one FloatArray(3) and reuse.
+     * Snap targets are vector-shape vertices/centers and (when grid is
+     * on) grid intersections. No-op + didSnap=0 if snap is disabled.
+     */
+    external fun snapPoint(x: Float, y: Float, output: FloatArray)
+
+    /** Toggle whether snapping is active. Default on. */
+    external fun setSnapEnabled(enabled: Boolean)
+
+    /**
+     * Selection helpers — operate on the active vector layer.
+     *
+     *  selectShapeAt(x, y): hit-test, set selection on hit, returns true
+     *     on hit; on miss clears any prior selection and returns false.
+     *  hasSelection: whether anything is currently selected.
+     *  clearSelection: drop the current selection.
+     *  translateSelection: move the selected shape by (dx, dy) doc px.
+     *  moveSelectionTo:    snap-aware absolute move; drives an in-progress
+     *     Move drag using the captured pen-to-center offset.
+     *  deleteSelection: remove the selected shape from its layer.
+     *  persistActiveVectorLayer: write shapes.bin for the active layer
+     *     (used after a transform drag completes).
+     *
+     * All are safe to call from any thread.
+     */
+    external fun selectShapeAt(x: Float, y: Float): Boolean
+    external fun hasSelection(): Boolean
+    external fun clearSelection()
+    external fun translateSelection(dx: Float, dy: Float)
+    external fun moveSelectionTo(x: Float, y: Float)
+    external fun deleteSelection()
+    external fun persistActiveVectorLayer()
+
+    /**
+     * Begin a SELECT-tool interaction at (x, y). Returns the drag mode:
+     *   0 = none (tap missed everything; selection cleared if there was one)
+     *   1 = move  (drive moveSelectionTo with absolute pen pos; native
+     *              uses the offset captured here so the grab-point follows)
+     *   2 = scale (drive updateInteractionAt with absolute pen pos)
+     *   3 = rotate (drive updateInteractionAt with absolute pen pos)
+     */
+    external fun beginInteractionAt(x: Float, y: Float): Int
+
+    /** Drive an in-progress scale, rotate, or move interaction to (x, y).
+     *  No-op if no interaction is active. (For Move, prefer the dedicated
+     *  moveSelectionTo entry point — both go through the same path.) */
+    external fun updateInteractionAt(x: Float, y: Float)
+
+    /** Mark the current interaction complete. */
+    external fun endInteraction()
 
     /**
      * Set the active drawing tool: 0 = brush, 1 = eraser. The next stroke
