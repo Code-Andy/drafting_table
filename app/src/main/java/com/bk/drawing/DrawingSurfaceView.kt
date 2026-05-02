@@ -2,6 +2,7 @@ package com.bk.drawing
 
 import android.content.Context
 import android.util.AttributeSet
+import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceView
 import androidx.graphics.lowlatency.BufferInfo
@@ -14,6 +15,8 @@ data class StrokeSample(
     val pressure: Float,
     val isNewStroke: Boolean
 )
+
+enum class Tool(val nativeId: Int) { BRUSH(0), ERASER(1) }
 
 class DrawingSurfaceView @JvmOverloads constructor(
     context: Context,
@@ -63,7 +66,71 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var renderer: GLFrontBufferedRenderer<StrokeSample>? =
         GLFrontBufferedRenderer(this, callback)
 
+    private var currentTool = Tool.BRUSH
+
+    /** Notified after the active tool changes (from the UI button or
+     *  the stylus side-button). MainActivity uses this to refresh the
+     *  on-screen tool button label. */
+    var onToolChanged: ((Tool) -> Unit)? = null
+
+    /** Public so MainActivity's tool button can route through the same
+     *  code path the stylus side-button uses. */
+    fun toggleTool() {
+        currentTool = if (currentTool == Tool.BRUSH) Tool.ERASER else Tool.BRUSH
+        NativeRenderer.setTool(currentTool.nativeId)
+        Log.i("DrawingApp", "tool -> ${currentTool.name.lowercase()}")
+        onToolChanged?.invoke(currentTool)
+    }
+
+    // Last-seen stylus button bitmask, used to detect press transitions
+    // even on devices/states that don't fire ACTION_BUTTON_PRESS (notably
+    // Wacom EMR while the pen is hovering — buttonState is reported on
+    // hover events too, but the discrete press action isn't always).
+    private var prevButtonState = 0
+
+    /**
+     * Detect stylus side-button presses two ways:
+     *   1. ACTION_BUTTON_PRESS with actionButton == BUTTON_STYLUS_SECONDARY
+     *      (the standard path; fires while pen is in contact).
+     *   2. A 0→1 transition of the BUTTON_STYLUS_SECONDARY bit in
+     *      event.buttonState (catches presses during hover that don't
+     *      generate ACTION_BUTTON_PRESS).
+     */
+    private fun handleStylusButton(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
+            val ab = event.actionButton
+            Log.i("DrawingApp", "ACTION_BUTTON_PRESS: 0x${ab.toString(16)}")
+            if (ab == MotionEvent.BUTTON_STYLUS_SECONDARY) {
+                toggleTool()
+                prevButtonState = event.buttonState
+                return true
+            }
+        }
+        val state = event.buttonState
+        val newlyPressed = state and prevButtonState.inv()
+        prevButtonState = state
+        if (newlyPressed and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) {
+            Log.i("DrawingApp",
+                "stylus button transition (during action=${event.actionMasked}): " +
+                "0x${newlyPressed.toString(16)}")
+            toggleTool()
+            return true
+        }
+        return false
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (handleStylusButton(event)) return true
+        return super.onGenericMotionEvent(event)
+    }
+
+    override fun onHoverEvent(event: MotionEvent): Boolean {
+        if (handleStylusButton(event)) return true
+        return super.onHoverEvent(event)
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (handleStylusButton(event)) return true
         val tool = event.getToolType(0)
         if (tool != MotionEvent.TOOL_TYPE_STYLUS && tool != MotionEvent.TOOL_TYPE_FINGER) {
             return super.onTouchEvent(event)
@@ -96,6 +163,22 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
         }
         return true
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        // First time we know the surface size, kick a multi-buffer pass so
+        // the saved document loads and shows immediately on app launch
+        // (rather than only appearing after the first stroke commit).
+        if (oldw == 0 && oldh == 0 && w > 0 && h > 0) {
+            renderer?.commit()
+        }
+    }
+
+    /** Force a multi-buffer redraw (used after layer-state changes that
+     *  need to be reflected on screen, e.g. clearing a layer). */
+    fun forceRedraw() {
+        renderer?.commit()
     }
 
     fun release() {
