@@ -205,6 +205,13 @@ class MainActivity : AppCompatActivity() {
         }
         panel.addView(snapButton, panelChildParams())
 
+        val resetViewButton = Button(this).apply {
+            text = "Reset View"
+            alpha = 0.92f
+            setOnClickListener { drawingView?.resetView() }
+        }
+        panel.addView(resetViewButton, panelChildParams())
+
         panel.addView(buildColorGrid(), panelChildParams())
 
         return panel

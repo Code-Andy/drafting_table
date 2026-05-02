@@ -1,6 +1,7 @@
 package com.bk.drawing
 
 import android.content.Context
+import android.opengl.Matrix
 import android.util.AttributeSet
 import android.util.Log
 import android.view.MotionEvent
@@ -8,6 +9,10 @@ import android.view.SurfaceView
 import androidx.graphics.lowlatency.BufferInfo
 import androidx.graphics.lowlatency.GLFrontBufferedRenderer
 import androidx.graphics.opengl.egl.EGLManager
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.sin
 
 // Param type for the front-buffered renderer. Brush/eraser strokes flow
 // through Sample (a stream per stroke); the shape tools (line, rect,
@@ -67,6 +72,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
             transform: FloatArray,
             param: StrokeAction
         ) {
+            // Native shaders expect `transform` to be doc-pixel →
+            // buffer-pixel; compose the framework's view→buffer with our
+            // current doc→view here.
+            val composed = composedTransform(transform)
             when (param) {
                 is StrokeAction.Sample -> {
                     if (param.isNewStroke) {
@@ -74,14 +83,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     }
                     NativeRenderer.extendStroke(
                         bufferInfo.width, bufferInfo.height,
-                        transform,
+                        composed,
                         param.x, param.y, param.pressure
                     )
                 }
                 is StrokeAction.ShapePreview -> {
                     NativeRenderer.renderShapePreview(
                         bufferInfo.width, bufferInfo.height,
-                        transform,
+                        composed,
                         param.shapeType,
                         param.x0, param.y0, param.x1, param.y1,
                         param.snapped
@@ -98,17 +107,21 @@ class DrawingSurfaceView @JvmOverloads constructor(
             transform: FloatArray,
             params: Collection<StrokeAction>
         ) {
+            val composed = composedTransform(transform)
             // Only commit a brush/eraser stroke if this batch actually
             // contained Sample entries. Line previews go through here too
             // when the line tool's commit calls renderer.commit(); we
-            // mustn't bake an empty stroke in that case.
+            // mustn't bake an empty stroke in that case. cancelNextCommit
+            // (set when a 2-finger gesture interrupts a stroke) suppresses
+            // the bake entirely so the in-progress stroke is discarded.
             val hadStrokeSamples = params.any { it is StrokeAction.Sample }
-            if (hadStrokeSamples) {
+            if (hadStrokeSamples && !cancelNextCommit) {
                 NativeRenderer.commitStroke()
             }
+            cancelNextCommit = false
             NativeRenderer.renderDocument(
                 bufferInfo.width, bufferInfo.height,
-                transform
+                composed
             )
         }
     }
@@ -116,7 +129,74 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
         GLFrontBufferedRenderer(this, callback)
 
-    // Shape-tool drag state (in view-space pixels). Shared by Line,
+    // -------------------------------------------------------------------
+    // View transform: doc-pixel → view-pixel, parameterized as scale,
+    // rotation (radians, applied around origin), and translation.
+    // Identity by default. Updated by 2-finger gestures.
+    //
+    // The composition viewBufferTransform * docToViewMatrix is the matrix
+    // we send to native shaders, so all native rendering operates in
+    // doc-px and the view transform is "free" downstream.
+    // -------------------------------------------------------------------
+    private var viewScale = 1.0f
+    private var viewRotation = 0.0f
+    private var viewPanX = 0.0f
+    private var viewPanY = 0.0f
+
+    // Reused scratch buffers; touch handling runs at high rate, avoid alloc.
+    private val tmpDoc = FloatArray(2)
+    private val tmpDocToView = FloatArray(16)
+    private val tmpComposed = FloatArray(16)
+
+    /** Convert a view-pixel coordinate to its doc-pixel equivalent. */
+    private fun viewToDoc(vx: Float, vy: Float, out: FloatArray) {
+        val tx = vx - viewPanX
+        val ty = vy - viewPanY
+        val invS = 1f / viewScale
+        // Inverse rotation = R(-rotation).
+        val c = cos(-viewRotation)
+        val s = sin(-viewRotation)
+        out[0] = invS * (c * tx - s * ty)
+        out[1] = invS * (s * tx + c * ty)
+    }
+
+    /** Build a column-major 4x4 of the current doc→view affine. */
+    private fun fillDocToViewMatrix(out: FloatArray) {
+        val c = cos(viewRotation)
+        val s = sin(viewRotation)
+        val a = viewScale * c
+        val b = viewScale * s
+        // Column 0
+        out[0]  =  a;  out[1]  =  b;  out[2]  = 0f; out[3]  = 0f
+        // Column 1
+        out[4]  = -b;  out[5]  =  a;  out[6]  = 0f; out[7]  = 0f
+        // Column 2 (z)
+        out[8]  = 0f;  out[9]  = 0f;  out[10] = 1f; out[11] = 0f
+        // Column 3 (translation)
+        out[12] = viewPanX; out[13] = viewPanY; out[14] = 0f; out[15] = 1f
+    }
+
+    /** Compose framework's view→buffer transform with our doc→view, giving
+     *  the doc→buffer matrix the native shaders consume as `uTransform`. */
+    private fun composedTransform(framebufferTransform: FloatArray): FloatArray {
+        fillDocToViewMatrix(tmpDocToView)
+        Matrix.multiplyMM(tmpComposed, 0,
+            framebufferTransform, 0,
+            tmpDocToView, 0)
+        return tmpComposed
+    }
+
+    /** Reset view transform to identity. Forces a redraw. */
+    fun resetView() {
+        viewScale = 1.0f
+        viewRotation = 0.0f
+        viewPanX = 0.0f
+        viewPanY = 0.0f
+        NativeRenderer.setViewScale(viewScale)
+        forceRedraw()
+    }
+
+    // Shape-tool drag state (doc-pixels, post-snap). Shared by Line,
     // Rectangle, Circle, Ellipse — only the interpretation differs.
     private var shapeP0X = 0f
     private var shapeP0Y = 0f
@@ -199,14 +279,167 @@ class DrawingSurfaceView @JvmOverloads constructor(
         return super.onHoverEvent(event)
     }
 
+    // ---- 2-finger pan/zoom/rotate gesture state ----------------------
+    //
+    // While a gesture is active, viewScale/Rotation/Pan are recomputed
+    // each MOVE so the two anchor doc-points (captured at the moment the
+    // 2nd finger touched) stay locked under their respective fingers.
+    // suppressTouches stays true after the gesture ends until every finger
+    // has lifted, so a finger left from the gesture doesn't accidentally
+    // start a stroke.
+    private var gestureActive = false
+    private var gestureP1Id = -1
+    private var gestureP2Id = -1
+    private var gestureP1DocX = 0f; private var gestureP1DocY = 0f
+    private var gestureP2DocX = 0f; private var gestureP2DocY = 0f
+    private var suppressTouches = false
+
+    // Set by the gesture path when an in-progress brush/eraser stroke is
+    // discarded; checked in onDrawMultiBufferedLayer to skip the bake.
+    private var cancelNextCommit = false
+
+    private fun anyStylusPointer(event: MotionEvent): Boolean {
+        for (i in 0 until event.pointerCount) {
+            if (event.getToolType(i) == MotionEvent.TOOL_TYPE_STYLUS) return true
+        }
+        return false
+    }
+
+    private fun beginGesture(event: MotionEvent, p1Index: Int, p2Index: Int) {
+        // Cancel any in-progress draw / interaction so the user's drag
+        // doesn't bleed into a stroke or transform on gesture release.
+        when (currentTool) {
+            Tool.BRUSH, Tool.ERASER -> {
+                NativeRenderer.discardStroke()
+                cancelNextCommit = true
+                renderer?.commit()
+            }
+            Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE -> {
+                renderer?.commit()
+                p1Snapped = false
+            }
+            Tool.SELECT -> {
+                if (selectMode != 0) {
+                    NativeRenderer.endInteraction()
+                    selectMode = 0
+                    selectChanged = false
+                }
+            }
+        }
+        gestureP1Id = event.getPointerId(p1Index)
+        gestureP2Id = event.getPointerId(p2Index)
+        viewToDoc(event.getX(p1Index), event.getY(p1Index), tmpDoc)
+        gestureP1DocX = tmpDoc[0]; gestureP1DocY = tmpDoc[1]
+        viewToDoc(event.getX(p2Index), event.getY(p2Index), tmpDoc)
+        gestureP2DocX = tmpDoc[0]; gestureP2DocY = tmpDoc[1]
+        gestureActive   = true
+        suppressTouches = true
+    }
+
+    private fun updateGesture(event: MotionEvent) {
+        val i1 = event.findPointerIndex(gestureP1Id)
+        val i2 = event.findPointerIndex(gestureP2Id)
+        if (i1 < 0 || i2 < 0) return
+        val v1x = event.getX(i1); val v1y = event.getY(i1)
+        val v2x = event.getX(i2); val v2y = event.getY(i2)
+
+        // Solve the 2-point similarity problem: find scale, rotation, pan
+        // such that view(D1) = V1' and view(D2) = V2', where view(D) =
+        // pan + scale * R(rotation) * D.
+        val viewDx = v2x - v1x; val viewDy = v2y - v1y
+        val docDx  = gestureP2DocX - gestureP1DocX
+        val docDy  = gestureP2DocY - gestureP1DocY
+        val viewLen = hypot(viewDx, viewDy)
+        val docLen  = hypot(docDx,  docDy)
+        if (viewLen < 1e-3f || docLen < 1e-3f) return
+
+        // Clamp scale to a sane range. Without this, zooming far out makes
+        // any natural finger movement span enormous doc-pixel distances,
+        // and the stroke bake then has to materialize a tile FBO for every
+        // cell along the way — which can OOM the GPU.
+        val rawScale    = (viewLen / docLen).toFloat()
+        val newScale    = rawScale.coerceIn(kMinViewScale, kMaxViewScale)
+        val newRotation = (atan2(viewDy, viewDx) - atan2(docDy, docDx)).toFloat()
+        val c = cos(newRotation); val s = sin(newRotation)
+        val newPanX = v1x - newScale * (c * gestureP1DocX - s * gestureP1DocY)
+        val newPanY = v1y - newScale * (s * gestureP1DocX + c * gestureP1DocY)
+
+        viewScale    = newScale
+        viewRotation = newRotation
+        viewPanX     = newPanX
+        viewPanY     = newPanY
+        NativeRenderer.setViewScale(viewScale)
+        forceRedraw()
+    }
+
+    private companion object {
+        // Limits on the gesture-driven view scale.
+        const val kMinViewScale = 0.25f
+        const val kMaxViewScale = 8.0f
+    }
+
+    private fun endGesture() {
+        gestureActive = false
+        gestureP1Id = -1
+        gestureP2Id = -1
+        // suppressTouches stays true until the last finger lifts.
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (handleStylusButton(event)) return true
+
+        val r = renderer ?: return super.onTouchEvent(event)
+        val action = event.actionMasked
+
+        // ACTION_DOWN = transition from 0 → 1 pointers on screen, so no
+        // prior gesture state should leak through. Reset defensively in
+        // case an earlier ACTION_UP / ACTION_POINTER_UP was dropped (palm
+        // rejection edge cases can do this); without this, a stuck flag
+        // would silently swallow the new stroke.
+        if (action == MotionEvent.ACTION_DOWN) {
+            gestureActive   = false
+            suppressTouches = false
+            cancelNextCommit = false
+        }
+
+        // While a gesture is active, all events drive the gesture path.
+        if (gestureActive) {
+            when (action) {
+                MotionEvent.ACTION_MOVE -> updateGesture(event)
+                MotionEvent.ACTION_POINTER_UP -> {
+                    val upId = event.getPointerId(event.actionIndex)
+                    if (upId == gestureP1Id || upId == gestureP2Id) endGesture()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    endGesture()
+                    suppressTouches = false
+                }
+            }
+            return true
+        }
+
+        // After gesture, swallow remaining-finger events until all fingers
+        // have lifted. Otherwise the trailing finger would start a stroke.
+        if (suppressTouches) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                suppressTouches = false
+            }
+            return true
+        }
+
+        // 2nd finger down (with no stylus involved) starts a gesture.
+        if (action == MotionEvent.ACTION_POINTER_DOWN
+            && event.pointerCount == 2
+            && !anyStylusPointer(event)) {
+            beginGesture(event, 0, 1)
+            return true
+        }
+
+        // Single-pointer path: dispatch to the active tool.
         val tt = event.getToolType(0)
         if (tt != MotionEvent.TOOL_TYPE_STYLUS && tt != MotionEvent.TOOL_TYPE_FINGER) {
             return super.onTouchEvent(event)
         }
-        val r = renderer ?: return super.onTouchEvent(event)
-
         return when (currentTool) {
             Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
             Tool.SELECT             -> handleSelectEvent(event)
@@ -221,19 +454,21 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private fun handleSelectEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                selectMode = NativeRenderer.beginInteractionAt(event.x, event.y)
+                viewToDoc(event.x, event.y, tmpDoc)
+                selectMode = NativeRenderer.beginInteractionAt(tmpDoc[0], tmpDoc[1])
                 selectChanged = false
                 forceRedraw()
             }
             MotionEvent.ACTION_MOVE -> {
+                viewToDoc(event.x, event.y, tmpDoc)
                 when (selectMode) {
                     1 -> { // move — snap-aware absolute, native uses captured offset
-                        NativeRenderer.moveSelectionTo(event.x, event.y)
+                        NativeRenderer.moveSelectionTo(tmpDoc[0], tmpDoc[1])
                         selectChanged = true
                         forceRedraw()
                     }
                     2, 3 -> { // scale / rotate — absolute pen position
-                        NativeRenderer.updateInteractionAt(event.x, event.y)
+                        NativeRenderer.updateInteractionAt(tmpDoc[0], tmpDoc[1])
                         selectChanged = true
                         forceRedraw()
                     }
@@ -257,24 +492,26 @@ class DrawingSurfaceView @JvmOverloads constructor(
     ): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                viewToDoc(event.x, event.y, tmpDoc)
                 r.renderFrontBufferedLayer(
-                    StrokeAction.Sample(event.x, event.y, event.pressure,
+                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1], event.pressure,
                                         isNewStroke = true)
                 )
             }
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until event.historySize) {
+                    viewToDoc(event.getHistoricalX(i), event.getHistoricalY(i), tmpDoc)
                     r.renderFrontBufferedLayer(
                         StrokeAction.Sample(
-                            event.getHistoricalX(i),
-                            event.getHistoricalY(i),
+                            tmpDoc[0], tmpDoc[1],
                             event.getHistoricalPressure(i),
                             isNewStroke = false
                         )
                     )
                 }
+                viewToDoc(event.x, event.y, tmpDoc)
                 r.renderFrontBufferedLayer(
-                    StrokeAction.Sample(event.x, event.y, event.pressure,
+                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1], event.pressure,
                                         isNewStroke = false)
                 )
             }
@@ -290,8 +527,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private val snapOut = FloatArray(3)
     private var p1Snapped = false
 
-    /** Snap the given pen position to the nearest snap target if any.
-     *  Updates p1Snapped as a side effect. */
+    /** Snap the given doc-space point to the nearest snap target if any.
+     *  Updates p1Snapped as a side effect. Inputs and outputs are doc-px. */
     private fun snap(x: Float, y: Float): Pair<Float, Float> {
         NativeRenderer.snapPoint(x, y, snapOut)
         p1Snapped = snapOut[2] > 0.5f
@@ -305,7 +542,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
     ): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                val (sx, sy) = snap(event.x, event.y)
+                viewToDoc(event.x, event.y, tmpDoc)
+                val (sx, sy) = snap(tmpDoc[0], tmpDoc[1])
                 shapeP0X = sx; shapeP0Y = sy
                 shapeP1X = sx; shapeP1Y = sy
                 r.renderFrontBufferedLayer(
@@ -314,7 +552,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 )
             }
             MotionEvent.ACTION_MOVE -> {
-                val (sx, sy) = snap(event.x, event.y)
+                viewToDoc(event.x, event.y, tmpDoc)
+                val (sx, sy) = snap(tmpDoc[0], tmpDoc[1])
                 shapeP1X = sx; shapeP1Y = sy
                 r.renderFrontBufferedLayer(
                     StrokeAction.ShapePreview(shapeType,
@@ -348,6 +587,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // the saved document loads and shows immediately on app launch
         // (rather than only appearing after the first stroke commit).
         if (oldw == 0 && oldh == 0 && w > 0 && h > 0) {
+            // Page-boundary rectangle defaults to the initial visible
+            // viewport — what the user sees as "the page" at startup.
+            NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())
             renderer?.commit()
         }
     }

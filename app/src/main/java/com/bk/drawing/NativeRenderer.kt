@@ -110,6 +110,27 @@ object NativeRenderer {
     external fun setSnapEnabled(enabled: Boolean)
 
     /**
+     * Set the page-boundary rectangle (in doc-pixels). Drawn during
+     * composite under the layers so user strokes locally occlude it but
+     * the rest of the outline stays visible — useful as a visual anchor
+     * when zoomed/rotated. Pass a zero-size rect to disable.
+     */
+    external fun setPageBounds(x0: Float, y0: Float, x1: Float, y1: Float)
+
+    /**
+     * Update the cached view scale (doc-px per view-px). Native uses it
+     * to keep snap/hit-test radii and selection handles screen-relative
+     * across pan/zoom. Default 1.0 (no zoom).
+     */
+    external fun setViewScale(scale: Float)
+
+    /**
+     * Drop the in-progress brush/eraser stroke without baking. Used by
+     * the touch handler when a 2-finger gesture interrupts a stroke.
+     */
+    external fun discardStroke()
+
+    /**
      * Selection helpers — operate on the active vector layer.
      *
      *  selectShapeAt(x, y): hit-test, set selection on hit, returns true

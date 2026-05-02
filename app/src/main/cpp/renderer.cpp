@@ -37,6 +37,19 @@
 //   addLayer / cycleActiveLayer can be called from the UI thread; they
 //   enqueue an action under a mutex and the GL thread drains the queue at
 //   the start of each operation. This avoids racy access to g_layers.
+//
+// Coordinate spaces:
+//   doc-px:    document coordinates. The natural unit for shapes, tiles,
+//              snap targets, and stroke samples. Persistent.
+//   view-px:   on-screen pixels in the SurfaceView (MotionEvent coords).
+//   buffer-px: pixels of the GL buffer (may be rotated relative to view
+//              by the framework on certain device orientations).
+//   The `transform` mat4 passed into render JNIs is doc→buffer (Kotlin
+//   composes its doc→view view-transform with the framework's view→buffer
+//   matrix). Native consumes only this composed form, so 2-finger pan/
+//   zoom/rotate doesn't require any native-side coordinate plumbing.
+//   View scale is mirrored into g_viewScaleBits via setViewScale so snap
+//   radii and selection-handle sizes stay constant in screen-space.
 
 #include <jni.h>
 #include <GLES3/gl3.h>
@@ -111,14 +124,19 @@ constexpr float kIdentity[16] = {
 const char* kDabVS = R"(#version 300 es
 layout(location = 0) in vec2 aQuad;
 out vec2 vUv;
+out vec2 vDocPos;
 uniform mat4  uTransform;
 uniform vec2  uScreen;
 uniform vec2  uCenter;
 uniform float uRadius;
 void main() {
     vUv = aQuad;
-    vec2 viewPx = uCenter + aQuad * uRadius;
-    vec4 bufPx  = uTransform * vec4(viewPx, 0.0, 1.0);
+    // docPos is in the SAME frame as uCenter (tile-local during bake,
+    // doc-pixels during live preview); the page-clip rect uniforms must
+    // be set in that same frame.
+    vec2 docPos = uCenter + aQuad * uRadius;
+    vDocPos = docPos;
+    vec4 bufPx = uTransform * vec4(docPos, 0.0, 1.0);
     vec2 ndc = (bufPx.xy / uScreen) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
 }
@@ -127,9 +145,18 @@ void main() {
 const char* kDabFS = R"(#version 300 es
 precision mediump float;
 in vec2 vUv;
+in vec2 vDocPos;
 out vec4 outColor;
 uniform vec4 uColor;
+uniform vec2 uPageMin;
+uniform vec2 uPageMax;
+uniform int  uPageActive;     // 0 = no page clip
 void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
     float r = length(vUv);
     if (r > 1.0) discard;
     float a = 1.0 - smoothstep(0.55, 1.0, r);
@@ -221,6 +248,7 @@ void main() {
 const char* kLineVS = R"(#version 300 es
 layout(location = 0) in vec2 aQuad;
 out vec2 vLineSpace;       // (along, across) from line midpoint, in doc-pixels
+out vec2 vDocPos;          // for page-bounds discard in FS (doc-pixels)
 uniform mat4  uTransform;
 uniform vec2  uScreen;
 uniform vec2  uP0;
@@ -237,6 +265,7 @@ void main() {
     float along     = aQuad.x * (halfLen + uHalfWidth);
     float across    = aQuad.y * uHalfWidth;
     vec2  docPos    = mid + ndir * along + nrm * across;
+    vDocPos = docPos;
 
     vec4 bufPx = uTransform * vec4(docPos, 0.0, 1.0);
     vec2 ndc   = (bufPx.xy / uScreen) * 2.0 - 1.0;
@@ -254,12 +283,21 @@ const char* kLineFS = R"(#version 300 es
 // enough that alpha can't ramp correctly.
 precision highp float;
 in vec2 vLineSpace;
+in vec2 vDocPos;
 uniform vec2  uP0;
 uniform vec2  uP1;
 uniform float uHalfWidth;
 uniform vec4  uColor;        // straight RGBA (premultiplied at output)
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
 out vec4 outColor;
 void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
     float halfLen = length(uP1 - uP0) * 0.5;
     float dAlong  = max(abs(vLineSpace.x) - halfLen, 0.0);
     float dist    = sqrt(dAlong * dAlong + vLineSpace.y * vLineSpace.y);
@@ -292,10 +330,18 @@ uniform float uMajorWidth;
 uniform vec4  uMinorColor;         // straight RGBA
 uniform vec4  uMajorColor;
 uniform int   uStyle;              // 1 = lines, 2 = dots
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
 out vec4 outColor;
 
 void main() {
     vec2 docPos = (uInverseTransform * vec4(gl_FragCoord.xy, 0.0, 1.0)).xy;
+    if (uPageActive != 0 && (
+        docPos.x < uPageMin.x || docPos.x > uPageMax.x ||
+        docPos.y < uPageMin.y || docPos.y > uPageMax.y)) {
+        discard;
+    }
 
     float sMin = uSpacing;
     float sMaj = uSpacing * uSubdivisions;
@@ -330,6 +376,32 @@ void main() {
 
     // Premultiplied output for blending against the paper-white clear.
     outColor = vec4(col.rgb * col.a, col.a);
+}
+)";
+
+// Solid-color fill of an axis-aligned doc-coord rectangle. Used to paint
+// the page-area paper-white over the gray (off-canvas) clear.
+const char* kFillVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+uniform mat4 uTransform;
+uniform vec2 uScreen;
+uniform vec2 uMin;
+uniform vec2 uMax;
+void main() {
+    vec2 t = aQuad * 0.5 + 0.5;
+    vec2 docPos = mix(uMin, uMax, t);
+    vec4 bufPx  = uTransform * vec4(docPos, 0.0, 1.0);
+    vec2 ndc = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+}
+)";
+
+const char* kFillFS = R"(#version 300 es
+precision mediump float;
+uniform vec4 uFillColor;       // straight RGBA, opaque expected
+out vec4 outColor;
+void main() {
+    outColor = uFillColor;
 }
 )";
 
@@ -397,6 +469,9 @@ struct DabProg {
     GLint  uCenter    = -1;
     GLint  uRadius    = -1;
     GLint  uColor     = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
 };
 
 struct CompProg {
@@ -427,6 +502,9 @@ struct GridProg {
     GLint  uMinorColor       = -1;
     GLint  uMajorColor       = -1;
     GLint  uStyle            = -1;
+    GLint  uPageMin          = -1;
+    GLint  uPageMax          = -1;
+    GLint  uPageActive       = -1;
 };
 
 struct LineProg {
@@ -437,6 +515,18 @@ struct LineProg {
     GLint  uP1        = -1;
     GLint  uHalfWidth = -1;
     GLint  uColor     = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
+};
+
+struct FillProg {
+    GLuint program    = 0;
+    GLint  uTransform = -1;
+    GLint  uScreen    = -1;
+    GLint  uMin       = -1;
+    GLint  uMax       = -1;
+    GLint  uFillColor = -1;
 };
 
 struct ViewFbo {
@@ -453,6 +543,7 @@ CompProg    g_comp;
 PreviewProg g_preview;
 GridProg    g_grid;
 LineProg    g_lineProg;
+FillProg    g_fill;
 GLuint      g_quadVao = 0;
 GLuint      g_quadVbo = 0;
 bool        g_inited  = false;
@@ -466,9 +557,60 @@ std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
 // Snapping is on by default. Settable from any thread.
 std::atomic<int> g_snapEnabled{1};
 
-constexpr float    kSnapRadius      = 20.0f;          // doc px
-constexpr uint32_t kSnapMarkerColor = 0xFFC020u;      // amber
-constexpr float    kSnapMarkerR     = 9.0f;           // ring radius (doc px)
+// Page bounds in doc-pixels — a fixed rectangle drawn during composite
+// to give the user a visual anchor when zoomed/rotated. Optional;
+// disabled when w/h are 0. Set from Kotlin via setPageBounds. Stored
+// under a mutex (the rect's 4 floats need to update atomically together).
+std::mutex g_pageBoundsMutex;
+float      g_pageX0 = 0.0f, g_pageY0 = 0.0f;
+float      g_pageX1 = 0.0f, g_pageY1 = 0.0f;
+
+struct PageClip {
+    bool  active;
+    float minX, minY, maxX, maxY;
+};
+
+PageClip readPageClip() {
+    PageClip out;
+    std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
+    out.minX = g_pageX0; out.minY = g_pageY0;
+    out.maxX = g_pageX1; out.maxY = g_pageY1;
+    out.active = (out.maxX > out.minX && out.maxY > out.minY);
+    return out;
+}
+
+// Apply the page-clip uniforms to the currently-bound program. The
+// caller passes the program's uPageMin/Max/Active locations and the
+// page rect in whatever coord frame the program's vDocPos varying uses
+// (tile-local for bake, doc-pixels everywhere else).
+void uploadPageClip(GLint locMin, GLint locMax, GLint locActive,
+                    const PageClip& p) {
+    if (locActive >= 0) glUniform1i(locActive, p.active ? 1 : 0);
+    if (p.active) {
+        if (locMin >= 0) glUniform2f(locMin, p.minX, p.minY);
+        if (locMax >= 0) glUniform2f(locMax, p.maxX, p.maxY);
+    }
+}
+
+// Current view-zoom factor (doc-px per view-px). Set from Kotlin whenever
+// the 2-finger gesture changes scale; used to keep snap/hit-test radii
+// screen-relative — otherwise zooming out would make snap useless and
+// zooming in would make it overshoot. Stored as raw bits in an atomic
+// uint32 to avoid std::atomic<float> on platforms where it requires
+// special linkage.
+std::atomic<uint32_t> g_viewScaleBits{0x3F800000u};   // 1.0f
+inline float currentViewScale() {
+    uint32_t bits = g_viewScaleBits.load();
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f > 1e-6f ? f : 1.0f;
+}
+
+// All values below are *view-pixel* targets — divided by currentViewScale()
+// at use time to get the equivalent doc-pixel radius/threshold.
+constexpr float    kSnapRadiusViewPx   = 20.0f;
+constexpr uint32_t kSnapMarkerColor    = 0xFFC020u;       // amber
+constexpr float    kSnapMarkerRViewPx  = 9.0f;            // ring radius (view px)
 
 constexpr float kGridSpacing      = 50.0f;       // doc pixels between minor lines
 constexpr float kGridSubdivisions = 5.0f;        // major every Nth minor
@@ -790,15 +932,36 @@ struct DabEmitter {
     float lastY         = 0.0f;
     float lastP         = 0.0f;
     float distToNextDab = 0.0f;
+    // Optional clip bounds (in the same coord frame extend() is called in).
+    // Dabs whose square footprint lies entirely outside these bounds are
+    // skipped — saving the GL draw call. Used by bake (per-tile bounds);
+    // live preview leaves the bounds at +/-inf so all dabs render.
+    float clipMinX = -1e30f, clipMinY = -1e30f;
+    float clipMaxX =  1e30f, clipMaxY =  1e30f;
 
     void reset() {
         active = false;
         distToNextDab = 0.0f;
+        clipMinX = clipMinY = -1e30f;
+        clipMaxX = clipMaxY =  1e30f;
+    }
+
+    void setClipBounds(float minX, float minY, float maxX, float maxY) {
+        clipMinX = minX; clipMinY = minY;
+        clipMaxX = maxX; clipMaxY = maxY;
+    }
+
+    void emit(float x, float y, float radius) {
+        if (x + radius < clipMinX || x - radius > clipMaxX ||
+            y + radius < clipMinY || y - radius > clipMaxY) {
+            return;
+        }
+        drawDab(x, y, radius);
     }
 
     void extend(float x, float y, float p) {
         if (!active) {
-            drawDab(x, y, radiusOf(p));
+            emit(x, y, radiusOf(p));
             active = true;
             lastX = x; lastY = y; lastP = p;
             distToNextDab = kSpacing * radiusOf(p);
@@ -816,7 +979,7 @@ struct DabEmitter {
             float dabX = lastX + ux * traveled;
             float dabY = lastY + uy * traveled;
             float dabP = lastP + (p - lastP) * t;
-            drawDab(dabX, dabY, radiusOf(dabP));
+            emit(dabX, dabY, radiusOf(dabP));
             distToNextDab = kSpacing * radiusOf(dabP);
         }
         distToNextDab -= (dist - traveled);
@@ -1021,6 +1184,9 @@ void ensureInited() {
     g_dab.uCenter    = glGetUniformLocation(g_dab.program, "uCenter");
     g_dab.uRadius    = glGetUniformLocation(g_dab.program, "uRadius");
     g_dab.uColor     = glGetUniformLocation(g_dab.program, "uColor");
+    g_dab.uPageMin    = glGetUniformLocation(g_dab.program, "uPageMin");
+    g_dab.uPageMax    = glGetUniformLocation(g_dab.program, "uPageMax");
+    g_dab.uPageActive = glGetUniformLocation(g_dab.program, "uPageActive");
 
     g_comp.program     = linkProgram(kCompVS, kCompFS);
     g_comp.uTransform  = glGetUniformLocation(g_comp.program, "uTransform");
@@ -1045,6 +1211,9 @@ void ensureInited() {
     g_grid.uMinorColor       = glGetUniformLocation(g_grid.program, "uMinorColor");
     g_grid.uMajorColor       = glGetUniformLocation(g_grid.program, "uMajorColor");
     g_grid.uStyle            = glGetUniformLocation(g_grid.program, "uStyle");
+    g_grid.uPageMin          = glGetUniformLocation(g_grid.program, "uPageMin");
+    g_grid.uPageMax          = glGetUniformLocation(g_grid.program, "uPageMax");
+    g_grid.uPageActive       = glGetUniformLocation(g_grid.program, "uPageActive");
 
     g_lineProg.program    = linkProgram(kLineVS, kLineFS);
     g_lineProg.uTransform = glGetUniformLocation(g_lineProg.program, "uTransform");
@@ -1053,6 +1222,16 @@ void ensureInited() {
     g_lineProg.uP1        = glGetUniformLocation(g_lineProg.program, "uP1");
     g_lineProg.uHalfWidth = glGetUniformLocation(g_lineProg.program, "uHalfWidth");
     g_lineProg.uColor     = glGetUniformLocation(g_lineProg.program, "uColor");
+    g_lineProg.uPageMin    = glGetUniformLocation(g_lineProg.program, "uPageMin");
+    g_lineProg.uPageMax    = glGetUniformLocation(g_lineProg.program, "uPageMax");
+    g_lineProg.uPageActive = glGetUniformLocation(g_lineProg.program, "uPageActive");
+
+    g_fill.program    = linkProgram(kFillVS, kFillFS);
+    g_fill.uTransform = glGetUniformLocation(g_fill.program, "uTransform");
+    g_fill.uScreen    = glGetUniformLocation(g_fill.program, "uScreen");
+    g_fill.uMin       = glGetUniformLocation(g_fill.program, "uMin");
+    g_fill.uMax       = glGetUniformLocation(g_fill.program, "uMax");
+    g_fill.uFillColor = glGetUniformLocation(g_fill.program, "uFillColor");
 
     const float verts[] = {
         -1.0f, -1.0f,
@@ -1855,8 +2034,48 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
         glUniform4fv(g_dab.uColor, 1, kEraserBakeColor);
     }
 
+    // Page bounds (doc-px) treat the canvas as a fixed-size sheet:
+    //   - Tiles fully outside the page aren't created or baked at all.
+    //   - Boundary tiles only emit dabs within the page rectangle.
+    //   - The dab fragment shader also discards fragments outside the
+    //     page in those boundary tiles, giving clean truncation right at
+    //     the edge (the emitter-level clip alone leaves half-dab blobs).
+    // When the bounds are inactive (zero-size), no clipping happens and
+    // the doc behaves as the original infinite plane.
+    PageClip pageClip = readPageClip();
+    bool  pageActive = pageClip.active;
+    float pageX0 = pageClip.minX, pageY0 = pageClip.minY;
+    float pageX1 = pageClip.maxX, pageY1 = pageClip.maxY;
+
+    // Walk the cells in the AABB but skip ones the stroke can't reach.
+    // Without this, a long diagonal stroke (especially at low zoom-out)
+    // would create thousands of empty 256x256 RGBA tile FBOs purely
+    // because the AABB spans them — quickly exhausting GPU memory.
+    // Pessimistic check uses kMaxRadius regardless of per-sample pressure.
     for (int ty = ty0; ty <= ty1; ++ty) {
+        float tileY0 = ty * kTileSizeF;
+        float tileY1 = tileY0 + kTileSizeF;
         for (int tx = tx0; tx <= tx1; ++tx) {
+            float tileX0 = tx * kTileSizeF;
+            float tileX1 = tileX0 + kTileSizeF;
+
+            // Skip tiles entirely outside the page.
+            if (pageActive
+                && (tileX1 <= pageX0 || tileX0 >= pageX1
+                 || tileY1 <= pageY0 || tileY0 >= pageY1)) {
+                continue;
+            }
+
+            bool touched = false;
+            for (const auto& s : g_current.samples) {
+                if (s.x + kMaxRadius >= tileX0 && s.x - kMaxRadius <= tileX1
+                 && s.y + kMaxRadius >= tileY0 && s.y - kMaxRadius <= tileY1) {
+                    touched = true;
+                    break;
+                }
+            }
+            if (!touched) continue;
+
             Tile& tile = getOrCreateTile(layer, tx, ty);
             glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
             glViewport(0, 0, kTileSize, kTileSize);
@@ -1864,7 +2083,31 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
             float ox = tx * kTileSizeF;
             float oy = ty * kTileSizeF;
 
+            // Per-tile clip bounds in tile-local coords. Start with the
+            // full tile, then narrow to the intersection with the page
+            // for boundary tiles so dabs that cross the edge stop at it.
+            float clipMinX = 0.0f, clipMinY = 0.0f;
+            float clipMaxX = kTileSizeF, clipMaxY = kTileSizeF;
+            if (pageActive) {
+                clipMinX = std::max(0.0f,        pageX0 - ox);
+                clipMinY = std::max(0.0f,        pageY0 - oy);
+                clipMaxX = std::min(kTileSizeF,  pageX1 - ox);
+                clipMaxY = std::min(kTileSizeF,  pageY1 - oy);
+            }
+
+            // Set the dab fragment shader's page-clip uniforms in
+            // tile-local coords. Together with the emitter-level clip
+            // above, this gives clean fragment-level truncation at the
+            // page edge (no half-dab blobs leaking past it).
+            PageClip tilePage{pageActive, clipMinX, clipMinY, clipMaxX, clipMaxY};
+            uploadPageClip(g_dab.uPageMin, g_dab.uPageMax,
+                           g_dab.uPageActive, tilePage);
+
             DabEmitter e;
+            // Clip to the tile (and page, where applicable) so the path's
+            // interpolated dabs outside this region don't issue throwaway
+            // GL draw calls and don't paint outside the canvas.
+            e.setClipBounds(clipMinX, clipMinY, clipMaxX, clipMaxY);
             for (const auto& s : g_current.samples) {
                 e.extend(s.x - ox, s.y - oy, s.p);
             }
@@ -1926,10 +2169,15 @@ void drawLineSegment(float x0, float y0, float x1, float y1,
 }
 
 constexpr uint32_t kHandleColor       = 0x4080FFu;   // blue
-constexpr float    kHandleSize        = 14.0f;       // doc-pixel side length
-constexpr float    kHandleHitRadius   = 18.0f;       // tap tolerance for handles
-constexpr float    kRotateHandleOffset = 28.0f;      // distance above OBB top
-constexpr float    kSelectionOutlineWidth = 1.5f;
+// Visual / hit-test sizes for selection UI, expressed in view pixels.
+// Wrapped through vpxToDoc() at use sites so the on-screen size stays
+// constant regardless of view scale. (Drawn shape widths remain in
+// doc-px since they're a property of the doc, not the viewport.)
+constexpr float    kHandleSizeViewPx        = 14.0f;
+constexpr float    kHandleHitRadiusViewPx   = 18.0f;
+constexpr float    kRotateHandleOffsetViewPx = 28.0f;
+constexpr float    kSelectionOutlineWidthViewPx = 1.5f;
+inline float vpxToDoc(float vpx) { return vpx / currentViewScale(); }
 
 // Oriented bounding box for a shape, in doc-pixel space. Defined before
 // the handle-rendering helpers (which take it by reference) and before
@@ -2070,16 +2318,19 @@ void forEachShapeSnapTarget(const F& cb, const Selection* exclude = nullptr) {
     }
 }
 
-// Returns the nearest snap target to (x, y) within kSnapRadius. Falls
-// back to the nearest grid intersection when the grid is on and no shape
-// target qualifies.
+// Returns the nearest snap target to (x, y) within the screen-relative
+// snap radius. Falls back to the nearest grid intersection when the grid
+// is on and no shape target qualifies.
 struct SnapHit { float x, y; bool found; };
 
 SnapHit findSnap(float x, float y, const Selection* exclude = nullptr) {
     if (g_snapEnabled.load() == 0) return { x, y, false };
 
-    SnapHit best = { x, y, false };
-    float bestDist2 = kSnapRadius * kSnapRadius;
+    // Convert the view-pixel target radius into doc-px at the current zoom
+    // so snap stays the same on-screen distance regardless of view scale.
+    float radiusDoc  = kSnapRadiusViewPx / currentViewScale();
+    float bestDist2  = radiusDoc * radiusDoc;
+    SnapHit best     = { x, y, false };
 
     forEachShapeSnapTarget([&](float tx, float ty) {
         float dx = tx - x, dy = ty - y;
@@ -2094,7 +2345,7 @@ SnapHit findSnap(float x, float y, const Selection* exclude = nullptr) {
         float gx = std::round(x / kGridSpacing) * kGridSpacing;
         float gy = std::round(y / kGridSpacing) * kGridSpacing;
         float dx = gx - x, dy = gy - y;
-        if (dx * dx + dy * dy < kSnapRadius * kSnapRadius) {
+        if (dx * dx + dy * dy < radiusDoc * radiusDoc) {
             best = { gx, gy, true };
         }
     }
@@ -2108,20 +2359,22 @@ void drawEllipseAsLines(float cx, float cy, float rx, float ry, float rotation,
 // Draw a small ring + crosshair at (x, y) — the visual indicator for an
 // active snap. Caller has already bound the line program.
 void drawSnapMarker(float x, float y) {
-    drawEllipseAsLines(x, y, kSnapMarkerR, kSnapMarkerR, /*rotation*/ 0.0f,
-                       kSnapMarkerColor, 1.5f, 1.0f);
-    float h = kSnapMarkerR;
-    drawLineSegment(x - h, y, x + h, y, kSnapMarkerColor, 1.5f, 1.0f);
-    drawLineSegment(x, y - h, x, y + h, kSnapMarkerColor, 1.5f, 1.0f);
+    float r = vpxToDoc(kSnapMarkerRViewPx);
+    float w = vpxToDoc(kSelectionOutlineWidthViewPx);
+    drawEllipseAsLines(x, y, r, r, /*rotation*/ 0.0f,
+                       kSnapMarkerColor, w, 1.0f);
+    drawLineSegment(x - r, y, x + r, y, kSnapMarkerColor, w, 1.0f);
+    drawLineSegment(x, y - r, x, y + r, kSnapMarkerColor, w, 1.0f);
 }
 
 // Draw a small square handle (4 line segments) centered at (x, y).
 void drawHandle(float x, float y, float size, uint32_t color) {
     float h = size * 0.5f;
-    drawLineSegment(x - h, y - h, x + h, y - h, color, 1.5f, 1.0f);
-    drawLineSegment(x + h, y - h, x + h, y + h, color, 1.5f, 1.0f);
-    drawLineSegment(x + h, y + h, x - h, y + h, color, 1.5f, 1.0f);
-    drawLineSegment(x - h, y + h, x - h, y - h, color, 1.5f, 1.0f);
+    float w = vpxToDoc(kSelectionOutlineWidthViewPx);
+    drawLineSegment(x - h, y - h, x + h, y - h, color, w, 1.0f);
+    drawLineSegment(x + h, y - h, x + h, y + h, color, w, 1.0f);
+    drawLineSegment(x + h, y + h, x - h, y + h, color, w, 1.0f);
+    drawLineSegment(x - h, y + h, x - h, y - h, color, w, 1.0f);
 }
 
 // Compute the world position of one of the four scale handles. handleIdx:
@@ -2143,7 +2396,8 @@ void scaleHandlePosition(const Obb& o, ShapeKind kind, int handleIdx,
 
 // Rotate handle is offset above the OBB top-center.
 void rotateHandlePosition(const Obb& o, float& outX, float& outY) {
-    rotateLocalToWorld(o, 0.0f, -o.hh - kRotateHandleOffset, outX, outY);
+    rotateLocalToWorld(o, 0.0f, -o.hh - vpxToDoc(kRotateHandleOffsetViewPx),
+                       outX, outY);
 }
 
 // Number of scale handles for the shape (2 for Line, 4 for others).
@@ -2157,23 +2411,26 @@ void renderSelectionOverlay(const Selection& sel) {
     Obb obb;
     if (!obbForSelection(sel, obb)) return;
 
+    float outlineW = vpxToDoc(kSelectionOutlineWidthViewPx);
+    float handleSz = vpxToDoc(kHandleSizeViewPx);
+
     // OBB outline — 4 corners of the box (rotated).
     float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
     rotateLocalToWorld(obb, -obb.hw, -obb.hh, c0x, c0y);
     rotateLocalToWorld(obb, +obb.hw, -obb.hh, c1x, c1y);
     rotateLocalToWorld(obb, +obb.hw, +obb.hh, c2x, c2y);
     rotateLocalToWorld(obb, -obb.hw, +obb.hh, c3x, c3y);
-    drawLineSegment(c0x, c0y, c1x, c1y, kHandleColor, kSelectionOutlineWidth, 1.0f);
-    drawLineSegment(c1x, c1y, c2x, c2y, kHandleColor, kSelectionOutlineWidth, 1.0f);
-    drawLineSegment(c2x, c2y, c3x, c3y, kHandleColor, kSelectionOutlineWidth, 1.0f);
-    drawLineSegment(c3x, c3y, c0x, c0y, kHandleColor, kSelectionOutlineWidth, 1.0f);
+    drawLineSegment(c0x, c0y, c1x, c1y, kHandleColor, outlineW, 1.0f);
+    drawLineSegment(c1x, c1y, c2x, c2y, kHandleColor, outlineW, 1.0f);
+    drawLineSegment(c2x, c2y, c3x, c3y, kHandleColor, outlineW, 1.0f);
+    drawLineSegment(c3x, c3y, c0x, c0y, kHandleColor, outlineW, 1.0f);
 
     // Scale handles.
     int n = scaleHandleCount(sel.kind);
     for (int i = 0; i < n; ++i) {
         float hx, hy;
         scaleHandlePosition(obb, sel.kind, i, hx, hy);
-        drawHandle(hx, hy, kHandleSize, kHandleColor);
+        drawHandle(hx, hy, handleSz, kHandleColor);
     }
 
     // Rotate handle (skip for circles — rotation is invariant).
@@ -2183,8 +2440,8 @@ void renderSelectionOverlay(const Selection& sel) {
         float rhX, rhY;
         rotateHandlePosition(obb, rhX, rhY);
         drawLineSegment(anchorX, anchorY, rhX, rhY,
-                        kHandleColor, kSelectionOutlineWidth, 1.0f);
-        drawHandle(rhX, rhY, kHandleSize, kHandleColor);
+                        kHandleColor, outlineW, 1.0f);
+        drawHandle(rhX, rhY, handleSz, kHandleColor);
     }
 }
 
@@ -2240,7 +2497,14 @@ void drawEllipseAsLines(float cx, float cy, float rx, float ry, float rotation,
 constexpr float kSelectionHaloPad = 3.0f;            // extra half-width
 constexpr uint32_t kSelectionHaloColor = 0xFF8030u;  // orange
 constexpr float kSelectionHaloAlpha = 0.55f;
-constexpr float kHitThresholdPad = 6.0f;             // tap tolerance, doc px
+constexpr float kHitThresholdPadViewPx = 6.0f;       // tap tolerance, view px
+
+// Convert the view-pixel hit-test pad to a doc-pixel pad at the current
+// zoom level, so tapping near a shape outline keeps the same on-screen
+// tolerance regardless of how zoomed-in the user is.
+inline float hitThresholdPadDoc() {
+    return kHitThresholdPadViewPx / currentViewScale();
+}
 
 inline bool isShapeSelected(const Selection& sel, size_t layerIdx,
                             ShapeKind kind, size_t shapeIdx) {
@@ -2298,31 +2562,32 @@ bool hitTestActiveVectorLayer(float x, float y) {
 
     ShapeKind hitKind = ShapeKind::None;
     size_t    hitIdx  = 0;
+    float     pad     = hitThresholdPadDoc();
 
     for (size_t i = 0; i < layer.lines.size(); ++i) {
         const auto& l = layer.lines[i];
-        float thr = l.width * 0.5f + kHitThresholdPad;
+        float thr = l.width * 0.5f + pad;
         if (distToSegment(x, y, l.x0, l.y0, l.x1, l.y1) <= thr) {
             hitKind = ShapeKind::Line; hitIdx = i;
         }
     }
     for (size_t i = 0; i < layer.rects.size(); ++i) {
         const auto& r = layer.rects[i];
-        float thr = r.width * 0.5f + kHitThresholdPad;
+        float thr = r.width * 0.5f + pad;
         if (distToRectOutline(x, y, r.x0, r.y0, r.x1, r.y1) <= thr) {
             hitKind = ShapeKind::Rect; hitIdx = i;
         }
     }
     for (size_t i = 0; i < layer.ellipses.size(); ++i) {
         const auto& e = layer.ellipses[i];
-        float thr = e.width * 0.5f + kHitThresholdPad;
+        float thr = e.width * 0.5f + pad;
         if (distToEllipseOutline(x, y, e.cx, e.cy, e.rx, e.ry) <= thr) {
             hitKind = ShapeKind::Ellipse; hitIdx = i;
         }
     }
     for (size_t i = 0; i < layer.circles.size(); ++i) {
         const auto& c = layer.circles[i];
-        float thr = c.width * 0.5f + kHitThresholdPad;
+        float thr = c.width * 0.5f + pad;
         if (distToCircleOutline(x, y, c.cx, c.cy, c.radius) <= thr) {
             hitKind = ShapeKind::Circle; hitIdx = i;
         }
@@ -2355,6 +2620,10 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_lineProg.uTransform, transform);
     glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+    // Vector content gets the same page-clip treatment as raster strokes.
+    PageClip pageClip = readPageClip();
+    uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                   g_lineProg.uPageActive, pageClip);
 
     for (size_t i = 0; i < layer.lines.size(); ++i) {
         const auto& l = layer.lines[i];
@@ -2397,12 +2666,69 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
 void compositeAllLayers(JNIEnv* env, jint width, jint height,
                         jfloatArray transform) {
     glViewport(0, 0, width, height);
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);          // paper white
-    glClear(GL_COLOR_BUFFER_BIT);
+
+    PageClip pageClip = readPageClip();
+
+    if (pageClip.active) {
+        // Off-canvas background: light gray clear, then paint paper-white
+        // over the page rectangle. With page disabled, fall back to a
+        // single paper-white clear (the original behavior).
+        glDisable(GL_BLEND);
+        glClearColor(0.86f, 0.87f, 0.89f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glUseProgram(g_fill.program);
+        glBindVertexArray(g_quadVao);
+        uploadMat4(env, g_fill.uTransform, transform);
+        glUniform2f(g_fill.uScreen, (float)width, (float)height);
+        glUniform2f(g_fill.uMin, pageClip.minX, pageClip.minY);
+        glUniform2f(g_fill.uMax, pageClip.maxX, pageClip.maxY);
+        glUniform4f(g_fill.uFillColor, 1.0f, 1.0f, 1.0f, 1.0f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
 
     // Grid is part of the page background — between the paper-white clear
-    // and the layer tiles, so user strokes naturally occlude it.
+    // and the layer tiles, so user strokes naturally occlude it. Grid
+    // shader discards fragments outside the page when active.
+    {
+        glUseProgram(g_grid.program);
+        uploadPageClip(g_grid.uPageMin, g_grid.uPageMax,
+                       g_grid.uPageActive, pageClip);
+    }
     renderGridOverlay(env, width, height, transform);
+
+    // Page-boundary rectangle (anchor for the user when zoomed/rotated).
+    // Drawn under the layers so strokes that cross the boundary occlude
+    // it locally while the rest stays visible. The outline itself must
+    // NOT be page-clipped — that would invisibly trim its own edges.
+    if (pageClip.active) {
+        glUseProgram(g_lineProg.program);
+        glBindVertexArray(g_quadVao);
+        uploadMat4(env, g_lineProg.uTransform, transform);
+        glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+        uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                       g_lineProg.uPageActive,
+                       PageClip{false, 0, 0, 0, 0});
+        constexpr uint32_t kPageColor = 0x808890u;     // medium gray
+        constexpr float    kPageAlpha = 0.85f;
+        constexpr float    kPageWidthViewPx = 1.5f;
+        float w = vpxToDoc(kPageWidthViewPx);
+        drawLineSegment(pageClip.minX, pageClip.minY,
+                        pageClip.maxX, pageClip.minY, kPageColor, w, kPageAlpha);
+        drawLineSegment(pageClip.maxX, pageClip.minY,
+                        pageClip.maxX, pageClip.maxY, kPageColor, w, kPageAlpha);
+        drawLineSegment(pageClip.maxX, pageClip.maxY,
+                        pageClip.minX, pageClip.maxY, kPageColor, w, kPageAlpha);
+        drawLineSegment(pageClip.minX, pageClip.maxY,
+                        pageClip.minX, pageClip.minY, kPageColor, w, kPageAlpha);
+        glBindVertexArray(0);
+    }
 
     if (g_layers.empty()) return;
 
@@ -2442,6 +2768,11 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         glBindVertexArray(g_quadVao);
         uploadMat4(env, g_lineProg.uTransform, transform);
         glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+        // Selection handles & snap marker are UI affordances — must stay
+        // visible even when the selected shape is right at the page edge.
+        uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                       g_lineProg.uPageActive,
+                       PageClip{false, 0, 0, 0, 0});
         renderSelectionOverlay(sel);
         if (snapActive) {
             drawSnapMarker(snapMx, snapMy);
@@ -2477,6 +2808,11 @@ void renderShapePreviewToFront(JNIEnv* env, jint width, jint height,
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_lineProg.uTransform, transform);
     glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+    {
+        PageClip pageClip = readPageClip();
+        uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                       g_lineProg.uPageActive, pageClip);
+    }
 
     switch (shapeType) {
         case 0:
@@ -2963,7 +3299,7 @@ int hitTestSelectionHandle(float x, float y) {
         float rhX, rhY;
         rotateHandlePosition(obb, rhX, rhY);
         float dx = x - rhX, dy = y - rhY;
-        if (dx*dx + dy*dy <= kHandleHitRadius * kHandleHitRadius) {
+        if (dx*dx + dy*dy <= vpxToDoc(kHandleHitRadiusViewPx) * vpxToDoc(kHandleHitRadiusViewPx)) {
             return -2;
         }
     }
@@ -2974,7 +3310,7 @@ int hitTestSelectionHandle(float x, float y) {
         float hx, hy;
         scaleHandlePosition(obb, sel.kind, i, hx, hy);
         float dx = x - hx, dy = y - hy;
-        if (dx*dx + dy*dy <= kHandleHitRadius * kHandleHitRadius) {
+        if (dx*dx + dy*dy <= vpxToDoc(kHandleHitRadiusViewPx) * vpxToDoc(kHandleHitRadiusViewPx)) {
             return i;
         }
     }
@@ -3533,6 +3869,39 @@ Java_com_bk_drawing_NativeRenderer_setSnapEnabled(
     g_snapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
 }
 
+// Set the page bounds (in doc-pixels). Drawn during composite as a thin
+// outlined rectangle so the user can see where the page edges are when
+// zoomed/rotated. Pass any zero-size rect to disable the outline.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setPageBounds(
+        JNIEnv*, jobject,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
+    g_pageX0 = x0; g_pageY0 = y0;
+    g_pageX1 = x1; g_pageY1 = y1;
+}
+
+// Update the cached view scale (doc-px per view-px). Read by snap/hit-
+// test code and selection-overlay rendering to keep their effective
+// radii / sizes constant in screen space across pan/zoom/rotate.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setViewScale(
+        JNIEnv*, jobject, jfloat scale) {
+    if (!(scale > 1e-6f)) return;   // also rejects NaN
+    uint32_t bits;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    g_viewScaleBits.store(bits);
+}
+
+// Throw away an in-progress brush/eraser stroke without baking it into
+// tiles. Called when a 2-finger gesture interrupts a stroke so the
+// partial preview doesn't end up as an unwanted permanent mark.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_discardStroke(JNIEnv*, jobject) {
+    g_current.samples.clear();
+    g_liveEmitter.reset();
+}
+
 // Read accessors for UI display. Called from the UI thread; the values may
 // momentarily be stale relative to queued addLayer/cycleActiveLayer
 // actions (which apply on the GL thread) but the discrepancy resolves on
@@ -3610,6 +3979,14 @@ Java_com_bk_drawing_NativeRenderer_extendStroke(
     uploadMat4(env, g_dab.uTransform, transform);
     glUniform2f(g_dab.uScreen, (float)width, (float)height);
     glUniform4fv(g_dab.uColor, 1, kCoverageColor);
+    // Page-clip in doc-pixels: the live preview uses uTransform = doc→buffer
+    // and uCenter is in doc-pixels, so the shader's vDocPos is doc-pixels
+    // and the page rect goes in unmodified.
+    {
+        PageClip pageClip = readPageClip();
+        uploadPageClip(g_dab.uPageMin, g_dab.uPageMax,
+                       g_dab.uPageActive, pageClip);
+    }
     g_liveEmitter.extend(x, y, pressure);
     glBindVertexArray(0);
 
