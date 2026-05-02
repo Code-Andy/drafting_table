@@ -142,6 +142,20 @@ class MainActivity : AppCompatActivity() {
         }
         panel.addView(toolButton, panelChildParams())
 
+        val undoButton = Button(this).apply {
+            text = "Undo"
+            alpha = 0.92f
+            setOnClickListener { userUndo() }
+        }
+        panel.addView(undoButton, panelChildParams())
+
+        val redoButton = Button(this).apply {
+            text = "Redo"
+            alpha = 0.92f
+            setOnClickListener { userRedo() }
+        }
+        panel.addView(redoButton, panelChildParams())
+
         val addButton = Button(this).apply {
             text = "+ Layer"
             alpha = 0.92f
@@ -319,6 +333,22 @@ class MainActivity : AppCompatActivity() {
         snapEnabled = !snapEnabled
         NativeRenderer.setSnapEnabled(snapEnabled)
         snapButton.text = if (snapEnabled) "Snap: on" else "Snap: off"
+    }
+
+    private fun userUndo() {
+        NativeRenderer.undo()
+        // Undo runs on the GL thread on the next render; trigger one and
+        // resync our local layer-state mirror once it's had a chance to
+        // apply (LayerAdd / LayerClear undos can change layer count or
+        // active index).
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
+    private fun userRedo() {
+        NativeRenderer.redo()
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
     // ---- Helpers ---------------------------------------------------------

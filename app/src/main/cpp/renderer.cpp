@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <dirent.h>
 #include <memory>
 #include <mutex>
@@ -522,6 +523,8 @@ constexpr int kActionAddLayer       = 1;
 constexpr int kActionCycleActive    = 2;
 constexpr int kActionClearActive    = 3;
 constexpr int kActionAddVectorLayer = 4;
+constexpr int kActionUndo           = 5;
+constexpr int kActionRedo           = 6;
 
 // Shapes added from the UI thread are queued separately because they
 // carry per-shape data that doesn't fit in the int-tagged action queue.
@@ -586,6 +589,167 @@ struct DragState {
     float    snapX = 0.0f, snapY = 0.0f;
 };
 DragState g_drag;
+
+// ---- Undo / redo ---------------------------------------------------------
+//
+// Single global stack of reversible actions. Entries are pushed at the
+// point each mutation is realized (so e.g. queued vector-shape adds push
+// from applyPendingShapes after they actually land in g_layers, not from
+// the JNI thread when they're queued). Bounded by entry count and total
+// memory; oldest entries evict first.
+//
+// Threading: pushes happen from the GL thread (commitStroke, applyPending*,
+// applyUndo) and the UI thread (deleteSelection, end of a transform drag).
+// All access is protected by g_undoMutex. The actual undo() / redo() JNI
+// calls just enqueue a kActionUndo/Redo into the pending-action queue;
+// the GL thread runs the inverse mutation in applyPendingLayerActions so
+// GL state stays single-threaded.
+
+enum class UndoOp : int {
+    RasterStroke = 0,   // tile snapshots before/after a stroke bake
+    VectorAdd,          // shape was appended to a vector layer
+    VectorDelete,       // shape was removed from a vector layer
+    VectorMutate,       // shape was transformed (move/scale/rotate)
+    LayerClear,         // active layer was cleared
+    LayerAdd,           // a new layer was appended
+};
+
+struct TileSnap {
+    int  tx = 0, ty = 0;
+    bool existed = false;            // tile present at snapshot time
+    std::vector<uint8_t> bytes;      // size = kTileBytes when existed; else empty
+};
+
+struct ShapeData {
+    ShapeKind kind = ShapeKind::None;
+    Line    line{};
+    Rect    rect{};
+    Ellipse ellipse{};
+    Circle  circle{};
+};
+
+struct UndoEntry {
+    UndoOp op = UndoOp::RasterStroke;
+    size_t layerIdx = 0;
+
+    // RasterStroke: tile state before / after the bake (snapshots cover
+    //   the same tx,ty grid in both arrays in the same order).
+    // LayerClear:   beforeTiles holds the pre-clear tile state (raster).
+    std::vector<TileSnap> beforeTiles;
+    std::vector<TileSnap> afterTiles;
+
+    // VectorAdd:    afterShape  = pushed shape; shapeIdx = its index.
+    // VectorDelete: beforeShape = removed shape; shapeIdx = original index.
+    // VectorMutate: beforeShape / afterShape; shapeIdx = the shape's index.
+    ShapeData beforeShape;
+    ShapeData afterShape;
+    size_t    shapeIdx = 0;
+
+    // LayerClear (vector path): full pre-clear shape lists.
+    std::vector<Line>    beforeLines;
+    std::vector<Rect>    beforeRects;
+    std::vector<Ellipse> beforeEllipses;
+    std::vector<Circle>  beforeCircles;
+    LayerType            layerTypeBefore = LayerType::Raster;
+
+    // LayerAdd: type of the layer that was appended; previous active idx.
+    LayerType addedLayerType  = LayerType::Raster;
+    size_t    prevActiveLayer = 0;
+
+    size_t bytes = 0;                // approximate memory cost
+};
+
+constexpr size_t kMaxUndoEntries = 50;
+constexpr size_t kMaxUndoBytes   = 200u * 1024u * 1024u;   // combined cap
+
+std::mutex            g_undoMutex;
+std::deque<UndoEntry> g_undoStack;
+std::deque<UndoEntry> g_redoStack;
+size_t                g_undoTotalBytes = 0;
+size_t                g_redoTotalBytes = 0;
+
+// Drag-scoped pre-transform shape snapshot. Captured at beginInteractionAt
+// and consumed at endInteraction to build a VectorMutate entry. Both are
+// guarded by g_selectionMutex.
+Selection g_transformBeforeSel;
+ShapeData g_transformBeforeShape;
+
+size_t computeEntrySize(const UndoEntry& e) {
+    size_t s = sizeof(UndoEntry);
+    for (const auto& t : e.beforeTiles) s += t.bytes.size();
+    for (const auto& t : e.afterTiles)  s += t.bytes.size();
+    s += e.beforeLines.size()    * sizeof(Line);
+    s += e.beforeRects.size()    * sizeof(Rect);
+    s += e.beforeEllipses.size() * sizeof(Ellipse);
+    s += e.beforeCircles.size()  * sizeof(Circle);
+    return s;
+}
+
+void clearRedoStack_locked() {
+    g_redoTotalBytes = 0;
+    g_redoStack.clear();
+}
+
+// Drop oldest entries until under both the count and byte budgets.
+void enforceUndoBudget_locked() {
+    while ((g_undoStack.size() > kMaxUndoEntries
+            || g_undoTotalBytes + g_redoTotalBytes > kMaxUndoBytes)
+           && !g_undoStack.empty()) {
+        g_undoTotalBytes -= g_undoStack.front().bytes;
+        g_undoStack.pop_front();
+    }
+}
+
+// Push a fresh action onto the undo stack. Clears the redo stack (any
+// re-do history is invalidated by a new mutation).
+void pushUndoEntry(UndoEntry e) {
+    e.bytes = computeEntrySize(e);
+    std::lock_guard<std::mutex> lock(g_undoMutex);
+    clearRedoStack_locked();
+    g_undoTotalBytes += e.bytes;
+    g_undoStack.push_back(std::move(e));
+    enforceUndoBudget_locked();
+}
+
+bool shapeDataEqual(const ShapeData& a, const ShapeData& b) {
+    if (a.kind != b.kind) return false;
+    switch (a.kind) {
+        case ShapeKind::Line:    return std::memcmp(&a.line,    &b.line,    sizeof(Line))    == 0;
+        case ShapeKind::Rect:    return std::memcmp(&a.rect,    &b.rect,    sizeof(Rect))    == 0;
+        case ShapeKind::Ellipse: return std::memcmp(&a.ellipse, &b.ellipse, sizeof(Ellipse)) == 0;
+        case ShapeKind::Circle:  return std::memcmp(&a.circle,  &b.circle,  sizeof(Circle))  == 0;
+        case ShapeKind::None:    return true;
+    }
+    return true;
+}
+
+// Snapshot the active selection's shape into a ShapeData (used at drag
+// start and drag end for VectorMutate entries). Returns false if there's
+// no selection or the layer is gone.
+bool snapshotSelectionShape(const Selection& sel, ShapeData& out) {
+    out.kind = ShapeKind::None;
+    if (sel.kind == ShapeKind::None) return false;
+    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return false;
+    const Layer& layer = *g_layers[sel.layerIdx];
+    out.kind = sel.kind;
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx >= layer.lines.size()) return false;
+            out.line = layer.lines[sel.shapeIdx]; return true;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx >= layer.rects.size()) return false;
+            out.rect = layer.rects[sel.shapeIdx]; return true;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx >= layer.ellipses.size()) return false;
+            out.ellipse = layer.ellipses[sel.shapeIdx]; return true;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx >= layer.circles.size()) return false;
+            out.circle = layer.circles[sel.shapeIdx]; return true;
+        case ShapeKind::None:
+            return false;
+    }
+    return false;
+}
 
 constexpr float kDefaultLineWidth = 2.0f;
 
@@ -666,6 +830,20 @@ DabEmitter g_liveEmitter;
 // helpers.
 void saveVectorLayer(size_t layerIdx, const Layer& layer);
 void loadVectorLayerShapes(Layer& layer, const std::string& dir);
+void saveTileToDisk(size_t layerIdx, int64_t tileK);
+void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
+                          const uint8_t* bytes);
+void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out);
+void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
+                         std::vector<TileSnap>& out);
+void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
+                            const uint8_t* bytes);
+void deleteTileIfExists(size_t layerIdx, int tx, int ty);
+void applyTileSnap(size_t layerIdx, const TileSnap& snap);
+void deleteLayerDirIfExists(size_t layerIdx);
+void applyUndo();
+void applyRedo();
+void applyPendingShapes();
 void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
                                  jfloatArray transform);
 void compositeRasterLayer(const Layer& layer);
@@ -687,15 +865,23 @@ void applyPendingLayerActions() {
     }
     for (int a : actions) {
         if (a == kActionAddLayer) {
+            size_t prevActive = g_activeLayer;
             g_layers.push_back(std::make_unique<Layer>());
             g_activeLayer = g_layers.size() - 1;
             LOGI("layer added (count=%zu, active=%zu)",
                  g_layers.size(), g_activeLayer);
+            UndoEntry e;
+            e.op = UndoOp::LayerAdd;
+            e.layerIdx = g_activeLayer;
+            e.addedLayerType = LayerType::Raster;
+            e.prevActiveLayer = prevActive;
+            pushUndoEntry(std::move(e));
         } else if (a == kActionCycleActive && !g_layers.empty()) {
             g_activeLayer = (g_activeLayer + 1) % g_layers.size();
             LOGI("active layer cycled to %zu/%zu",
                  g_activeLayer, g_layers.size() - 1);
         } else if (a == kActionAddVectorLayer) {
+            size_t prevActive = g_activeLayer;
             auto layer = std::make_unique<Layer>();
             layer->type = LayerType::Vector;
             g_layers.push_back(std::move(layer));
@@ -706,10 +892,35 @@ void applyPendingLayerActions() {
             // even before any line is drawn. saveVectorLayer creates the
             // dir if needed and writes a header with zero shapes.
             saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
+            UndoEntry e;
+            e.op = UndoOp::LayerAdd;
+            e.layerIdx = g_activeLayer;
+            e.addedLayerType = LayerType::Vector;
+            e.prevActiveLayer = prevActive;
+            pushUndoEntry(std::move(e));
         } else if (a == kActionClearActive
                    && g_activeLayer < g_layers.size()
                    && g_layers[g_activeLayer]) {
             Layer& layer = *g_layers[g_activeLayer];
+            // Snapshot pre-clear state for undo (raster tiles or vector
+            // shapes, depending on layer type).
+            UndoEntry undo;
+            undo.op = UndoOp::LayerClear;
+            undo.layerIdx = g_activeLayer;
+            undo.layerTypeBefore = layer.type;
+            if (layer.type == LayerType::Raster) {
+                snapshotAllTiles(g_activeLayer, undo.beforeTiles);
+            } else {
+                undo.beforeLines    = layer.lines;
+                undo.beforeRects    = layer.rects;
+                undo.beforeEllipses = layer.ellipses;
+                undo.beforeCircles  = layer.circles;
+            }
+            bool somethingToUndo = !undo.beforeTiles.empty()
+                                || !undo.beforeLines.empty()
+                                || !undo.beforeRects.empty()
+                                || !undo.beforeEllipses.empty()
+                                || !undo.beforeCircles.empty();
             // Drop GL resources for raster tiles.
             for (auto& kv : layer.tiles) {
                 if (kv.second.fbo)     glDeleteFramebuffers(1, &kv.second.fbo);
@@ -743,6 +954,15 @@ void applyPendingLayerActions() {
                 }
             }
             LOGI("active layer %zu cleared", g_activeLayer);
+            if (somethingToUndo) pushUndoEntry(std::move(undo));
+        } else if (a == kActionUndo) {
+            // Realize any queued shapes first so they end up on the undo
+            // stack and can themselves be undone in the natural order.
+            applyPendingShapes();
+            applyUndo();
+        } else if (a == kActionRedo) {
+            applyPendingShapes();
+            applyRedo();
         }
     }
 }
@@ -1056,6 +1276,161 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
     return layer.tiles[k];
 }
 
+// Snapshot every tile in the inclusive bbox (tx0..tx1, ty0..ty1) of the
+// given layer into `out`. Tiles that don't currently exist are recorded
+// with `existed=false` and zero bytes (so undo of a stroke that created
+// new tiles deletes them rather than leaving zero-alpha leftovers). Tile
+// pixels are read via the tile's FBO with glReadPixels.
+void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
+                         std::vector<TileSnap>& out) {
+    out.clear();
+    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
+    Layer& layer = *g_layers[layerIdx];
+    if (layer.type != LayerType::Raster) return;
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            TileSnap snap;
+            snap.tx = tx; snap.ty = ty;
+            auto it = layer.tiles.find(tileKey(tx, ty));
+            if (it != layer.tiles.end()) {
+                snap.existed = true;
+                snap.bytes.resize(kTileBytes);
+                glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+                             snap.bytes.data());
+            }
+            out.push_back(std::move(snap));
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
+// Snapshot every existing tile in the layer (for full-layer-clear undo).
+void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out) {
+    out.clear();
+    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
+    Layer& layer = *g_layers[layerIdx];
+    if (layer.type != LayerType::Raster) return;
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    out.reserve(layer.tiles.size());
+    for (const auto& kv : layer.tiles) {
+        TileSnap snap;
+        unpackTileKey(kv.first, snap.tx, snap.ty);
+        snap.existed = true;
+        snap.bytes.resize(kTileBytes);
+        glBindFramebuffer(GL_FRAMEBUFFER, kv.second.fbo);
+        glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+                     snap.bytes.data());
+        out.push_back(std::move(snap));
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
+// Upload bytes into a tile's texture (creating it if necessary), then
+// persist to disk. Used by undo/redo to restore tile state.
+//
+// Save+restore the FBO binding so this is safe to call from inside the
+// pending-action drain at the start of compositeAllLayers, where the
+// caller's bound FBO is the multi-buffer and any leak would cause the
+// subsequent clear/grid/composite to write into a tile FBO instead.
+// (getOrCreateTile binds the new tile's FBO during its clear path.)
+void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
+                            const uint8_t* bytes) {
+    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
+    Layer& layer = *g_layers[layerIdx];
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    Tile& tile = getOrCreateTile(layer, tx, ty);
+    glBindTexture(GL_TEXTURE_2D, tile.texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kTileSize, kTileSize,
+                    GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    saveTileToDisk(layerIdx, tileKey(tx, ty));
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
+// Drop a tile's GL resources, remove it from the layer's map, and unlink
+// its on-disk file. No-op if the tile isn't present.
+void deleteTileIfExists(size_t layerIdx, int tx, int ty) {
+    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
+    Layer& layer = *g_layers[layerIdx];
+    int64_t k = tileKey(tx, ty);
+    auto it = layer.tiles.find(k);
+    if (it == layer.tiles.end()) {
+        // Even if no GPU tile, an orphan disk file from a partially-saved
+        // state should still be cleaned up; harmless if absent.
+        if (!g_docDir.empty()) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/layer_%zu/tile_%d_%d.bin",
+                     g_docDir.c_str(), layerIdx, tx, ty);
+            unlink(path);
+        }
+        return;
+    }
+    if (it->second.fbo)     glDeleteFramebuffers(1, &it->second.fbo);
+    if (it->second.texture) glDeleteTextures(1, &it->second.texture);
+    layer.tiles.erase(it);
+    if (!g_docDir.empty()) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/layer_%zu/tile_%d_%d.bin",
+                 g_docDir.c_str(), layerIdx, tx, ty);
+        unlink(path);
+    }
+}
+
+// Apply one tile snapshot (existed=true → upload bytes; false → delete).
+void applyTileSnap(size_t layerIdx, const TileSnap& snap) {
+    if (snap.existed) {
+        uploadTileBytesAndSave(layerIdx, snap.tx, snap.ty, snap.bytes.data());
+    } else {
+        deleteTileIfExists(layerIdx, snap.tx, snap.ty);
+    }
+}
+
+// Compute the tile-space bbox a stroke's samples will touch, the same
+// way bakeCurrentStrokeIntoTiles does. Returns false if there are no
+// samples (caller should skip snapshotting).
+bool currentStrokeTileBbox(int& tx0, int& tx1, int& ty0, int& ty1) {
+    if (g_current.samples.empty()) return false;
+    float pad = kMaxRadius;
+    float minX = g_current.samples.front().x, maxX = minX;
+    float minY = g_current.samples.front().y, maxY = minY;
+    for (const auto& s : g_current.samples) {
+        if (s.x < minX) minX = s.x;
+        if (s.x > maxX) maxX = s.x;
+        if (s.y < minY) minY = s.y;
+        if (s.y > maxY) maxY = s.y;
+    }
+    minX -= pad; maxX += pad;
+    minY -= pad; maxY += pad;
+    tx0 = static_cast<int>(std::floor(minX / kTileSizeF));
+    tx1 = static_cast<int>(std::floor(maxX / kTileSizeF));
+    ty0 = static_cast<int>(std::floor(minY / kTileSizeF));
+    ty1 = static_cast<int>(std::floor(maxY / kTileSizeF));
+    return true;
+}
+
+// Wipe the on-disk dir for a layer (used when undoing a layer add to
+// remove stranded shapes.bin / tile files).
+void deleteLayerDirIfExists(size_t layerIdx) {
+    if (g_docDir.empty()) return;
+    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    DIR* d = opendir(layerDir.c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        const char* n = e->d_name;
+        if (n[0] == '.') continue;
+        std::string p = layerDir + "/" + n;
+        unlink(p.c_str());
+    }
+    closedir(d);
+    rmdir(layerDir.c_str());
+}
+
 // ---- Persistence ---------------------------------------------------------
 
 // Move any tile_*_*.bin files at <docDir> root into <docDir>/layer_0/.
@@ -1326,11 +1701,81 @@ void applyPendingShapes() {
              g_activeLayer);
         return;
     }
-    for (const auto& s : lines)    layer.lines.push_back(s);
-    for (const auto& s : rects)    layer.rects.push_back(s);
-    for (const auto& s : ellipses) layer.ellipses.push_back(s);
-    for (const auto& s : circles)  layer.circles.push_back(s);
+    for (const auto& s : lines) {
+        layer.lines.push_back(s);
+        UndoEntry e;
+        e.op = UndoOp::VectorAdd;
+        e.layerIdx = g_activeLayer;
+        e.shapeIdx = layer.lines.size() - 1;
+        e.afterShape.kind = ShapeKind::Line;
+        e.afterShape.line = s;
+        pushUndoEntry(std::move(e));
+    }
+    for (const auto& s : rects) {
+        layer.rects.push_back(s);
+        UndoEntry e;
+        e.op = UndoOp::VectorAdd;
+        e.layerIdx = g_activeLayer;
+        e.shapeIdx = layer.rects.size() - 1;
+        e.afterShape.kind = ShapeKind::Rect;
+        e.afterShape.rect = s;
+        pushUndoEntry(std::move(e));
+    }
+    for (const auto& s : ellipses) {
+        layer.ellipses.push_back(s);
+        UndoEntry e;
+        e.op = UndoOp::VectorAdd;
+        e.layerIdx = g_activeLayer;
+        e.shapeIdx = layer.ellipses.size() - 1;
+        e.afterShape.kind = ShapeKind::Ellipse;
+        e.afterShape.ellipse = s;
+        pushUndoEntry(std::move(e));
+    }
+    for (const auto& s : circles) {
+        layer.circles.push_back(s);
+        UndoEntry e;
+        e.op = UndoOp::VectorAdd;
+        e.layerIdx = g_activeLayer;
+        e.shapeIdx = layer.circles.size() - 1;
+        e.afterShape.kind = ShapeKind::Circle;
+        e.afterShape.circle = s;
+        pushUndoEntry(std::move(e));
+    }
     saveVectorLayer(g_activeLayer, layer);
+}
+
+// Write tile pixel bytes to disk via tmp+rename. Callable when the
+// caller already has the bytes in hand (e.g. commitStroke's combined
+// after-snapshot + disk save pass). Bytes must be exactly kTileBytes.
+void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
+                          const uint8_t* bytes) {
+    if (g_docDir.empty()) return;
+    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    if (mkdir(layerDir.c_str(), 0755) != 0 && errno != EEXIST) {
+        LOGE("can't create %s (errno=%d)", layerDir.c_str(), errno);
+        return;
+    }
+    char path[1024], tmpPath[1024];
+    snprintf(path,    sizeof(path),    "%s/tile_%d_%d.bin",     layerDir.c_str(), tx, ty);
+    snprintf(tmpPath, sizeof(tmpPath), "%s/tile_%d_%d.bin.tmp", layerDir.c_str(), tx, ty);
+    FILE* f = fopen(tmpPath, "wb");
+    if (!f) {
+        LOGE("save tile (%d, %d) layer %zu: fopen %s failed",
+             tx, ty, layerIdx, tmpPath);
+        return;
+    }
+    size_t written = fwrite(bytes, 1, kTileBytes, f);
+    fclose(f);
+    if (written != kTileBytes) {
+        LOGE("save tile (%d, %d) layer %zu: short write %zu",
+             tx, ty, layerIdx, written);
+        unlink(tmpPath);
+        return;
+    }
+    if (rename(tmpPath, path) != 0) {
+        LOGE("save tile (%d, %d) layer %zu: rename failed (errno=%d)",
+             tx, ty, layerIdx, errno);
+    }
 }
 
 void saveTileToDisk(size_t layerIdx, int64_t tileK) {
@@ -1343,39 +1788,19 @@ void saveTileToDisk(size_t layerIdx, int64_t tileK) {
     int tx, ty;
     unpackTileKey(tileK, tx, ty);
 
+    // Read pixels via the tile's FBO. Restore the previous binding before
+    // returning so callers (notably undo/redo from inside the pending-
+    // action drain at the start of compositeAllLayers) don't end up with
+    // a tile FBO leaked into the multi-buffer composite path.
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
     std::vector<uint8_t> buf(kTileBytes);
     glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
                  buf.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 
-    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
-    if (mkdir(layerDir.c_str(), 0755) != 0 && errno != EEXIST) {
-        LOGE("can't create %s (errno=%d)", layerDir.c_str(), errno);
-        return;
-    }
-
-    char path[1024], tmpPath[1024];
-    snprintf(path,    sizeof(path),    "%s/tile_%d_%d.bin",     layerDir.c_str(), tx, ty);
-    snprintf(tmpPath, sizeof(tmpPath), "%s/tile_%d_%d.bin.tmp", layerDir.c_str(), tx, ty);
-
-    FILE* f = fopen(tmpPath, "wb");
-    if (!f) {
-        LOGE("save tile (%d, %d) layer %zu: fopen %s failed",
-             tx, ty, layerIdx, tmpPath);
-        return;
-    }
-    size_t written = fwrite(buf.data(), 1, buf.size(), f);
-    fclose(f);
-    if (written != buf.size()) {
-        LOGE("save tile (%d, %d) layer %zu: short write %zu",
-             tx, ty, layerIdx, written);
-        unlink(tmpPath);
-        return;
-    }
-    if (rename(tmpPath, path) != 0) {
-        LOGE("save tile (%d, %d) layer %zu: rename failed (errno=%d)",
-             tx, ty, layerIdx, errno);
-    }
+    writeTileBytesToDisk(layerIdx, tx, ty, buf.data());
 }
 
 // ---- Bake -----------------------------------------------------------------
@@ -2087,6 +2512,280 @@ void renderShapePreviewToFront(JNIEnv* env, jint width, jint height,
     glBindVertexArray(0);
 }
 
+// ---- Undo / redo apply ---------------------------------------------------
+
+void insertShapeAt(Layer& layer, ShapeKind kind, size_t idx, const ShapeData& sd) {
+    switch (kind) {
+        case ShapeKind::Line:
+            layer.lines.insert(layer.lines.begin()
+                + std::min(idx, layer.lines.size()), sd.line);
+            break;
+        case ShapeKind::Rect:
+            layer.rects.insert(layer.rects.begin()
+                + std::min(idx, layer.rects.size()), sd.rect);
+            break;
+        case ShapeKind::Ellipse:
+            layer.ellipses.insert(layer.ellipses.begin()
+                + std::min(idx, layer.ellipses.size()), sd.ellipse);
+            break;
+        case ShapeKind::Circle:
+            layer.circles.insert(layer.circles.begin()
+                + std::min(idx, layer.circles.size()), sd.circle);
+            break;
+        case ShapeKind::None:
+            break;
+    }
+}
+
+void eraseShapeAt(Layer& layer, ShapeKind kind, size_t idx) {
+    switch (kind) {
+        case ShapeKind::Line:
+            if (idx < layer.lines.size())
+                layer.lines.erase(layer.lines.begin() + idx);
+            break;
+        case ShapeKind::Rect:
+            if (idx < layer.rects.size())
+                layer.rects.erase(layer.rects.begin() + idx);
+            break;
+        case ShapeKind::Ellipse:
+            if (idx < layer.ellipses.size())
+                layer.ellipses.erase(layer.ellipses.begin() + idx);
+            break;
+        case ShapeKind::Circle:
+            if (idx < layer.circles.size())
+                layer.circles.erase(layer.circles.begin() + idx);
+            break;
+        case ShapeKind::None:
+            break;
+    }
+}
+
+void assignShapeAt(Layer& layer, ShapeKind kind, size_t idx, const ShapeData& sd) {
+    switch (kind) {
+        case ShapeKind::Line:
+            if (idx < layer.lines.size())    layer.lines[idx]    = sd.line;
+            break;
+        case ShapeKind::Rect:
+            if (idx < layer.rects.size())    layer.rects[idx]    = sd.rect;
+            break;
+        case ShapeKind::Ellipse:
+            if (idx < layer.ellipses.size()) layer.ellipses[idx] = sd.ellipse;
+            break;
+        case ShapeKind::Circle:
+            if (idx < layer.circles.size())  layer.circles[idx]  = sd.circle;
+            break;
+        case ShapeKind::None:
+            break;
+    }
+}
+
+// Drop GL resources for every tile in a layer, clear the tile map. Used
+// by both LayerClear redo and LayerAdd undo (defensive — added layers
+// should be empty already, but safe to call regardless).
+void dropAllTilesGl(Layer& layer) {
+    for (auto& kv : layer.tiles) {
+        if (kv.second.fbo)     glDeleteFramebuffers(1, &kv.second.fbo);
+        if (kv.second.texture) glDeleteTextures(1, &kv.second.texture);
+    }
+    layer.tiles.clear();
+}
+
+// Wipe the on-disk contents of a layer dir (but leave the dir itself).
+// Used by LayerClear redo to mirror the live clearActiveLayer path.
+void clearLayerDirOnDisk(size_t layerIdx) {
+    if (g_docDir.empty()) return;
+    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    DIR* d = opendir(layerDir.c_str());
+    if (!d) return;
+    struct dirent* dirEnt;
+    while ((dirEnt = readdir(d)) != nullptr) {
+        if (dirEnt->d_name[0] == '.') continue;
+        std::string p = layerDir + "/" + dirEnt->d_name;
+        unlink(p.c_str());
+    }
+    closedir(d);
+}
+
+// Reverse a previously-recorded action.
+void applyEntryReverse(const UndoEntry& e) {
+    switch (e.op) {
+        case UndoOp::RasterStroke: {
+            for (const auto& s : e.beforeTiles) applyTileSnap(e.layerIdx, s);
+            break;
+        }
+        case UndoOp::VectorAdd: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            eraseShapeAt(layer, e.afterShape.kind, e.shapeIdx);
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                if (g_selection.kind == e.afterShape.kind
+                    && g_selection.layerIdx == e.layerIdx
+                    && g_selection.shapeIdx == e.shapeIdx) {
+                    g_selection = Selection{};
+                }
+            }
+            saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::VectorDelete: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            insertShapeAt(layer, e.beforeShape.kind, e.shapeIdx, e.beforeShape);
+            saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::VectorMutate: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            assignShapeAt(layer, e.beforeShape.kind, e.shapeIdx, e.beforeShape);
+            saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::LayerClear: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            for (const auto& s : e.beforeTiles) applyTileSnap(e.layerIdx, s);
+            layer.lines    = e.beforeLines;
+            layer.rects    = e.beforeRects;
+            layer.ellipses = e.beforeEllipses;
+            layer.circles  = e.beforeCircles;
+            if (layer.type == LayerType::Vector) {
+                saveVectorLayer(e.layerIdx, layer);
+            }
+            break;
+        }
+        case UndoOp::LayerAdd: {
+            // Layer should be the topmost (other entries were undone in
+            // reverse). If not, something's gone wrong; bail safely.
+            if (e.layerIdx >= g_layers.size()
+                || e.layerIdx + 1 != g_layers.size()) {
+                LOGE("undo LayerAdd: layer %zu isn't topmost (size=%zu)",
+                     e.layerIdx, g_layers.size());
+                break;
+            }
+            if (g_layers[e.layerIdx]) {
+                dropAllTilesGl(*g_layers[e.layerIdx]);
+            }
+            g_layers.pop_back();
+            deleteLayerDirIfExists(e.layerIdx);
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                if (g_selection.layerIdx == e.layerIdx) {
+                    g_selection = Selection{};
+                }
+            }
+            if (e.prevActiveLayer < g_layers.size()) {
+                g_activeLayer = e.prevActiveLayer;
+            } else if (!g_layers.empty()) {
+                g_activeLayer = g_layers.size() - 1;
+            } else {
+                g_activeLayer = 0;
+            }
+            break;
+        }
+    }
+}
+
+// Re-apply a previously-undone action.
+void applyEntryForward(const UndoEntry& e) {
+    switch (e.op) {
+        case UndoOp::RasterStroke: {
+            for (const auto& s : e.afterTiles) applyTileSnap(e.layerIdx, s);
+            break;
+        }
+        case UndoOp::VectorAdd: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            insertShapeAt(layer, e.afterShape.kind, e.shapeIdx, e.afterShape);
+            saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::VectorDelete: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            eraseShapeAt(layer, e.beforeShape.kind, e.shapeIdx);
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                if (g_selection.kind == e.beforeShape.kind
+                    && g_selection.layerIdx == e.layerIdx
+                    && g_selection.shapeIdx == e.shapeIdx) {
+                    g_selection = Selection{};
+                }
+            }
+            saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::VectorMutate: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            assignShapeAt(layer, e.afterShape.kind, e.shapeIdx, e.afterShape);
+            saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::LayerClear: {
+            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
+            Layer& layer = *g_layers[e.layerIdx];
+            dropAllTilesGl(layer);
+            layer.lines.clear();
+            layer.rects.clear();
+            layer.ellipses.clear();
+            layer.circles.clear();
+            clearLayerDirOnDisk(e.layerIdx);
+            if (layer.type == LayerType::Vector) {
+                saveVectorLayer(e.layerIdx, layer);
+            }
+            break;
+        }
+        case UndoOp::LayerAdd: {
+            auto layer = std::make_unique<Layer>();
+            layer->type = e.addedLayerType;
+            g_layers.push_back(std::move(layer));
+            g_activeLayer = g_layers.size() - 1;
+            if (e.addedLayerType == LayerType::Vector) {
+                saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
+            }
+            break;
+        }
+    }
+}
+
+// Pop the top of the undo stack, reverse it, push onto the redo stack.
+// Caller is responsible for any subsequent re-render.
+void applyUndo() {
+    UndoEntry e;
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        if (g_undoStack.empty()) return;
+        e = std::move(g_undoStack.back());
+        g_undoStack.pop_back();
+        g_undoTotalBytes -= e.bytes;
+    }
+    applyEntryReverse(e);
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_redoTotalBytes += e.bytes;
+        g_redoStack.push_back(std::move(e));
+    }
+}
+
+void applyRedo() {
+    UndoEntry e;
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        if (g_redoStack.empty()) return;
+        e = std::move(g_redoStack.back());
+        g_redoStack.pop_back();
+        g_redoTotalBytes -= e.bytes;
+    }
+    applyEntryForward(e);
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoTotalBytes += e.bytes;
+        g_undoStack.push_back(std::move(e));
+    }
+}
+
 }  // namespace
 
 // ---- JNI ------------------------------------------------------------------
@@ -2142,6 +2841,32 @@ Java_com_bk_drawing_NativeRenderer_clearActiveLayer(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_addVectorLayer(JNIEnv*, jobject) {
     enqueuePendingAction(kActionAddVectorLayer);
+}
+
+// Undo / redo are queued through the same pending-action path so the
+// inverse mutation (which can touch GL state and disk) runs on the GL
+// thread. Caller should trigger a redraw afterward; the change won't be
+// visible until the next composite.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_undo(JNIEnv*, jobject) {
+    enqueuePendingAction(kActionUndo);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_redo(JNIEnv*, jobject) {
+    enqueuePendingAction(kActionRedo);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_canUndo(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_undoMutex);
+    return g_undoStack.empty() ? JNI_FALSE : JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_canRedo(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_undoMutex);
+    return g_redoStack.empty() ? JNI_FALSE : JNI_TRUE;
 }
 
 // Each addXxx packs the user's drag into a shape struct, picks up the
@@ -2293,6 +3018,8 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
             && sel.shapeIdx < g_layers[sel.layerIdx]->lines.size()) {
             g_drag.initialLine = g_layers[sel.layerIdx]->lines[sel.shapeIdx];
         }
+        g_transformBeforeSel = sel;
+        snapshotSelectionShape(sel, g_transformBeforeShape);
         return 3;
     }
 
@@ -2319,6 +3046,8 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
         g_drag.anchorX = ax;
         g_drag.anchorY = ay;
         g_drag.initialRotation = obb.rotation;
+        g_transformBeforeSel = sel;
+        snapshotSelectionShape(sel, g_transformBeforeShape);
         return 2;
     }
 
@@ -2338,6 +3067,8 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
             g_drag.mode = DragMode::Move;
             g_drag.moveOffsetX = x - obb.cx;
             g_drag.moveOffsetY = y - obb.cy;
+            g_transformBeforeSel = sel;
+            snapshotSelectionShape(sel, g_transformBeforeShape);
             return 1;
         }
     }
@@ -2358,6 +3089,8 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
             g_drag.moveOffsetX = 0.0f;
             g_drag.moveOffsetY = 0.0f;
         }
+        g_transformBeforeSel = sel;
+        snapshotSelectionShape(sel, g_transformBeforeShape);
         return 1;
     }
     // Empty tap — selection cleared by hitTestActiveVectorLayer.
@@ -2620,9 +3353,33 @@ Java_com_bk_drawing_NativeRenderer_updateInteractionAt(
 
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
-    std::lock_guard<std::mutex> lock(g_selectionMutex);
-    g_drag.mode = DragMode::None;
-    g_drag.snapActive = false;
+    DragMode  wasMode;
+    Selection beforeSel;
+    ShapeData beforeShape;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        wasMode     = g_drag.mode;
+        beforeSel   = g_transformBeforeSel;
+        beforeShape = g_transformBeforeShape;
+        g_drag.mode = DragMode::None;
+        g_drag.snapActive = false;
+        g_transformBeforeSel   = Selection{};
+        g_transformBeforeShape = ShapeData{};
+    }
+    if (wasMode == DragMode::None || beforeSel.kind == ShapeKind::None) return;
+    if (beforeShape.kind == ShapeKind::None) return;
+
+    ShapeData afterShape;
+    if (!snapshotSelectionShape(beforeSel, afterShape)) return;
+    if (shapeDataEqual(beforeShape, afterShape)) return;
+
+    UndoEntry entry;
+    entry.op          = UndoOp::VectorMutate;
+    entry.layerIdx    = beforeSel.layerIdx;
+    entry.shapeIdx    = beforeSel.shapeIdx;
+    entry.beforeShape = beforeShape;
+    entry.afterShape  = afterShape;
+    pushUndoEntry(std::move(entry));
 }
 
 JNIEXPORT void JNICALL
@@ -2678,27 +3435,51 @@ Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
     Layer& layer = *g_layers[sel.layerIdx];
     if (layer.type != LayerType::Vector) return;
 
+    // Snapshot the shape before erase, for undo.
+    UndoEntry entry;
+    entry.op = UndoOp::VectorDelete;
+    entry.layerIdx = sel.layerIdx;
+    entry.shapeIdx = sel.shapeIdx;
+    bool captured = false;
+
     switch (sel.kind) {
         case ShapeKind::Line:
-            if (sel.shapeIdx < layer.lines.size())
+            if (sel.shapeIdx < layer.lines.size()) {
+                entry.beforeShape.kind = ShapeKind::Line;
+                entry.beforeShape.line = layer.lines[sel.shapeIdx];
+                captured = true;
                 layer.lines.erase(layer.lines.begin() + sel.shapeIdx);
+            }
             break;
         case ShapeKind::Rect:
-            if (sel.shapeIdx < layer.rects.size())
+            if (sel.shapeIdx < layer.rects.size()) {
+                entry.beforeShape.kind = ShapeKind::Rect;
+                entry.beforeShape.rect = layer.rects[sel.shapeIdx];
+                captured = true;
                 layer.rects.erase(layer.rects.begin() + sel.shapeIdx);
+            }
             break;
         case ShapeKind::Ellipse:
-            if (sel.shapeIdx < layer.ellipses.size())
+            if (sel.shapeIdx < layer.ellipses.size()) {
+                entry.beforeShape.kind = ShapeKind::Ellipse;
+                entry.beforeShape.ellipse = layer.ellipses[sel.shapeIdx];
+                captured = true;
                 layer.ellipses.erase(layer.ellipses.begin() + sel.shapeIdx);
+            }
             break;
         case ShapeKind::Circle:
-            if (sel.shapeIdx < layer.circles.size())
+            if (sel.shapeIdx < layer.circles.size()) {
+                entry.beforeShape.kind = ShapeKind::Circle;
+                entry.beforeShape.circle = layer.circles[sel.shapeIdx];
+                captured = true;
                 layer.circles.erase(layer.circles.begin() + sel.shapeIdx);
+            }
             break;
         case ShapeKind::None:
             break;
     }
     saveVectorLayer(sel.layerIdx, layer);
+    if (captured) pushUndoEntry(std::move(entry));
 }
 
 // Persist the active vector layer to disk. Used after a transform-drag
@@ -2877,11 +3658,79 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     size_t layerIdx = g_strokeTarget < g_layers.size() ? g_strokeTarget
                                                        : g_layers.size() - 1;
 
+    // Snapshot tiles in the stroke's bbox BEFORE bake (only meaningful
+    // for raster layers; bake is a no-op for vector). Skip snapshot if
+    // there are no samples — the bake is a no-op too.
+    bool   snapForUndo = (layerIdx < g_layers.size()
+                          && g_layers[layerIdx]
+                          && g_layers[layerIdx]->type == LayerType::Raster);
+    int    tx0 = 0, tx1 = 0, ty0 = 0, ty1 = 0;
+    UndoEntry entry;
+    if (snapForUndo && currentStrokeTileBbox(tx0, tx1, ty0, ty1)) {
+        entry.op = UndoOp::RasterStroke;
+        entry.layerIdx = layerIdx;
+        snapshotTilesInBbox(layerIdx, tx0, tx1, ty0, ty1, entry.beforeTiles);
+    } else {
+        snapForUndo = false;
+    }
+
     std::vector<int64_t> dirty;
     bakeCurrentStrokeIntoTiles(&dirty, layerIdx);
 
-    for (int64_t k : dirty) {
-        saveTileToDisk(layerIdx, k);
+    if (snapForUndo) {
+        // Combined pass: readback each bbox tile once and reuse the bytes
+        // for both the undo's after-snapshot AND the on-disk save. This
+        // avoids reading every dirty tile twice (once for save, once for
+        // snapshot) — important because glReadPixels stalls the pipeline
+        // and the front-buffered renderer's commit can otherwise overrun
+        // a vsync, briefly double-rendering the stroke during the swap.
+        Layer& layer = *g_layers[layerIdx];
+        size_t cellCount = static_cast<size_t>((tx1 - tx0 + 1))
+                         * static_cast<size_t>((ty1 - ty0 + 1));
+        entry.afterTiles.reserve(cellCount);
+        GLint prevFboInner = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFboInner);
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                TileSnap snap;
+                snap.tx = tx; snap.ty = ty;
+                auto it = layer.tiles.find(tileKey(tx, ty));
+                if (it != layer.tiles.end()) {
+                    snap.existed = true;
+                    snap.bytes.resize(kTileBytes);
+                    glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                    glReadPixels(0, 0, kTileSize, kTileSize,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+                    writeTileBytesToDisk(layerIdx, tx, ty, snap.bytes.data());
+                }
+                entry.afterTiles.push_back(std::move(snap));
+            }
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, prevFboInner);
+
+        bool changed = entry.beforeTiles.size() == entry.afterTiles.size();
+        if (changed) {
+            // Confirm at least one tile differs (avoids a useless entry
+            // when, e.g., the stroke missed every pixel of every tile).
+            changed = false;
+            for (size_t i = 0; i < entry.beforeTiles.size(); ++i) {
+                const auto& b = entry.beforeTiles[i];
+                const auto& a = entry.afterTiles[i];
+                if (b.existed != a.existed
+                    || b.bytes.size() != a.bytes.size()
+                    || (b.existed && std::memcmp(b.bytes.data(),
+                                                  a.bytes.data(),
+                                                  b.bytes.size()) != 0)) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed) pushUndoEntry(std::move(entry));
+    } else {
+        for (int64_t k : dirty) {
+            saveTileToDisk(layerIdx, k);
+        }
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);

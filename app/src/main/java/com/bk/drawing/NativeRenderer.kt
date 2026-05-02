@@ -179,4 +179,16 @@ object NativeRenderer {
      */
     external fun getLayerCount(): Int
     external fun getActiveLayer(): Int
+
+    /**
+     * Undo/redo. Both are queued onto the GL thread alongside layer
+     * actions so the inverse mutation (which touches GL state and disk)
+     * runs on the right thread. Call forceRedraw() afterward to make
+     * the change appear immediately. canUndo/canRedo can be called from
+     * any thread for UI button state.
+     */
+    external fun undo()
+    external fun redo()
+    external fun canUndo(): Boolean
+    external fun canRedo(): Boolean
 }
