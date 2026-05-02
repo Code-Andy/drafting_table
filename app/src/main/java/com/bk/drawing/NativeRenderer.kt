@@ -53,10 +53,36 @@ object NativeRenderer {
 
     /**
      * Delete every tile in the active layer (GL textures + on-disk files).
-     * The layer itself remains; its tile map is just emptied. Safe to
-     * call from any thread.
+     * For a vector layer, drops every shape and rewrites the empty marker.
+     * Safe to call from any thread.
      */
     external fun clearActiveLayer()
+
+    /**
+     * Append a new (empty) vector layer above the current top, switch the
+     * active layer to it. Vector layers hold parametric shapes (lines for
+     * now; circles/rects later) instead of a tile grid.
+     */
+    external fun addVectorLayer()
+
+    /**
+     * Append a line shape to the active layer (only effective if the
+     * active layer is a vector layer). Color and width follow the current
+     * brush color and a fixed line width. Safe to call from any thread.
+     */
+    external fun addLine(x0: Float, y0: Float, x1: Float, y1: Float)
+
+    /**
+     * Live preview for the line tool — renders a single line into the
+     * currently-bound framebuffer (intended to be the front-buffered
+     * layer, called from inside onDrawFrontBufferedLayer). Clears the
+     * buffer first so successive previews replace rather than accumulate.
+     */
+    external fun renderLinePreview(
+        width: Int, height: Int,
+        transform: FloatArray,
+        x0: Float, y0: Float, x1: Float, y1: Float
+    )
 
     /**
      * Set the active drawing tool: 0 = brush, 1 = eraser. The next stroke
@@ -64,6 +90,20 @@ object NativeRenderer {
      * mid-stroke doesn't split a stroke. Safe to call from any thread.
      */
     external fun setTool(tool: Int)
+
+    /**
+     * Set the brush RGB color (alpha is fixed). `rgb` is 0xRRGGBB; any
+     * upper bits are ignored. Snapshotted at the next beginStroke. Safe
+     * to call from any thread.
+     */
+    external fun setBrushColor(rgb: Int)
+
+    /**
+     * Page-background grid controls. Read at multi-buffer composite time;
+     * call forceRedraw() afterward to make a change appear immediately.
+     */
+    external fun setGridEnabled(enabled: Boolean)
+    external fun setGridStyle(style: Int)   // 1 = lines, 2 = dots
 
     /**
      * Layer-state read accessors for UI display. Values may lag queued

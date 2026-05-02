@@ -9,37 +9,59 @@ import androidx.graphics.lowlatency.BufferInfo
 import androidx.graphics.lowlatency.GLFrontBufferedRenderer
 import androidx.graphics.opengl.egl.EGLManager
 
-data class StrokeSample(
-    val x: Float,
-    val y: Float,
-    val pressure: Float,
-    val isNewStroke: Boolean
-)
+// Param type for the front-buffered renderer. Brush/eraser strokes flow
+// through Sample (a stream per stroke); the line tool flows through
+// LinePreview (one entry per pen position during the drag).
+sealed class StrokeAction {
+    data class Sample(
+        val x: Float, val y: Float, val pressure: Float,
+        val isNewStroke: Boolean
+    ) : StrokeAction()
 
-enum class Tool(val nativeId: Int) { BRUSH(0), ERASER(1) }
+    data class LinePreview(
+        val x0: Float, val y0: Float,
+        val x1: Float, val y1: Float
+    ) : StrokeAction()
+}
+
+// LINE doesn't correspond to a native "stroke tool" (it doesn't flow
+// through beginStroke / extendStroke / commitStroke); its nativeId is
+// unused but kept consistent with the others for symmetry.
+enum class Tool(val nativeId: Int) { BRUSH(0), ERASER(1), LINE(2) }
 
 class DrawingSurfaceView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : SurfaceView(context, attrs) {
 
-    private val callback = object : GLFrontBufferedRenderer.Callback<StrokeSample> {
+    private val callback = object : GLFrontBufferedRenderer.Callback<StrokeAction> {
         override fun onDrawFrontBufferedLayer(
             eglManager: EGLManager,
             width: Int,
             height: Int,
             bufferInfo: BufferInfo,
             transform: FloatArray,
-            param: StrokeSample
+            param: StrokeAction
         ) {
-            if (param.isNewStroke) {
-                NativeRenderer.beginStroke()
+            when (param) {
+                is StrokeAction.Sample -> {
+                    if (param.isNewStroke) {
+                        NativeRenderer.beginStroke()
+                    }
+                    NativeRenderer.extendStroke(
+                        bufferInfo.width, bufferInfo.height,
+                        transform,
+                        param.x, param.y, param.pressure
+                    )
+                }
+                is StrokeAction.LinePreview -> {
+                    NativeRenderer.renderLinePreview(
+                        bufferInfo.width, bufferInfo.height,
+                        transform,
+                        param.x0, param.y0, param.x1, param.y1
+                    )
+                }
             }
-            NativeRenderer.extendStroke(
-                bufferInfo.width, bufferInfo.height,
-                transform,
-                param.x, param.y, param.pressure
-            )
         }
 
         override fun onDrawMultiBufferedLayer(
@@ -48,12 +70,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
             height: Int,
             bufferInfo: BufferInfo,
             transform: FloatArray,
-            params: Collection<StrokeSample>
+            params: Collection<StrokeAction>
         ) {
-            // Empty params means a refresh (e.g. orientation change), not a
-            // commit — don't promote the in-progress stroke to committed in
-            // that case, since the user may still be drawing it.
-            if (params.isNotEmpty()) {
+            // Only commit a brush/eraser stroke if this batch actually
+            // contained Sample entries. Line previews go through here too
+            // when the line tool's commit calls renderer.commit(); we
+            // mustn't bake an empty stroke in that case.
+            val hadStrokeSamples = params.any { it is StrokeAction.Sample }
+            if (hadStrokeSamples) {
                 NativeRenderer.commitStroke()
             }
             NativeRenderer.renderDocument(
@@ -63,8 +87,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
         }
     }
 
-    private var renderer: GLFrontBufferedRenderer<StrokeSample>? =
+    private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
         GLFrontBufferedRenderer(this, callback)
+
+    // Line-tool drag state (in view-space pixels).
+    private var lineP0X = 0f
+    private var lineP0Y = 0f
+    private var lineP1X = 0f
+    private var lineP1Y = 0f
 
     private var currentTool = Tool.BRUSH
 
@@ -74,10 +104,20 @@ class DrawingSurfaceView @JvmOverloads constructor(
     var onToolChanged: ((Tool) -> Unit)? = null
 
     /** Public so MainActivity's tool button can route through the same
-     *  code path the stylus side-button uses. */
+     *  code path the stylus side-button uses. Cycles brush → eraser →
+     *  line → brush. */
     fun toggleTool() {
-        currentTool = if (currentTool == Tool.BRUSH) Tool.ERASER else Tool.BRUSH
-        NativeRenderer.setTool(currentTool.nativeId)
+        currentTool = when (currentTool) {
+            Tool.BRUSH  -> Tool.ERASER
+            Tool.ERASER -> Tool.LINE
+            Tool.LINE   -> Tool.BRUSH
+        }
+        // Native only knows about the raster stroke tools (brush/eraser);
+        // LINE is handled entirely on the Kotlin side via the line tool
+        // gesture path, so we don't update the native tool state for it.
+        if (currentTool != Tool.LINE) {
+            NativeRenderer.setTool(currentTool.nativeId)
+        }
         Log.i("DrawingApp", "tool -> ${currentTool.name.lowercase()}")
         onToolChanged?.invoke(currentTool)
     }
@@ -131,22 +171,33 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (handleStylusButton(event)) return true
-        val tool = event.getToolType(0)
-        if (tool != MotionEvent.TOOL_TYPE_STYLUS && tool != MotionEvent.TOOL_TYPE_FINGER) {
+        val tt = event.getToolType(0)
+        if (tt != MotionEvent.TOOL_TYPE_STYLUS && tt != MotionEvent.TOOL_TYPE_FINGER) {
             return super.onTouchEvent(event)
         }
         val r = renderer ?: return super.onTouchEvent(event)
 
+        return when (currentTool) {
+            Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
+            Tool.LINE               -> handleLineEvent(r, event)
+        }
+    }
+
+    private fun handleStrokeEvent(
+        r: GLFrontBufferedRenderer<StrokeAction>,
+        event: MotionEvent
+    ): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 r.renderFrontBufferedLayer(
-                    StrokeSample(event.x, event.y, event.pressure, isNewStroke = true)
+                    StrokeAction.Sample(event.x, event.y, event.pressure,
+                                        isNewStroke = true)
                 )
             }
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until event.historySize) {
                     r.renderFrontBufferedLayer(
-                        StrokeSample(
+                        StrokeAction.Sample(
                             event.getHistoricalX(i),
                             event.getHistoricalY(i),
                             event.getHistoricalPressure(i),
@@ -155,10 +206,43 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     )
                 }
                 r.renderFrontBufferedLayer(
-                    StrokeSample(event.x, event.y, event.pressure, isNewStroke = false)
+                    StrokeAction.Sample(event.x, event.y, event.pressure,
+                                        isNewStroke = false)
                 )
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                r.commit()
+            }
+        }
+        return true
+    }
+
+    private fun handleLineEvent(
+        r: GLFrontBufferedRenderer<StrokeAction>,
+        event: MotionEvent
+    ): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lineP0X = event.x; lineP0Y = event.y
+                lineP1X = event.x; lineP1Y = event.y
+                r.renderFrontBufferedLayer(
+                    StrokeAction.LinePreview(lineP0X, lineP0Y, lineP1X, lineP1Y)
+                )
+            }
+            MotionEvent.ACTION_MOVE -> {
+                lineP1X = event.x; lineP1Y = event.y
+                r.renderFrontBufferedLayer(
+                    StrokeAction.LinePreview(lineP0X, lineP0Y, lineP1X, lineP1Y)
+                )
+            }
+            MotionEvent.ACTION_UP -> {
+                NativeRenderer.addLine(lineP0X, lineP0Y, lineP1X, lineP1Y)
+                // commit() clears the front buffer's preview and triggers a
+                // multi-buffer redraw via onDrawMultiBufferedLayer, which
+                // applies the queued line and re-renders the document.
+                r.commit()
+            }
+            MotionEvent.ACTION_CANCEL -> {
                 r.commit()
             }
         }

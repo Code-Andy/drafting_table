@@ -3,9 +3,11 @@ package com.bk.drawing
 import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.LinearLayout
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -18,11 +20,27 @@ class MainActivity : AppCompatActivity() {
     private var drawingView: DrawingSurfaceView? = null
     private lateinit var toolButton: Button
     private lateinit var layerButton: Button
+    private lateinit var gridButton: Button
+
+    // Grid cycles off → lines → dots → off.
+    private var gridState = 0   // 0 = off, 1 = lines, 2 = dots
 
     // Local prediction of native layer state. Initialized from a one-shot
     // read after the GL thread has had a chance to load tiles from disk.
     private var layerCount = 1
     private var activeLayerIndex = 0
+
+    // Preset brush palette — 0xRRGGBB. First entry is the default.
+    private val palette = intArrayOf(
+        0x14171F,   // dark blue-black (default)
+        0xB02828,   // red
+        0xC07020,   // orange
+        0xB8A020,   // mustard
+        0x408840,   // green
+        0x3060B8,   // blue
+        0x782878,   // purple
+        0x806040    // brown
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -129,6 +147,13 @@ class MainActivity : AppCompatActivity() {
         }
         panel.addView(addButton, panelChildParams())
 
+        val addVectorButton = Button(this).apply {
+            text = "+ V Layer"
+            alpha = 0.92f
+            setOnClickListener { userAddVectorLayer() }
+        }
+        panel.addView(addVectorButton, panelChildParams())
+
         layerButton = Button(this).apply {
             text = "Layer 1/1"
             alpha = 0.92f
@@ -143,7 +168,57 @@ class MainActivity : AppCompatActivity() {
         }
         panel.addView(clearButton, panelChildParams())
 
+        gridButton = Button(this).apply {
+            text = "Grid: off"
+            alpha = 0.92f
+            setOnClickListener { cycleGrid() }
+        }
+        panel.addView(gridButton, panelChildParams())
+
+        panel.addView(buildColorGrid(), panelChildParams())
+
         return panel
+    }
+
+    private fun cycleGrid() {
+        gridState = (gridState + 1) % 3
+        when (gridState) {
+            0 -> {
+                NativeRenderer.setGridEnabled(false)
+                gridButton.text = "Grid: off"
+            }
+            1 -> {
+                NativeRenderer.setGridStyle(1)
+                NativeRenderer.setGridEnabled(true)
+                gridButton.text = "Grid: lines"
+            }
+            2 -> {
+                NativeRenderer.setGridStyle(2)
+                NativeRenderer.setGridEnabled(true)
+                gridButton.text = "Grid: dots"
+            }
+        }
+        drawingView?.forceRedraw()
+    }
+
+    private fun buildColorGrid(): GridLayout {
+        val grid = GridLayout(this).apply {
+            columnCount = 4
+            alpha = 0.92f
+        }
+        palette.forEach { rgb ->
+            val swatch = View(this).apply {
+                setBackgroundColor(0xFF000000.toInt() or rgb)
+                setOnClickListener { NativeRenderer.setBrushColor(rgb) }
+            }
+            val lp = GridLayout.LayoutParams().apply {
+                width  = 32.dp
+                height = 32.dp
+                setMargins(2.dp, 2.dp, 2.dp, 2.dp)
+            }
+            grid.addView(swatch, lp)
+        }
+        return grid
     }
 
     private fun topRightPanelParams() = FrameLayout.LayoutParams(
@@ -174,7 +249,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateToolButton(tool: Tool) {
-        toolButton.text = if (tool == Tool.BRUSH) "Brush" else "Eraser"
+        toolButton.text = when (tool) {
+            Tool.BRUSH  -> "Brush"
+            Tool.ERASER -> "Eraser"
+            Tool.LINE   -> "Line"
+        }
     }
 
     private fun updateLayerButton() {
@@ -183,6 +262,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun userAddLayer() {
         NativeRenderer.addLayer()
+        layerCount++
+        activeLayerIndex = layerCount - 1
+        updateLayerButton()
+    }
+
+    private fun userAddVectorLayer() {
+        NativeRenderer.addVectorLayer()
         layerCount++
         activeLayerIndex = layerCount - 1
         updateLayerButton()

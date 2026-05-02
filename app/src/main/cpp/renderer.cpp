@@ -73,8 +73,11 @@ constexpr float kSpacing   = 0.18f;
 constexpr float kMinRadius = 2.0f;
 constexpr float kMaxRadius = 18.0f;
 
-// Brush dabs render this dark ink color, premultiplied + additive.
-constexpr float kBrushColor[4] = { 0.08f, 0.09f, 0.12f, 0.85f };
+// Brush dabs render with a runtime-settable color. The dab's per-fragment
+// alpha (kBrushAlpha * radial falloff) controls stroke buildup as
+// overlapping dabs accumulate; the *color* is g_strokeBrushColor, which
+// is captured from g_currentBrushColor at beginStroke.
+constexpr float kBrushAlpha = 0.85f;
 
 // During an erase stroke, the front-buffered live preview shows a pink
 // indicator (blended additively, like a brush) so the user can see where
@@ -162,16 +165,20 @@ void main() {
 }
 )";
 
-// Eraser preview composite. Output is premultiplied with alpha=c, so the
-// framework's premultiplied composite over the multi-buffer evaluates to:
-//     result = (fullErase * c) + multi * (1 - c)
-//            = lerp(multi, fullErase, c)
-// where fullErase = composite(below, above) is the "what would be left if
-// the active layer were removed entirely". By the linearity of
-// premultiplied compositing in any single layer's contribution, this lerp
-// equals the true WYSIWYG display target — the same result the eraser
-// bake will produce — for any 0 ≤ c ≤ 1. Includes the layers above
-// active correctly, so erasing under them doesn't make them disappear.
+// Unified live-preview composite for both brush and eraser. Output is
+// premultiplied with alpha = c (accumulated coverage), so the framework's
+// premultiplied composite over the multi-buffer yields:
+//     result = fullColor * c + multi * (1 - c)
+//            = lerp(multi, fullColor, c)
+// where fullColor is "the displayed pixel value if the active layer were
+// fully painted (brush) / fully erased (eraser) at this point". By the
+// linearity of premultiplied compositing in any single layer's
+// contribution, this lerp equals the true WYSIWYG display target for any
+// 0 ≤ c ≤ 1. Both tools therefore correctly render strokes UNDER any
+// layers above active, instead of overlaying them on top of multi.
+//
+//   eraser: fullColor = above + below * (1 - above.a)   // active gone
+//   brush:  fullColor = above + brushRgb * (1 - above.a) // active fully painted
 const char* kPreviewVS = R"(#version 300 es
 layout(location = 0) in vec2 aQuad;
 out vec2 vUv;
@@ -186,14 +193,142 @@ precision mediump float;
 in vec2 vUv;
 uniform sampler2D uBelow;     // paper + layers strictly below active; alpha=1
 uniform sampler2D uAbove;     // layers strictly above active, premultiplied
-uniform sampler2D uCoverage;  // erase coverage in alpha
+uniform sampler2D uCoverage;  // accumulated coverage in alpha channel
+uniform int       uMode;      // 0 = brush, 1 = eraser
+uniform vec3      uBrushRgb;  // un-premultiplied brush color (ignored for eraser)
 out vec4 outColor;
 void main() {
-    vec4 below = texture(uBelow, vUv);
     vec4 above = texture(uAbove, vUv);
     float c    = texture(uCoverage, vUv).a;
-    vec3 fullErase = above.rgb + below.rgb * (1.0 - above.a);
-    outColor = vec4(fullErase * c, c);
+
+    vec3 fullColor;
+    if (uMode == 1) {
+        vec4 below = texture(uBelow, vUv);
+        fullColor = above.rgb + below.rgb * (1.0 - above.a);
+    } else {
+        fullColor = above.rgb + uBrushRgb * (1.0 - above.a);
+    }
+    outColor = vec4(fullColor * c, c);
+}
+)";
+
+// Vector-layer line. Vertex shader morphs the unit quad into a
+// capsule-shaped quad oriented along the line, with an extra halfWidth
+// of margin past each endpoint so the rounded caps fit. Fragment shader
+// computes a capsule SDF (signed distance to the segment with rounded
+// ends) and anti-aliases over a 1-pixel band at the edge.
+const char* kLineVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+out vec2 vLineSpace;       // (along, across) from line midpoint, in doc-pixels
+uniform mat4  uTransform;
+uniform vec2  uScreen;
+uniform vec2  uP0;
+uniform vec2  uP1;
+uniform float uHalfWidth;
+void main() {
+    vec2 dir = uP1 - uP0;
+    float len = length(dir);
+    vec2 ndir = (len > 1e-6) ? dir / len : vec2(1.0, 0.0);
+    vec2 nrm  = vec2(-ndir.y, ndir.x);
+    vec2 mid  = (uP0 + uP1) * 0.5;
+
+    float halfLen   = len * 0.5;
+    float along     = aQuad.x * (halfLen + uHalfWidth);
+    float across    = aQuad.y * uHalfWidth;
+    vec2  docPos    = mid + ndir * along + nrm * across;
+
+    vec4 bufPx = uTransform * vec4(docPos, 0.0, 1.0);
+    vec2 ndc   = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+
+    vLineSpace = vec2(along, across);
+}
+)";
+
+const char* kLineFS = R"(#version 300 es
+// highp throughout — uP0/uP1 carry full-buffer-magnitude pixel
+// coordinates (up to ~2200), and at that magnitude the default mediump
+// (10-bit mantissa) has ~1.7 unit precision. length(uP1 - uP0) for
+// short lines then loses most of its accuracy, which warps the SDF
+// enough that alpha can't ramp correctly.
+precision highp float;
+in vec2 vLineSpace;
+uniform vec2  uP0;
+uniform vec2  uP1;
+uniform float uHalfWidth;
+uniform vec4  uColor;        // straight RGBA (premultiplied at output)
+out vec4 outColor;
+void main() {
+    float halfLen = length(uP1 - uP0) * 0.5;
+    float dAlong  = max(abs(vLineSpace.x) - halfLen, 0.0);
+    float dist    = sqrt(dAlong * dAlong + vLineSpace.y * vLineSpace.y);
+    float alpha   = 1.0 - smoothstep(uHalfWidth - 0.5, uHalfWidth + 0.5, dist);
+    if (alpha <= 0.0) discard;
+    float a = uColor.a * alpha;
+    outColor = vec4(uColor.rgb * a, a);
+}
+)";
+
+// Page-background grid. A fullscreen NDC quad whose fragment shader
+// computes each pixel's document position via the inverse of the
+// framework's transform matrix, then evaluates a periodic line/dot
+// pattern. Output is premultiplied so it composites cleanly onto the
+// paper-white-cleared multi-buffer ahead of the layer tiles.
+const char* kGridVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+void main() {
+    gl_Position = vec4(aQuad, 0.0, 1.0);
+}
+)";
+
+const char* kGridFS = R"(#version 300 es
+precision mediump float;
+uniform mat4  uInverseTransform;   // buffer-pixel -> document-pixel
+uniform float uSpacing;            // minor grid spacing in document pixels
+uniform float uSubdivisions;       // major lines every Nth minor
+uniform float uMinorWidth;         // half-width of minor line/dot in doc pixels
+uniform float uMajorWidth;
+uniform vec4  uMinorColor;         // straight RGBA
+uniform vec4  uMajorColor;
+uniform int   uStyle;              // 1 = lines, 2 = dots
+out vec4 outColor;
+
+void main() {
+    vec2 docPos = (uInverseTransform * vec4(gl_FragCoord.xy, 0.0, 1.0)).xy;
+
+    float sMin = uSpacing;
+    float sMaj = uSpacing * uSubdivisions;
+
+    // Distance to the nearest grid line per axis, in document pixels.
+    vec2 dMin = abs(mod(docPos + sMin * 0.5, sMin) - sMin * 0.5);
+    vec2 dMaj = abs(mod(docPos + sMaj * 0.5, sMaj) - sMaj * 0.5);
+
+    float aMinor = 0.0;
+    float aMajor = 0.0;
+
+    if (uStyle == 1) {
+        // Lines — close to ANY axis lights up.
+        aMinor = max(
+            1.0 - smoothstep(uMinorWidth, uMinorWidth + 1.0, dMin.x),
+            1.0 - smoothstep(uMinorWidth, uMinorWidth + 1.0, dMin.y));
+        aMajor = max(
+            1.0 - smoothstep(uMajorWidth, uMajorWidth + 1.0, dMaj.x),
+            1.0 - smoothstep(uMajorWidth, uMajorWidth + 1.0, dMaj.y));
+    } else if (uStyle == 2) {
+        // Dots — only at intersections (both axes close).
+        aMinor = 1.0 - smoothstep(uMinorWidth, uMinorWidth + 1.0, length(dMin));
+        aMajor = 1.0 - smoothstep(uMajorWidth, uMajorWidth + 1.0, length(dMaj));
+    }
+
+    vec4 col = vec4(0.0);
+    if (aMajor >= aMinor && aMajor > 0.001) {
+        col = vec4(uMajorColor.rgb, uMajorColor.a * aMajor);
+    } else if (aMinor > 0.001) {
+        col = vec4(uMinorColor.rgb, uMinorColor.a * aMinor);
+    }
+
+    // Premultiplied output for blending against the paper-white clear.
+    outColor = vec4(col.rgb * col.a, col.a);
 }
 )";
 
@@ -207,8 +342,20 @@ struct Tile {
     GLuint fbo     = 0;
 };
 
+// Vector-layer primitives. All coordinates are in document pixels.
+enum class LayerType : int { Raster = 0, Vector = 1 };
+
+struct Line {
+    float    x0, y0;
+    float    x1, y1;
+    uint32_t color;     // 0xRRGGBB
+    float    width;     // full line width in doc pixels
+};
+
 struct Layer {
-    std::unordered_map<int64_t, Tile> tiles;
+    LayerType type = LayerType::Raster;
+    std::unordered_map<int64_t, Tile> tiles;   // populated for raster
+    std::vector<Line> lines;                   // populated for vector
 };
 
 struct DabProg {
@@ -234,6 +381,30 @@ struct PreviewProg {
     GLint  uBelow    = -1;
     GLint  uAbove    = -1;
     GLint  uCoverage = -1;
+    GLint  uMode     = -1;
+    GLint  uBrushRgb = -1;
+};
+
+struct GridProg {
+    GLuint program           = 0;
+    GLint  uInverseTransform = -1;
+    GLint  uSpacing          = -1;
+    GLint  uSubdivisions     = -1;
+    GLint  uMinorWidth       = -1;
+    GLint  uMajorWidth       = -1;
+    GLint  uMinorColor       = -1;
+    GLint  uMajorColor       = -1;
+    GLint  uStyle            = -1;
+};
+
+struct LineProg {
+    GLuint program    = 0;
+    GLint  uTransform = -1;
+    GLint  uScreen    = -1;
+    GLint  uP0        = -1;
+    GLint  uP1        = -1;
+    GLint  uHalfWidth = -1;
+    GLint  uColor     = -1;
 };
 
 struct ViewFbo {
@@ -248,9 +419,28 @@ struct ViewFbo {
 DabProg     g_dab;
 CompProg    g_comp;
 PreviewProg g_preview;
+GridProg    g_grid;
+LineProg    g_lineProg;
 GLuint      g_quadVao = 0;
 GLuint      g_quadVbo = 0;
 bool        g_inited  = false;
+
+// Grid overlay state. Settable from any thread; read at multi-buffer
+// composite time. Style = 0 means "use most recent non-zero style"
+// internally, but the public setter only sends 1 (lines) or 2 (dots).
+std::atomic<int> g_gridEnabled{0};   // 0 = off, 1 = on
+std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
+
+constexpr float kGridSpacing      = 50.0f;       // doc pixels between minor lines
+constexpr float kGridSubdivisions = 5.0f;        // major every Nth minor
+// Half-widths in doc pixels. Lines look fine at sub-pixel widths since they're
+// extended; isolated dots need to be chunkier to read.
+constexpr float kGridMinorLineWidth = 0.5f;
+constexpr float kGridMajorLineWidth = 1.0f;
+constexpr float kGridMinorDotWidth  = 1.5f;
+constexpr float kGridMajorDotWidth  = 2.5f;
+constexpr float kGridMinorColor[4] = { 0.55f, 0.60f, 0.70f, 0.45f };  // straight RGBA
+constexpr float kGridMajorColor[4] = { 0.40f, 0.45f, 0.55f, 0.70f };
 
 // Live eraser preview state. Two layer-stack snapshots and one coverage
 // map, all sized to the buffer dimensions and lazily (re)allocated.
@@ -260,7 +450,7 @@ bool        g_inited  = false;
 ViewFbo g_belowFbo;
 ViewFbo g_aboveFbo;
 ViewFbo g_coverage;
-bool    g_needsErasePrep = false;    // set at beginStroke (eraser); cleared on first extendStroke
+bool    g_needsPreviewPrep = false;  // set at beginStroke; cleared on first extendStroke
 
 std::vector<std::unique_ptr<Layer>> g_layers;
 size_t g_activeLayer  = 0;
@@ -273,6 +463,12 @@ size_t g_strokeTarget = 0;          // captured at beginStroke
 std::atomic<int> g_currentTool{0};
 int g_strokeTool = 0;
 
+// Brush color: RGB packed into low 24 bits (0xRRGGBB). Settable from any
+// thread; the GL thread snapshots into g_strokeBrushColor at beginStroke.
+// Alpha component of the snapshot is kBrushAlpha.
+std::atomic<uint32_t> g_currentBrushColor{0x14171Fu};
+float g_strokeBrushColor[4] = { 0.08f, 0.09f, 0.12f, kBrushAlpha };
+
 Stroke     g_current;
 struct DabEmitter;                  // forward-decl
 extern DabEmitter g_liveEmitter;
@@ -284,9 +480,18 @@ bool        g_loaded = false;
 // start of each operation.
 std::mutex g_pendingMutex;
 std::vector<int> g_pendingActions;
-constexpr int kActionAddLayer    = 1;
-constexpr int kActionCycleActive = 2;
-constexpr int kActionClearActive = 3;
+constexpr int kActionAddLayer       = 1;
+constexpr int kActionCycleActive    = 2;
+constexpr int kActionClearActive    = 3;
+constexpr int kActionAddVectorLayer = 4;
+
+// Lines added from the UI thread are queued separately because they
+// carry data (the Line struct) that doesn't fit in the int-tagged action
+// queue. Drained on the GL thread alongside the layer-action queue.
+std::mutex        g_pendingLineMutex;
+std::vector<Line> g_pendingLines;
+
+constexpr float kDefaultLineWidth = 2.0f;
 
 // ---- Helpers --------------------------------------------------------------
 
@@ -361,6 +566,10 @@ struct DabEmitter {
 
 DabEmitter g_liveEmitter;
 
+// Forward declarations; defined down with the persistence helpers.
+void saveVectorLayer(size_t layerIdx, const Layer& layer);
+void loadVectorLayerShapes(Layer& layer, const std::string& dir);
+
 // ---- Pending layer actions ------------------------------------------------
 
 void enqueuePendingAction(int a) {
@@ -384,16 +593,30 @@ void applyPendingLayerActions() {
             g_activeLayer = (g_activeLayer + 1) % g_layers.size();
             LOGI("active layer cycled to %zu/%zu",
                  g_activeLayer, g_layers.size() - 1);
+        } else if (a == kActionAddVectorLayer) {
+            auto layer = std::make_unique<Layer>();
+            layer->type = LayerType::Vector;
+            g_layers.push_back(std::move(layer));
+            g_activeLayer = g_layers.size() - 1;
+            LOGI("vector layer added (count=%zu, active=%zu)",
+                 g_layers.size(), g_activeLayer);
+            // Marker file so loadAllLayersFromDisk recognizes the type
+            // even before any line is drawn. saveVectorLayer creates the
+            // dir if needed and writes a header with zero shapes.
+            saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
         } else if (a == kActionClearActive
                    && g_activeLayer < g_layers.size()
                    && g_layers[g_activeLayer]) {
             Layer& layer = *g_layers[g_activeLayer];
+            // Drop GL resources for raster tiles.
             for (auto& kv : layer.tiles) {
                 if (kv.second.fbo)     glDeleteFramebuffers(1, &kv.second.fbo);
                 if (kv.second.texture) glDeleteTextures(1, &kv.second.texture);
             }
             layer.tiles.clear();
-            // Also wipe the on-disk copy so the cleared state persists.
+            // Drop vector shapes too.
+            layer.lines.clear();
+            // Wipe the on-disk copy so the cleared state persists.
             if (!g_docDir.empty()) {
                 std::string layerDir = g_docDir + "/layer_"
                                      + std::to_string(g_activeLayer);
@@ -407,6 +630,11 @@ void applyPendingLayerActions() {
                         unlink(p.c_str());
                     }
                     closedir(d);
+                }
+                // For vector layers, re-create the empty marker so the
+                // type is preserved across launches.
+                if (layer.type == LayerType::Vector) {
+                    saveVectorLayer(g_activeLayer, layer);
                 }
             }
             LOGI("active layer %zu cleared", g_activeLayer);
@@ -480,6 +708,26 @@ void ensureInited() {
     g_preview.uBelow    = glGetUniformLocation(g_preview.program, "uBelow");
     g_preview.uAbove    = glGetUniformLocation(g_preview.program, "uAbove");
     g_preview.uCoverage = glGetUniformLocation(g_preview.program, "uCoverage");
+    g_preview.uMode     = glGetUniformLocation(g_preview.program, "uMode");
+    g_preview.uBrushRgb = glGetUniformLocation(g_preview.program, "uBrushRgb");
+
+    g_grid.program           = linkProgram(kGridVS, kGridFS);
+    g_grid.uInverseTransform = glGetUniformLocation(g_grid.program, "uInverseTransform");
+    g_grid.uSpacing          = glGetUniformLocation(g_grid.program, "uSpacing");
+    g_grid.uSubdivisions     = glGetUniformLocation(g_grid.program, "uSubdivisions");
+    g_grid.uMinorWidth       = glGetUniformLocation(g_grid.program, "uMinorWidth");
+    g_grid.uMajorWidth       = glGetUniformLocation(g_grid.program, "uMajorWidth");
+    g_grid.uMinorColor       = glGetUniformLocation(g_grid.program, "uMinorColor");
+    g_grid.uMajorColor       = glGetUniformLocation(g_grid.program, "uMajorColor");
+    g_grid.uStyle            = glGetUniformLocation(g_grid.program, "uStyle");
+
+    g_lineProg.program    = linkProgram(kLineVS, kLineFS);
+    g_lineProg.uTransform = glGetUniformLocation(g_lineProg.program, "uTransform");
+    g_lineProg.uScreen    = glGetUniformLocation(g_lineProg.program, "uScreen");
+    g_lineProg.uP0        = glGetUniformLocation(g_lineProg.program, "uP0");
+    g_lineProg.uP1        = glGetUniformLocation(g_lineProg.program, "uP1");
+    g_lineProg.uHalfWidth = glGetUniformLocation(g_lineProg.program, "uHalfWidth");
+    g_lineProg.uColor     = glGetUniformLocation(g_lineProg.program, "uColor");
 
     const float verts[] = {
         -1.0f, -1.0f,
@@ -507,6 +755,67 @@ void uploadMat4(JNIEnv* env, GLint loc, jfloatArray transform) {
     jfloat* arr = env->GetFloatArrayElements(transform, nullptr);
     glUniformMatrix4fv(loc, 1, GL_FALSE, arr);
     env->ReleaseFloatArrayElements(transform, arr, JNI_ABORT);
+}
+
+// General 4x4 matrix inverse via cofactor expansion (column-major in/out).
+// Returns true on success; on a singular matrix, leaves out untouched and
+// returns false. Used to map buffer-pixel coords back to document-pixel
+// coords for the grid overlay shader.
+bool invertMat4(const float* m, float* out) {
+    float inv[16];
+    inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+    inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+    inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+    inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+    inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+    inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+
+    float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (det == 0.0f) return false;
+    float invDet = 1.0f / det;
+    for (int i = 0; i < 16; ++i) out[i] = inv[i] * invDet;
+    return true;
+}
+
+void renderGridOverlay(JNIEnv* env, int width, int height,
+                       jfloatArray transform) {
+    if (g_gridEnabled.load() == 0) return;
+
+    jfloat* m = env->GetFloatArrayElements(transform, nullptr);
+    float invM[16];
+    bool ok = invertMat4(m, invM);
+    env->ReleaseFloatArrayElements(transform, m, JNI_ABORT);
+    if (!ok) return;
+
+    glViewport(0, 0, width, height);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_grid.program);
+    glBindVertexArray(g_quadVao);
+
+    int style = g_gridStyle.load();
+    glUniformMatrix4fv(g_grid.uInverseTransform, 1, GL_FALSE, invM);
+    glUniform1f(g_grid.uSpacing, kGridSpacing);
+    glUniform1f(g_grid.uSubdivisions, kGridSubdivisions);
+    glUniform1f(g_grid.uMinorWidth,
+                style == 2 ? kGridMinorDotWidth : kGridMinorLineWidth);
+    glUniform1f(g_grid.uMajorWidth,
+                style == 2 ? kGridMajorDotWidth : kGridMajorLineWidth);
+    glUniform4fv(g_grid.uMinorColor, 1, kGridMinorColor);
+    glUniform4fv(g_grid.uMajorColor, 1, kGridMajorColor);
+    glUniform1i(g_grid.uStyle, style);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
 }
 
 // ---- Eraser-preview FBO helpers ------------------------------------------
@@ -585,13 +894,14 @@ void renderLayerRangeIntoFbo(JNIEnv* env, ViewFbo& target,
     glBindVertexArray(0);
 }
 
-// Populate the scratch buffers used by the eraser preview composite. The
-// active layer is intentionally omitted — by compositing linearity, lerp
-// between multi (active in) and fullErase (active out) recovers the true
-// disp(c) for any 0 ≤ c ≤ 1, and the framework's alpha-blend does the
-// lerp for free.
-void prepareErasePreviewBuffers(JNIEnv* env, int width, int height,
-                                jfloatArray transform) {
+// Populate the scratch buffers used by the live-preview composite. Both
+// the brush and the eraser paths share the same plumbing — only the
+// preview shader's mode + uniforms differ. The active layer is
+// intentionally omitted: compositing is linear in any single layer's
+// contribution, so the framework's alpha-blend recovers the true
+// disp(c) for free as a lerp between multi and fullColor.
+void preparePreviewBuffers(JNIEnv* env, int width, int height,
+                           jfloatArray transform) {
     // below: paper + layers strictly below active (paper-backed, alpha=1)
     renderLayerRangeIntoFbo(env, g_belowFbo, 0, g_strokeTarget,
                             width, height, transform, /*clearWhite=*/true);
@@ -740,7 +1050,17 @@ void loadAllLayersFromDisk() {
 
     for (int idx : indices) {
         std::string dirPath = g_docDir + "/layer_" + std::to_string(idx);
-        loadTilesIntoLayer(*g_layers[idx], dirPath);
+        Layer& layer = *g_layers[idx];
+        // Detect type by file presence: shapes.bin → Vector; tiles → Raster.
+        struct stat st;
+        std::string shapesPath = dirPath + "/shapes.bin";
+        if (stat(shapesPath.c_str(), &st) == 0) {
+            layer.type = LayerType::Vector;
+            loadVectorLayerShapes(layer, dirPath);
+        } else {
+            layer.type = LayerType::Raster;
+            loadTilesIntoLayer(layer, dirPath);
+        }
     }
 }
 
@@ -752,6 +1072,107 @@ void ensureLoaded() {
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     loadAllLayersFromDisk();
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
+// ---- Vector-layer persistence --------------------------------------------
+//
+// Each vector layer is one file: <docDir>/layer_<idx>/shapes.bin. The
+// presence of this file is also how loadAllLayersFromDisk recognizes a
+// layer as Vector vs Raster, so we always write at least the header
+// (4-byte magic + 4-byte shape count) — even for an empty vector layer.
+
+constexpr uint32_t kShapesMagic = 0x30434556u;   // "VEC0" little-endian
+constexpr uint8_t  kShapeTypeLine = 1;
+
+void saveVectorLayer(size_t layerIdx, const Layer& layer) {
+    if (g_docDir.empty()) return;
+
+    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    if (mkdir(layerDir.c_str(), 0755) != 0 && errno != EEXIST) {
+        LOGE("save vector layer %zu: mkdir failed (errno=%d)", layerIdx, errno);
+        return;
+    }
+
+    std::string path    = layerDir + "/shapes.bin";
+    std::string tmpPath = path + ".tmp";
+
+    FILE* f = fopen(tmpPath.c_str(), "wb");
+    if (!f) {
+        LOGE("save vector layer %zu: fopen failed", layerIdx);
+        return;
+    }
+    uint32_t magic = kShapesMagic;
+    uint32_t count = static_cast<uint32_t>(layer.lines.size());
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&count, sizeof(count), 1, f);
+    for (const auto& l : layer.lines) {
+        uint8_t type = kShapeTypeLine;
+        fwrite(&type, sizeof(type), 1, f);
+        fwrite(&l, sizeof(Line), 1, f);
+    }
+    fclose(f);
+    if (rename(tmpPath.c_str(), path.c_str()) != 0) {
+        LOGE("save vector layer %zu: rename failed", layerIdx);
+    }
+}
+
+void loadVectorLayerShapes(Layer& layer, const std::string& dir) {
+    std::string path = dir + "/shapes.bin";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return;
+
+    uint32_t magic = 0, count = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != kShapesMagic) {
+        LOGE("vector layer at %s: bad magic", dir.c_str());
+        fclose(f);
+        return;
+    }
+    if (fread(&count, sizeof(count), 1, f) != 1) {
+        fclose(f);
+        return;
+    }
+    layer.lines.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t type = 0;
+        if (fread(&type, sizeof(type), 1, f) != 1) break;
+        if (type == kShapeTypeLine) {
+            Line l;
+            if (fread(&l, sizeof(Line), 1, f) != 1) break;
+            layer.lines.push_back(l);
+        } else {
+            // Unknown shape type — bail rather than mis-parse downstream.
+            LOGE("vector layer at %s: unknown shape type %d", dir.c_str(), type);
+            break;
+        }
+    }
+    fclose(f);
+    LOGI("loaded %zu shapes from %s", layer.lines.size(), dir.c_str());
+}
+
+// ---- Pending vector-layer line additions ---------------------------------
+
+void applyPendingLines() {
+    std::vector<Line> lines;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingLineMutex);
+        lines.swap(g_pendingLines);
+    }
+    if (lines.empty()) return;
+
+    // Lines append to whichever layer is active when applied. If the
+    // active layer isn't vector, drop them (the line tool shouldn't have
+    // committed in the first place; user UI can prevent this).
+    if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return;
+    Layer& layer = *g_layers[g_activeLayer];
+    if (layer.type != LayerType::Vector) {
+        LOGE("dropping %zu queued lines: active layer %zu is not vector",
+             lines.size(), g_activeLayer);
+        return;
+    }
+    for (const Line& l : lines) {
+        layer.lines.push_back(l);
+    }
+    saveVectorLayer(g_activeLayer, layer);
 }
 
 void saveTileToDisk(size_t layerIdx, int64_t tileK) {
@@ -807,6 +1228,16 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     if (layerIdx >= g_layers.size()) return;
     Layer& layer = *g_layers[layerIdx];
 
+    // Brush/eraser are raster operations; they can't bake into a vector
+    // layer. Drop the samples so they don't get re-tried on next render
+    // and so stale tiles don't end up in the layer's tile map.
+    if (layer.type != LayerType::Raster) {
+        g_current.samples.clear();
+        LOGI("brush/eraser stroke dropped: active layer %zu is vector",
+             layerIdx);
+        return;
+    }
+
     float pad = kMaxRadius;
     float minX = g_current.samples.front().x, maxX = minX;
     float minY = g_current.samples.front().y, maxY = minY;
@@ -832,7 +1263,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     if (g_strokeTool == 0) {
         // Brush: additive premultiplied.
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        glUniform4fv(g_dab.uColor, 1, kBrushColor);
+        glUniform4fv(g_dab.uColor, 1, g_strokeBrushColor);
     } else {
         // Eraser: subtract coverage. Tile alpha (and rgb) get scaled by
         // (1 - srcAlpha), so painted pixels go transparent and the
@@ -869,39 +1300,115 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
 
 // ---- Compose --------------------------------------------------------------
 
-void compositeAllLayers(JNIEnv* env, jint width, jint height,
-                        jfloatArray transform) {
-    glViewport(0, 0, width, height);
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);          // paper white
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (g_layers.empty()) return;
-
-    // Tiles are premultiplied, so the global blend is the right setting.
+// Helper: bind the raster compositing pipeline (program + uniforms).
+// Reused both at the top of compositeAllLayers and after we temporarily
+// switch to the line program for a vector layer.
+void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
+                                 jfloatArray transform) {
     glUseProgram(g_comp.program);
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_comp.uTransform, transform);
     glUniform2f(g_comp.uScreen, (float)width, (float)height);
     glUniform1f(g_comp.uTileHalf, kTileHalfF);
     glUniform1i(g_comp.uTileTex, 0);
-
     glActiveTexture(GL_TEXTURE0);
+}
+
+void compositeRasterLayer(const Layer& layer) {
+    // Caller must have bound the raster pipeline first.
+    for (const auto& kv : layer.tiles) {
+        int tx, ty;
+        unpackTileKey(kv.first, tx, ty);
+        float cx = tx * kTileSizeF + kTileHalfF;
+        float cy = ty * kTileSizeF + kTileHalfF;
+        glBindTexture(GL_TEXTURE_2D, kv.second.texture);
+        glUniform2f(g_comp.uTileCenter, cx, cy);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+}
+
+void compositeVectorLayer(JNIEnv* env, const Layer& layer,
+                          jint width, jint height, jfloatArray transform) {
+    if (layer.lines.empty()) return;
+    glUseProgram(g_lineProg.program);
+    glBindVertexArray(g_quadVao);
+    uploadMat4(env, g_lineProg.uTransform, transform);
+    glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+
+    for (const auto& l : layer.lines) {
+        glUniform2f(g_lineProg.uP0, l.x0, l.y0);
+        glUniform2f(g_lineProg.uP1, l.x1, l.y1);
+        glUniform1f(g_lineProg.uHalfWidth, l.width * 0.5f);
+        float r = ((l.color >> 16) & 0xFFu) / 255.0f;
+        float g = ((l.color >>  8) & 0xFFu) / 255.0f;
+        float b = ( l.color        & 0xFFu) / 255.0f;
+        float c[4] = { r, g, b, 1.0f };
+        glUniform4fv(g_lineProg.uColor, 1, c);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+}
+
+void compositeAllLayers(JNIEnv* env, jint width, jint height,
+                        jfloatArray transform) {
+    glViewport(0, 0, width, height);
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);          // paper white
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Grid is part of the page background — between the paper-white clear
+    // and the layer tiles, so user strokes naturally occlude it.
+    renderGridOverlay(env, width, height, transform);
+
+    if (g_layers.empty()) return;
+
+    // Premultiplied blend is the global default; both raster tiles and
+    // vector lines composite correctly under it.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    bindRasterCompositePipeline(env, width, height, transform);
 
     for (const auto& layer : g_layers) {
         if (!layer) continue;
-        for (const auto& kv : layer->tiles) {
-            int tx, ty;
-            unpackTileKey(kv.first, tx, ty);
-            float cx = tx * kTileSizeF + kTileHalfF;
-            float cy = ty * kTileSizeF + kTileHalfF;
-
-            glBindTexture(GL_TEXTURE_2D, kv.second.texture);
-            glUniform2f(g_comp.uTileCenter, cx, cy);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        if (layer->type == LayerType::Raster) {
+            compositeRasterLayer(*layer);
+        } else { // Vector
+            compositeVectorLayer(env, *layer, width, height, transform);
+            // Switch back to raster pipeline for the next raster layer.
+            bindRasterCompositePipeline(env, width, height, transform);
         }
     }
 
     glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+}
+
+// Renders a single line into the currently-bound framebuffer, used for
+// the live preview during the line tool's drag. Clears the buffer first
+// so successive previews replace rather than accumulate.
+void renderLinePreviewToFront(JNIEnv* env, jint width, jint height,
+                              jfloatArray transform,
+                              float x0, float y0, float x1, float y1,
+                              uint32_t rgb, float lineWidth, float alpha) {
+    glViewport(0, 0, width, height);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_lineProg.program);
+    glBindVertexArray(g_quadVao);
+    uploadMat4(env, g_lineProg.uTransform, transform);
+    glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+    glUniform2f(g_lineProg.uP0, x0, y0);
+    glUniform2f(g_lineProg.uP1, x1, y1);
+    glUniform1f(g_lineProg.uHalfWidth, lineWidth * 0.5f);
+    float r = ((rgb >> 16) & 0xFFu) / 255.0f;
+    float g = ((rgb >>  8) & 0xFFu) / 255.0f;
+    float b = ( rgb        & 0xFFu) / 255.0f;
+    float c[4] = { r, g, b, alpha };
+    glUniform4fv(g_lineProg.uColor, 1, c);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 }
 
@@ -925,6 +1432,24 @@ Java_com_bk_drawing_NativeRenderer_setTool(JNIEnv*, jobject, jint tool) {
 }
 
 JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setBrushColor(JNIEnv*, jobject, jint rgb) {
+    // Mask to 24 bits in case caller passes a packed ARGB; we ignore alpha.
+    g_currentBrushColor.store(static_cast<uint32_t>(rgb) & 0x00FFFFFFu);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setGridEnabled(JNIEnv*, jobject, jboolean enabled) {
+    g_gridEnabled.store(enabled ? 1 : 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setGridStyle(JNIEnv*, jobject, jint style) {
+    // Only 1 (lines) or 2 (dots) are valid; clamp.
+    int s = (style == 2) ? 2 : 1;
+    g_gridStyle.store(s);
+}
+
+JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_addLayer(JNIEnv*, jobject) {
     enqueuePendingAction(kActionAddLayer);
 }
@@ -937,6 +1462,45 @@ Java_com_bk_drawing_NativeRenderer_cycleActiveLayer(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_clearActiveLayer(JNIEnv*, jobject) {
     enqueuePendingAction(kActionClearActive);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_addVectorLayer(JNIEnv*, jobject) {
+    enqueuePendingAction(kActionAddVectorLayer);
+}
+
+// Append a line to the active vector layer. Color (0xRRGGBB) and width
+// default to the brush color and a fixed line width if Kotlin passes 0.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_addLine(
+        JNIEnv*, jobject,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    Line l;
+    l.x0 = x0; l.y0 = y0;
+    l.x1 = x1; l.y1 = y1;
+    l.color = g_currentBrushColor.load();
+    l.width = kDefaultLineWidth;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingLineMutex);
+        g_pendingLines.push_back(l);
+    }
+}
+
+// Live preview during line-tool drag: renders into the currently-bound
+// framebuffer (the front-buffered layer when called from the framework
+// callback). Color follows the current brush color.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_renderLinePreview(
+        JNIEnv* env, jobject,
+        jint width, jint height,
+        jfloatArray transform,
+        jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    ensureInited();
+    uint32_t rgb = g_currentBrushColor.load();
+    // Slightly translucent so the preview reads as "in progress".
+    renderLinePreviewToFront(env, width, height, transform,
+                             x0, y0, x1, y1,
+                             rgb, kDefaultLineWidth, /*alpha=*/0.7f);
 }
 
 // Read accessors for UI display. Called from the UI thread; the values may
@@ -958,14 +1522,24 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     ensureInited();
     ensureLoaded();
     applyPendingLayerActions();
+    applyPendingLines();
     ensureAtLeastOneLayer();
 
     g_strokeTarget = g_activeLayer;
     g_strokeTool   = g_currentTool.load();
-    // Eraser strokes need a WYSIWYG preview, which depends on snapshots
-    // of below/active/above. We can't render those yet (no width/
-    // height/transform here); defer to first extendStroke.
-    g_needsErasePrep = (g_strokeTool == 1);
+    // Snapshot brush RGB so mid-stroke color changes don't split a stroke.
+    {
+        uint32_t rgb = g_currentBrushColor.load();
+        g_strokeBrushColor[0] = ((rgb >> 16) & 0xFFu) / 255.0f;
+        g_strokeBrushColor[1] = ((rgb >>  8) & 0xFFu) / 255.0f;
+        g_strokeBrushColor[2] = ( rgb        & 0xFFu) / 255.0f;
+        g_strokeBrushColor[3] = kBrushAlpha;
+    }
+    // Both brush and eraser strokes use the WYSIWYG preview path so that
+    // strokes appear under layers-above-active correctly. Defer the
+    // setup to first extendStroke (we don't have width/height/transform
+    // here yet).
+    g_needsPreviewPrep = true;
     g_current.samples.clear();
     g_liveEmitter.reset();
 }
@@ -979,37 +1553,25 @@ Java_com_bk_drawing_NativeRenderer_extendStroke(
     ensureInited();
     g_current.samples.push_back({x, y, pressure});
 
-    if (g_strokeTool == 0) {
-        // Brush: dabs go directly into the front buffer, additive premult.
-        glViewport(0, 0, width, height);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        glUseProgram(g_dab.program);
-        glBindVertexArray(g_quadVao);
-        uploadMat4(env, g_dab.uTransform, transform);
-        glUniform2f(g_dab.uScreen, (float)width, (float)height);
-        glUniform4fv(g_dab.uColor, 1, kBrushColor);
-        g_liveEmitter.extend(x, y, pressure);
-        glBindVertexArray(0);
-        return;
-    }
-
-    // Eraser: WYSIWYG preview. The front buffer can only ADD on top of the
-    // multi-buffer, so to fake "live erasing" we composite a fullscreen
-    // overlay equal to (below.rgb * coverage, coverage). When the framework
-    // blends that over the multi-buffer (premultiplied), the displayed
-    // pixel ends up at coverage*below + (1-coverage)*multi — i.e. fully
-    // erased pixels show what's beneath the active layer, partially
-    // erased pixels fade proportionally, untouched pixels stay as-is.
+    // Both brush and eraser run through the same WYSIWYG preview pipeline:
+    // accumulate the dab's coverage into g_coverage, then composite a
+    // fullscreen overlay of (fullColor * c, c) into the front buffer. The
+    // framework's premultiplied blend over multi yields display(c) =
+    // lerp(multi, fullColor, c) — correct under layers above active for
+    // either tool. fullColor differs by mode and is computed in the
+    // preview shader.
 
     GLint frontFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &frontFbo);
 
-    if (g_needsErasePrep) {
-        prepareErasePreviewBuffers(env, width, height, transform);
-        g_needsErasePrep = false;
+    if (g_needsPreviewPrep) {
+        preparePreviewBuffers(env, width, height, transform);
+        g_needsPreviewPrep = false;
     }
 
-    // Step 1: accumulate this dab's erase coverage into g_coverage.
+    // Step 1: accumulate this dab's coverage into g_coverage. RGB is
+    // ignored (kCoverageColor has rgb=0, premultiplied output is (0,0,0,α));
+    // only the alpha is sampled by the preview shader.
     glBindFramebuffer(GL_FRAMEBUFFER, g_coverage.fbo);
     glViewport(0, 0, width, height);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -1021,11 +1583,9 @@ Java_com_bk_drawing_NativeRenderer_extendStroke(
     g_liveEmitter.extend(x, y, pressure);
     glBindVertexArray(0);
 
-    // Step 2: re-render the front-buffer overlay as the proper layered
-    // composite. Output alpha is 1, so this fully replaces the multi
-    // buffer wherever it lands — for c=0 pixels it evaluates to multi
-    // exactly (compositing is associative), so unaffected regions look
-    // identical to the bare multi-buffer.
+    // Step 2: re-render the front-buffer overlay using the unified
+    // preview shader. The mode uniform selects brush vs. eraser fullColor
+    // formula; the brushRgb uniform feeds the brush path (un-premult RGB).
     glBindFramebuffer(GL_FRAMEBUFFER, frontFbo);
     glViewport(0, 0, width, height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1037,6 +1597,8 @@ Java_com_bk_drawing_NativeRenderer_extendStroke(
     glUniform1i(g_preview.uBelow,    0);
     glUniform1i(g_preview.uAbove,    1);
     glUniform1i(g_preview.uCoverage, 2);
+    glUniform1i(g_preview.uMode,     g_strokeTool);            // 0=brush, 1=eraser
+    glUniform3fv(g_preview.uBrushRgb, 1, g_strokeBrushColor);  // 1st 3 floats = RGB
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_belowFbo.texture);
     glActiveTexture(GL_TEXTURE1);
@@ -1060,6 +1622,7 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
 
     ensureLoaded();
     applyPendingLayerActions();
+    applyPendingLines();
     ensureAtLeastOneLayer();
 
     size_t layerIdx = g_strokeTarget < g_layers.size() ? g_strokeTarget
@@ -1084,6 +1647,7 @@ Java_com_bk_drawing_NativeRenderer_renderDocument(
     ensureInited();
     ensureLoaded();
     applyPendingLayerActions();
+    applyPendingLines();
     compositeAllLayers(env, width, height, transform);
 }
 
