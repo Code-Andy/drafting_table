@@ -10,6 +10,17 @@ object NativeRenderer {
      */
     external fun setDocumentDir(path: String)
 
+    /**
+     * Switch to a different document at runtime. Frees the current doc's
+     * GL state, clears selection/undo/pending writes, points g_docDir at
+     * the new path, and lazy-loads the new doc on the next render. Queued
+     * through the action drain so all GL work runs on the GL thread.
+     *
+     * Call drawingView.forceRedraw() afterward to trigger the load and
+     * subsequent compositor pass.
+     */
+    external fun loadDocument(path: String)
+
     /** Reset emitter state and start a new in-progress stroke. */
     external fun beginStroke()
 
@@ -18,6 +29,18 @@ object NativeRenderer {
      * reach (x, y), additively, into the bound (front-buffered) layer.
      */
     external fun extendStroke(
+        width: Int, height: Int,
+        transform: FloatArray,
+        x: Float, y: Float, pressure: Float
+    )
+
+    /**
+     * Like extendStroke but the sample is NOT recorded into the stroke's
+     * sample list — commitStroke won't bake it. Use this for motion-
+     * predicted dabs (rendered to front buffer to mask input latency);
+     * they disappear on the next multi-buffer pass.
+     */
+    external fun extendStrokePredicted(
         width: Int, height: Int,
         transform: FloatArray,
         x: Float, y: Float, pressure: Float
@@ -187,6 +210,54 @@ object NativeRenderer {
     external fun setBrushColor(rgb: Int)
 
     /**
+     * Brush size scale — multiplier on the per-pressure dab radius
+     * (1.0 = the default 2..18 doc-px range). Snapshotted at beginStroke
+     * so a slider change mid-stroke doesn't visibly split a stroke.
+     */
+    external fun setBrushSize(scale: Float)
+
+    /**
+     * Vector-tool line width in doc-pixels. Captured at the time a shape
+     * is added (addLine / addRectangle / etc.); subsequent changes don't
+     * affect existing shapes.
+     */
+    external fun setVectorLineWidth(width: Float)
+
+    /**
+     * Raster selection (Phase 1: rectangular, translate-only).
+     *
+     *  beginRasterSelection: lift a doc-coord rectangle from the active
+     *     raster layer into a floating selection. Returns false if the
+     *     active layer isn't raster, the rect is empty, or a selection
+     *     is already active (caller should commit/cancel first).
+     *  translateRasterSelection: incrementally pan the floating selection.
+     *  commitRasterSelection: bake the selection at its current position.
+     *     Pushes a single undo entry covering both lift and drop.
+     *  cancelRasterSelection: restore the lifted pixels to their original
+     *     position; no undo entry recorded.
+     *  hasRasterSelection / rasterSelectionContains: queries for UI.
+     */
+    external fun beginRasterSelection(
+        x0: Float, y0: Float, x1: Float, y1: Float
+    ): Boolean
+    external fun translateRasterSelection(dx: Float, dy: Float)
+    external fun commitRasterSelection()
+    external fun cancelRasterSelection()
+    external fun hasRasterSelection(): Boolean
+    external fun rasterSelectionContains(x: Float, y: Float): Boolean
+
+    /**
+     * Bucket fill at (x, y) in doc-pixels using the current brush color.
+     * Uses the visible page composite as the flood-fill source (so vector
+     * outlines on other layers act as boundaries) and writes pixels into
+     * the active raster layer. No-op if the active layer is vector or
+     * the seed is outside the page rectangle. Synchronous on the GL
+     * thread — call from inside an onDrawMultiBufferedLayer callback or
+     * be prepared for a brief freeze.
+     */
+    external fun bucketFillAt(x: Float, y: Float)
+
+    /**
      * Page-background grid controls. Read at multi-buffer composite time;
      * call forceRedraw() afterward to make a change appear immediately.
      */
@@ -200,6 +271,35 @@ object NativeRenderer {
      */
     external fun getLayerCount(): Int
     external fun getActiveLayer(): Int
+
+    /**
+     * Multi-page document support. Each page has its own independent
+     * layer stack and on-disk subdirectory (`page_<idx>/`).
+     *
+     *  getPageCount   - number of pages currently in the document.
+     *  getActivePage  - index of the currently-shown page.
+     *  addPage        - append an empty page and switch to it. Queued.
+     *  switchPage     - change the active page. Queued; clears selection
+     *                   and the undo stack (undo entries are scoped to
+     *                   the previous page).
+     *
+     * After invoking addPage/switchPage, call drawingView.forceRedraw()
+     * and re-sync any UI state mirrors.
+     */
+    external fun getPageCount(): Int
+    external fun getActivePage(): Int
+    external fun addPage()
+    external fun switchPage(idx: Int)
+
+    /**
+     * Render a thumbnail of the given page into the provided Bitmap
+     * (must be Bitmap.Config.ARGB_8888). Y-axis is oriented for
+     * straight-into-Bitmap consumption (doc-top → bitmap-top). Letter-
+     * boxes the page rect into the bitmap dimensions.
+     *
+     * Must be called from the GL thread (i.e. inside a render callback).
+     */
+    external fun renderPageThumbnail(pageIdx: Int, bitmap: android.graphics.Bitmap)
 
     /**
      * Undo/redo. Both are queued onto the GL thread alongside layer

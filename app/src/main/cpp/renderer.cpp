@@ -36,7 +36,7 @@
 // Cross-thread layer ops:
 //   addLayer / cycleActiveLayer can be called from the UI thread; they
 //   enqueue an action under a mutex and the GL thread drains the queue at
-//   the start of each operation. This avoids racy access to g_layers.
+//   the start of each operation. This avoids racy access to layers().
 //
 // Coordinate spaces:
 //   doc-px:    document coordinates. The natural unit for shapes, tiles,
@@ -53,9 +53,11 @@
 
 #include <jni.h>
 #include <GLES3/gl3.h>
+#include <android/bitmap.h>
 #include <android/log.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -405,6 +407,38 @@ void main() {
 }
 )";
 
+// Render a sampled, premultiplied texture to an axis-aligned doc-coord
+// rectangle (uMin..uMax). Used to draw the floating raster selection.
+// Translation lives in (uMin, uMax) — the caller adjusts these by the
+// pan offset, so this shader doesn't need to know about transforms
+// beyond the standard doc→buffer matrix.
+const char* kSelVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+out vec2 vUv;
+uniform mat4 uTransform;
+uniform vec2 uScreen;
+uniform vec2 uMin;
+uniform vec2 uMax;
+void main() {
+    vec2 t = aQuad * 0.5 + 0.5;
+    vec2 docPos = mix(uMin, uMax, t);
+    vec4 bufPx  = uTransform * vec4(docPos, 0.0, 1.0);
+    vec2 ndc = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    vUv = t;
+}
+)";
+
+const char* kSelFS = R"(#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uContent;     // premultiplied selection content
+out vec4 outColor;
+void main() {
+    outColor = texture(uContent, vUv);
+}
+)";
+
 // ---- Data structures ------------------------------------------------------
 
 struct Sample { float x, y, p; };
@@ -460,6 +494,15 @@ struct Layer {
     std::vector<Rect>    rects;
     std::vector<Ellipse> ellipses;
     std::vector<Circle>  circles;
+};
+
+// A document Page wraps a layer stack plus an active-layer index. All
+// pages live in g_pages; the active one is g_activePageIdx. Most existing
+// code references the active page's slots through layers() / activeLayer()
+// accessor functions so the historical single-page logic could stay put.
+struct Page {
+    std::vector<std::unique_ptr<Layer>> layers;
+    size_t activeLayer = 0;
 };
 
 struct DabProg {
@@ -529,6 +572,15 @@ struct FillProg {
     GLint  uFillColor = -1;
 };
 
+struct SelProg {
+    GLuint program    = 0;
+    GLint  uTransform = -1;
+    GLint  uScreen    = -1;
+    GLint  uMin       = -1;
+    GLint  uMax       = -1;
+    GLint  uContent   = -1;
+};
+
 struct ViewFbo {
     GLuint texture = 0;
     GLuint fbo     = 0;
@@ -544,6 +596,7 @@ PreviewProg g_preview;
 GridProg    g_grid;
 LineProg    g_lineProg;
 FillProg    g_fill;
+SelProg     g_sel;
 GLuint      g_quadVao = 0;
 GLuint      g_quadVbo = 0;
 bool        g_inited  = false;
@@ -633,9 +686,21 @@ ViewFbo g_aboveFbo;
 ViewFbo g_coverage;
 bool    g_needsPreviewPrep = false;  // set at beginStroke; cleared on first extendStroke
 
-std::vector<std::unique_ptr<Layer>> g_layers;
-size_t g_activeLayer  = 0;
-size_t g_strokeTarget = 0;          // captured at beginStroke
+std::vector<std::unique_ptr<Page>> g_pages;
+size_t g_activePageIdx = 0;
+size_t g_strokeTarget  = 0;          // captured at beginStroke
+
+// Accessors for the active page's layer state. Reseat as g_activePageIdx
+// changes — most existing code uses these as if they were the original
+// `layers()` / `activeLayer()` globals. Both return non-const references
+// (write-through). Caller must ensure at least one page exists; see
+// ensureAtLeastOnePage().
+inline std::vector<std::unique_ptr<Layer>>& layers() {
+    return g_pages[g_activePageIdx]->layers;
+}
+inline size_t& activeLayer() {
+    return g_pages[g_activePageIdx]->activeLayer;
+}
 
 // Active tool: 0 = brush, 1 = eraser. Settable from any thread (UI thread
 // flips it via setTool() on stylus-button press); the GL thread reads it
@@ -650,12 +715,53 @@ int g_strokeTool = 0;
 std::atomic<uint32_t> g_currentBrushColor{0x14171Fu};
 float g_strokeBrushColor[4] = { 0.08f, 0.09f, 0.12f, kBrushAlpha };
 
+// Brush size scale: a multiplier applied to the per-pressure dab radius.
+// Snapshotted into g_strokeBrushSizeScale at beginStroke so mid-stroke
+// slider changes don't split a stroke. Stored as raw bits in atomic<u32>
+// for the same reason as g_viewScaleBits — std::atomic<float> needs
+// special linkage on some platforms.
+std::atomic<uint32_t> g_brushSizeScaleBits{0x3F800000u};   // 1.0f
+float g_strokeBrushSizeScale = 1.0f;
+inline float currentBrushSizeScale() {
+    uint32_t bits = g_brushSizeScaleBits.load();
+    float f; std::memcpy(&f, &bits, sizeof(f));
+    return f > 1e-4f ? f : 1.0f;
+}
+
+// Vector tool line width (doc-pixels). Used by addLine / addRectangle /
+// addEllipse / addCircle / renderShapePreview. Read at call time on the
+// UI thread; subsequent changes don't retroactively affect existing
+// shapes (their width is captured into the shape struct at add time).
+std::atomic<uint32_t> g_vectorLineWidthBits{0x40000000u}; // 2.0f
+inline float currentVectorLineWidth() {
+    uint32_t bits = g_vectorLineWidthBits.load();
+    float f; std::memcpy(&f, &bits, sizeof(f));
+    return f > 1e-4f ? f : 2.0f;
+}
+
 Stroke     g_current;
 struct DabEmitter;                  // forward-decl
 extern DabEmitter g_liveEmitter;
 
 std::string g_docDir;               // empty = persistence disabled
 bool        g_loaded = false;
+
+// On-disk layout helpers — every page lives in its own directory and
+// hosts its layer subdirs. Using these consistently is what made the
+// single-page → multi-page transition feasible without changing every
+// call site. Defined up here (rather than next to the persistence code)
+// so they're visible to earlier callers like applyPendingLayerActions.
+inline std::string pageDirOf(size_t pageIdx) {
+    return g_docDir + "/page_" + std::to_string(pageIdx);
+}
+inline std::string layerDirIn(size_t pageIdx, size_t layerIdx) {
+    return pageDirOf(pageIdx) + "/layer_" + std::to_string(layerIdx);
+}
+// Most callers operate on the active page implicitly (stroke commit,
+// vector mutations, undo apply). They use this convenience wrapper.
+inline std::string activeLayerDir(size_t layerIdx) {
+    return layerDirIn(g_activePageIdx, layerIdx);
+}
 
 // Cross-thread queue: UI-thread layer ops enqueue, GL thread drains at the
 // start of each operation.
@@ -667,6 +773,18 @@ constexpr int kActionClearActive    = 3;
 constexpr int kActionAddVectorLayer = 4;
 constexpr int kActionUndo           = 5;
 constexpr int kActionRedo           = 6;
+constexpr int kActionAddPage        = 7;
+constexpr int kActionSwitchPage     = 8;
+constexpr int kActionLoadDocument   = 9;
+// Target index for the next kActionSwitchPage drained. Stored separately
+// because the action queue is just `vector<int>`. Last-write-wins on
+// rapid taps: exchange(-1) at drain time picks up whichever target was
+// most recently written.
+std::atomic<int>     g_pendingSwitchPage{-1};
+// Path for the next kActionLoadDocument drained. Same last-write-wins
+// shape as g_pendingSwitchPage but for an arbitrary string.
+std::mutex   g_pendingDocPathMutex;
+std::string  g_pendingDocPath;
 
 // Shapes added from the UI thread are queued separately because they
 // carry per-shape data that doesn't fit in the int-tagged action queue.
@@ -736,7 +854,7 @@ DragState g_drag;
 //
 // Single global stack of reversible actions. Entries are pushed at the
 // point each mutation is realized (so e.g. queued vector-shape adds push
-// from applyPendingShapes after they actually land in g_layers, not from
+// from applyPendingShapes after they actually land in layers(), not from
 // the JNI thread when they're queued). Bounded by entry count and total
 // memory; oldest entries evict first.
 //
@@ -816,6 +934,31 @@ size_t                g_redoTotalBytes = 0;
 Selection g_transformBeforeSel;
 ShapeData g_transformBeforeShape;
 
+// Floating raster selection ("marquee"). Lives across the SELECT_RECT
+// gesture: lift → translate (one or more drags) → commit/cancel.
+// While active, the source tiles have a hole where the selection was;
+// the contentTex carries the lifted pixels. Mutations to GL resources
+// happen on the GL thread; the active flag and pan offsets can be read
+// from the UI thread under g_rasterSelMutex.
+struct RasterSelection {
+    bool   active = false;
+    size_t layerIdx = 0;
+    // Original bbox of the lift, in doc-pixels.
+    float  bboxMinX = 0.0f, bboxMinY = 0.0f;
+    float  bboxMaxX = 0.0f, bboxMaxY = 0.0f;
+    // Current translation applied to the floating selection.
+    float  panX = 0.0f, panY = 0.0f;
+    // RGBA texture holding the lifted pixels, sized to the bbox in
+    // doc-pixels (premultiplied to match tile storage).
+    GLuint contentTex = 0;
+    int    contentW = 0, contentH = 0;
+    // Pre-lift snapshots of every tile that the bbox touched, used to
+    // build the undo entry on commit and to restore on cancel.
+    std::vector<TileSnap> liftedTiles;
+};
+std::mutex      g_rasterSelMutex;
+RasterSelection g_rasterSel;
+
 size_t computeEntrySize(const UndoEntry& e) {
     size_t s = sizeof(UndoEntry);
     for (const auto& t : e.beforeTiles) s += t.bytes.size();
@@ -871,8 +1014,8 @@ bool shapeDataEqual(const ShapeData& a, const ShapeData& b) {
 bool snapshotSelectionShape(const Selection& sel, ShapeData& out) {
     out.kind = ShapeKind::None;
     if (sel.kind == ShapeKind::None) return false;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return false;
-    const Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return false;
+    const Layer& layer = *layers()[sel.layerIdx];
     out.kind = sel.kind;
     switch (sel.kind) {
         case ShapeKind::Line:
@@ -913,7 +1056,13 @@ inline void unpackTileKey(int64_t k, int& tx, int& ty) {
 inline float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
 
 inline float radiusOf(float pressure) {
-    return kMinRadius + clamp01(pressure) * (kMaxRadius - kMinRadius);
+    // The base curve maps pressure to [kMinRadius, kMaxRadius]; the
+    // current stroke's brush-size scale (snapshotted at beginStroke into
+    // g_strokeBrushSizeScale) multiplies that. Both bake-time dab emitters
+    // and the live preview emitter call this — they share the snapshot,
+    // so live preview matches what'll be baked.
+    float base = kMinRadius + clamp01(pressure) * (kMaxRadius - kMinRadius);
+    return base * g_strokeBrushSizeScale;
 }
 
 // ---- Drawing primitive ----------------------------------------------------
@@ -1007,6 +1156,12 @@ void deleteLayerDirIfExists(size_t layerIdx);
 void applyUndo();
 void applyRedo();
 void applyPendingShapes();
+void ensureAtLeastOnePage();
+void closeCurrentDocument();
+void ensureLoaded();
+bool liftRasterSelectionRect(float x0, float y0, float x1, float y1);
+void commitRasterSelectionImpl();
+void cancelRasterSelectionImpl();
 void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
                                  jfloatArray transform);
 void compositeRasterLayer(const Layer& layer);
@@ -1026,53 +1181,59 @@ void applyPendingLayerActions() {
         std::lock_guard<std::mutex> lock(g_pendingMutex);
         actions.swap(g_pendingActions);
     }
+    // Every action below uses layers() / activeLayer(), which need a page.
+    if (!actions.empty()) ensureAtLeastOnePage();
     for (int a : actions) {
         if (a == kActionAddLayer) {
-            size_t prevActive = g_activeLayer;
-            g_layers.push_back(std::make_unique<Layer>());
-            g_activeLayer = g_layers.size() - 1;
+            size_t prevActive = activeLayer();
+            layers().push_back(std::make_unique<Layer>());
+            activeLayer() = layers().size() - 1;
             LOGI("layer added (count=%zu, active=%zu)",
-                 g_layers.size(), g_activeLayer);
+                 layers().size(), activeLayer());
             UndoEntry e;
             e.op = UndoOp::LayerAdd;
-            e.layerIdx = g_activeLayer;
+            e.layerIdx = activeLayer();
             e.addedLayerType = LayerType::Raster;
             e.prevActiveLayer = prevActive;
             pushUndoEntry(std::move(e));
-        } else if (a == kActionCycleActive && !g_layers.empty()) {
-            g_activeLayer = (g_activeLayer + 1) % g_layers.size();
+        } else if (a == kActionCycleActive && !layers().empty()) {
+            activeLayer() = (activeLayer() + 1) % layers().size();
             LOGI("active layer cycled to %zu/%zu",
-                 g_activeLayer, g_layers.size() - 1);
+                 activeLayer(), layers().size() - 1);
         } else if (a == kActionAddVectorLayer) {
-            size_t prevActive = g_activeLayer;
+            size_t prevActive = activeLayer();
             auto layer = std::make_unique<Layer>();
             layer->type = LayerType::Vector;
-            g_layers.push_back(std::move(layer));
-            g_activeLayer = g_layers.size() - 1;
+            layers().push_back(std::move(layer));
+            activeLayer() = layers().size() - 1;
             LOGI("vector layer added (count=%zu, active=%zu)",
-                 g_layers.size(), g_activeLayer);
+                 layers().size(), activeLayer());
             // Marker file so loadAllLayersFromDisk recognizes the type
             // even before any line is drawn. saveVectorLayer creates the
             // dir if needed and writes a header with zero shapes.
-            saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
+            saveVectorLayer(activeLayer(), *layers()[activeLayer()]);
             UndoEntry e;
             e.op = UndoOp::LayerAdd;
-            e.layerIdx = g_activeLayer;
+            e.layerIdx = activeLayer();
             e.addedLayerType = LayerType::Vector;
             e.prevActiveLayer = prevActive;
             pushUndoEntry(std::move(e));
         } else if (a == kActionClearActive
-                   && g_activeLayer < g_layers.size()
-                   && g_layers[g_activeLayer]) {
-            Layer& layer = *g_layers[g_activeLayer];
+                   && activeLayer() < layers().size()
+                   && layers()[activeLayer()]) {
+            // A floating selection on this layer wouldn't survive the
+            // clear; cancel it (restoring its pre-lift bytes) so the
+            // pre-clear snapshot below captures a consistent state.
+            cancelRasterSelectionImpl();
+            Layer& layer = *layers()[activeLayer()];
             // Snapshot pre-clear state for undo (raster tiles or vector
             // shapes, depending on layer type).
             UndoEntry undo;
             undo.op = UndoOp::LayerClear;
-            undo.layerIdx = g_activeLayer;
+            undo.layerIdx = activeLayer();
             undo.layerTypeBefore = layer.type;
             if (layer.type == LayerType::Raster) {
-                snapshotAllTiles(g_activeLayer, undo.beforeTiles);
+                snapshotAllTiles(activeLayer(), undo.beforeTiles);
             } else {
                 undo.beforeLines    = layer.lines;
                 undo.beforeRects    = layer.rects;
@@ -1097,8 +1258,7 @@ void applyPendingLayerActions() {
             layer.circles.clear();
             // Wipe the on-disk copy so the cleared state persists.
             if (!g_docDir.empty()) {
-                std::string layerDir = g_docDir + "/layer_"
-                                     + std::to_string(g_activeLayer);
+                std::string layerDir = activeLayerDir(activeLayer());
                 DIR* d = opendir(layerDir.c_str());
                 if (d) {
                     struct dirent* e;
@@ -1113,10 +1273,10 @@ void applyPendingLayerActions() {
                 // For vector layers, re-create the empty marker so the
                 // type is preserved across launches.
                 if (layer.type == LayerType::Vector) {
-                    saveVectorLayer(g_activeLayer, layer);
+                    saveVectorLayer(activeLayer(), layer);
                 }
             }
-            LOGI("active layer %zu cleared", g_activeLayer);
+            LOGI("active layer %zu cleared", activeLayer());
             if (somethingToUndo) pushUndoEntry(std::move(undo));
         } else if (a == kActionUndo) {
             // Realize any queued shapes first so they end up on the undo
@@ -1126,18 +1286,134 @@ void applyPendingLayerActions() {
         } else if (a == kActionRedo) {
             applyPendingShapes();
             applyRedo();
+        } else if (a == kActionAddPage) {
+            // Apply any pending shapes to the current page first.
+            applyPendingShapes();
+            // Snapshot pre-state for clearing selection / undo.
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                g_selection = Selection{};
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_undoMutex);
+                g_undoStack.clear(); g_undoTotalBytes = 0;
+                g_redoStack.clear(); g_redoTotalBytes = 0;
+            }
+            g_pages.push_back(std::make_unique<Page>());
+            g_activePageIdx = g_pages.size() - 1;
+            LOGI("page added (count=%zu, active=%zu)",
+                 g_pages.size(), g_activePageIdx);
+        } else if (a == kActionLoadDocument) {
+            std::string newPath;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingDocPathMutex);
+                newPath = g_pendingDocPath;
+                g_pendingDocPath.clear();
+            }
+            if (newPath.empty()) continue;
+            closeCurrentDocument();
+            g_docDir = newPath;
+            // The render entry point already called ensureLoaded() before
+            // we got here (g_loaded was true at that point so it no-op'd).
+            // Re-run it now so the new doc's pages/tiles are available
+            // before the SAME pass tries to composite — otherwise layers()
+            // dereferences an empty g_pages and we crash.
+            ensureLoaded();
+            LOGI("loaded document: %s", g_docDir.c_str());
+        } else if (a == kActionSwitchPage) {
+            int target = g_pendingSwitchPage.exchange(-1);
+            if (target >= 0
+                && static_cast<size_t>(target) < g_pages.size()
+                && static_cast<size_t>(target) != g_activePageIdx) {
+                // Drain pending shapes onto the OLD page first.
+                applyPendingShapes();
+                // A floating raster selection refers to a specific layer
+                // on the current page; cancel-restore before swapping.
+                cancelRasterSelectionImpl();
+                // Selection and undo are scoped to the active page; reset.
+                {
+                    std::lock_guard<std::mutex> lock(g_selectionMutex);
+                    g_selection = Selection{};
+                }
+                {
+                    std::lock_guard<std::mutex> lock(g_undoMutex);
+                    g_undoStack.clear(); g_undoTotalBytes = 0;
+                    g_redoStack.clear(); g_redoTotalBytes = 0;
+                }
+                g_activePageIdx = static_cast<size_t>(target);
+                LOGI("switched to page %d", target);
+            }
         }
     }
 }
 
+// Guarantees g_pages has at least one page and g_activePageIdx is in
+// range. layers() / activeLayer() are unsafe to call before this. Run
+// from every JNI entry point that touches the active-page layer state.
+void ensureAtLeastOnePage() {
+    if (g_pages.empty()) {
+        g_pages.push_back(std::make_unique<Page>());
+        g_activePageIdx = 0;
+    }
+    if (g_activePageIdx >= g_pages.size()) {
+        g_activePageIdx = g_pages.size() - 1;
+    }
+}
+
 void ensureAtLeastOneLayer() {
-    if (g_layers.empty()) {
-        g_layers.push_back(std::make_unique<Layer>());
-        g_activeLayer = 0;
+    ensureAtLeastOnePage();
+    if (layers().empty()) {
+        layers().push_back(std::make_unique<Layer>());
+        activeLayer() = 0;
     }
-    if (g_activeLayer >= g_layers.size()) {
-        g_activeLayer = g_layers.size() - 1;
+    if (activeLayer() >= layers().size()) {
+        activeLayer() = layers().size() - 1;
     }
+}
+
+// Tear down all in-memory state belonging to the currently-loaded
+// document so a different document can take its place. Run on the GL
+// thread (frees tile FBOs/textures). Does not touch g_docDir — caller
+// changes that after this returns.
+void closeCurrentDocument() {
+    // A floating selection is tied to a specific layer; discard it
+    // before tearing down the layer it points at. We bake-back via
+    // cancel so the source pixels are restored — but the tiles get
+    // freed below anyway, so this just keeps the in-memory state clean.
+    cancelRasterSelectionImpl();
+    for (auto& page : g_pages) {
+        if (!page) continue;
+        for (auto& layer : page->layers) {
+            if (!layer) continue;
+            for (auto& kv : layer->tiles) {
+                if (kv.second.fbo)     glDeleteFramebuffers(1, &kv.second.fbo);
+                if (kv.second.texture) glDeleteTextures(1, &kv.second.texture);
+            }
+            layer->tiles.clear();
+        }
+    }
+    g_pages.clear();
+    g_activePageIdx = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+        g_pendingLines.clear();
+        g_pendingRects.clear();
+        g_pendingEllipses.clear();
+        g_pendingCircles.clear();
+    }
+    g_current.samples.clear();
+    g_liveEmitter.reset();
+    g_loaded = false;
 }
 
 // ---- Shader / program helpers --------------------------------------------
@@ -1232,6 +1508,13 @@ void ensureInited() {
     g_fill.uMin       = glGetUniformLocation(g_fill.program, "uMin");
     g_fill.uMax       = glGetUniformLocation(g_fill.program, "uMax");
     g_fill.uFillColor = glGetUniformLocation(g_fill.program, "uFillColor");
+
+    g_sel.program    = linkProgram(kSelVS, kSelFS);
+    g_sel.uTransform = glGetUniformLocation(g_sel.program, "uTransform");
+    g_sel.uScreen    = glGetUniformLocation(g_sel.program, "uScreen");
+    g_sel.uMin       = glGetUniformLocation(g_sel.program, "uMin");
+    g_sel.uMax       = glGetUniformLocation(g_sel.program, "uMax");
+    g_sel.uContent   = glGetUniformLocation(g_sel.program, "uContent");
 
     const float verts[] = {
         -1.0f, -1.0f,
@@ -1378,12 +1661,12 @@ void renderLayerRangeIntoFbo(JNIEnv* env, ViewFbo& target,
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     bindRasterCompositePipeline(env, width, height, transform);
 
-    for (size_t i = startIdx; i < endExclusive && i < g_layers.size(); ++i) {
-        if (!g_layers[i]) continue;
-        if (g_layers[i]->type == LayerType::Raster) {
-            compositeRasterLayer(*g_layers[i]);
+    for (size_t i = startIdx; i < endExclusive && i < layers().size(); ++i) {
+        if (!layers()[i]) continue;
+        if (layers()[i]->type == LayerType::Raster) {
+            compositeRasterLayer(*layers()[i]);
         } else { // Vector
-            compositeVectorLayer(env, *g_layers[i], i, width, height, transform);
+            compositeVectorLayer(env, *layers()[i], i, width, height, transform);
             // compositeVectorLayer leaves the line program bound; restore
             // the raster pipeline for the next iteration.
             bindRasterCompositePipeline(env, width, height, transform);
@@ -1407,7 +1690,7 @@ void preparePreviewBuffers(JNIEnv* env, int width, int height,
                             width, height, transform, /*clearWhite=*/true);
     // above: layers strictly above active (premultiplied over transparent;
     // empty range when active is the top layer is handled by early-return)
-    renderLayerRangeIntoFbo(env, g_aboveFbo, g_strokeTarget + 1, g_layers.size(),
+    renderLayerRangeIntoFbo(env, g_aboveFbo, g_strokeTarget + 1, layers().size(),
                             width, height, transform, /*clearWhite=*/false);
 
     // Reset coverage to zero.
@@ -1463,8 +1746,8 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
 void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
                          std::vector<TileSnap>& out) {
     out.clear();
-    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
-    Layer& layer = *g_layers[layerIdx];
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& layer = *layers()[layerIdx];
     if (layer.type != LayerType::Raster) return;
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
@@ -1489,8 +1772,8 @@ void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
 // Snapshot every existing tile in the layer (for full-layer-clear undo).
 void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out) {
     out.clear();
-    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
-    Layer& layer = *g_layers[layerIdx];
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& layer = *layers()[layerIdx];
     if (layer.type != LayerType::Raster) return;
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
@@ -1518,8 +1801,8 @@ void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out) {
 // (getOrCreateTile binds the new tile's FBO during its clear path.)
 void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
                             const uint8_t* bytes) {
-    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
-    Layer& layer = *g_layers[layerIdx];
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& layer = *layers()[layerIdx];
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     Tile& tile = getOrCreateTile(layer, tx, ty);
@@ -1534,18 +1817,18 @@ void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
 // Drop a tile's GL resources, remove it from the layer's map, and unlink
 // its on-disk file. No-op if the tile isn't present.
 void deleteTileIfExists(size_t layerIdx, int tx, int ty) {
-    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
-    Layer& layer = *g_layers[layerIdx];
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& layer = *layers()[layerIdx];
     int64_t k = tileKey(tx, ty);
     auto it = layer.tiles.find(k);
     if (it == layer.tiles.end()) {
         // Even if no GPU tile, an orphan disk file from a partially-saved
         // state should still be cleaned up; harmless if absent.
         if (!g_docDir.empty()) {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s/layer_%zu/tile_%d_%d.bin",
-                     g_docDir.c_str(), layerIdx, tx, ty);
-            unlink(path);
+            std::string p = activeLayerDir(layerIdx)
+                          + "/tile_" + std::to_string(tx)
+                          + "_"      + std::to_string(ty) + ".bin";
+            unlink(p.c_str());
         }
         return;
     }
@@ -1553,10 +1836,10 @@ void deleteTileIfExists(size_t layerIdx, int tx, int ty) {
     if (it->second.texture) glDeleteTextures(1, &it->second.texture);
     layer.tiles.erase(it);
     if (!g_docDir.empty()) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/layer_%zu/tile_%d_%d.bin",
-                 g_docDir.c_str(), layerIdx, tx, ty);
-        unlink(path);
+        std::string p = activeLayerDir(layerIdx)
+                      + "/tile_" + std::to_string(tx)
+                      + "_"      + std::to_string(ty) + ".bin";
+        unlink(p.c_str());
     }
 }
 
@@ -1596,7 +1879,7 @@ bool currentStrokeTileBbox(int& tx0, int& tx1, int& ty0, int& ty1) {
 // remove stranded shapes.bin / tile files).
 void deleteLayerDirIfExists(size_t layerIdx) {
     if (g_docDir.empty()) return;
-    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    std::string layerDir = activeLayerDir(layerIdx);
     DIR* d = opendir(layerDir.c_str());
     if (!d) return;
     struct dirent* e;
@@ -1612,8 +1895,11 @@ void deleteLayerDirIfExists(size_t layerIdx) {
 
 // ---- Persistence ---------------------------------------------------------
 
+// (Path helpers moved up near g_docDir so they're visible to earlier
+// users in applyPendingLayerActions / clearLayerDirOnDisk / etc.)
+
 // Move any tile_*_*.bin files at <docDir> root into <docDir>/layer_0/.
-// One-time migration for documents written before the layer refactor.
+// One-time migration for documents written before the per-layer refactor.
 void migrateLegacyTilesToLayer0IfNeeded() {
     if (g_docDir.empty()) return;
 
@@ -1647,6 +1933,50 @@ void migrateLegacyTilesToLayer0IfNeeded() {
     LOGI("migrated %d legacy tiles to layer_0", moved);
 }
 
+// Documents from before the multi-page refactor have layer_* dirs at the
+// root of g_docDir. Move them into page_0/ so the current loader (which
+// expects page_*) finds them. No-op when the doc is already laid out by
+// page or when there's nothing on disk yet.
+void migrateLegacyLayersToPage0IfNeeded() {
+    if (g_docDir.empty()) return;
+
+    DIR* d = opendir(g_docDir.c_str());
+    if (!d) return;
+
+    std::vector<std::string> rootLayers;
+    bool hasPageDir = false;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        int idx;
+        if (sscanf(e->d_name, "page_%d", &idx) == 1) { hasPageDir = true; continue; }
+        if (sscanf(e->d_name, "layer_%d", &idx) == 1) {
+            rootLayers.emplace_back(e->d_name);
+        }
+    }
+    closedir(d);
+
+    if (rootLayers.empty()) return;
+    if (hasPageDir) {
+        // Mixed state — pages and stray root layers. Don't auto-merge to
+        // avoid clobbering. Log and leave the strays where they are.
+        LOGE("doc has both page_* and root layer_* dirs; skipping migration");
+        return;
+    }
+
+    std::string page0Dir = pageDirOf(0);
+    if (mkdir(page0Dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        LOGE("can't create %s (errno=%d)", page0Dir.c_str(), errno);
+        return;
+    }
+    int moved = 0;
+    for (const auto& name : rootLayers) {
+        std::string from = g_docDir + "/" + name;
+        std::string to   = page0Dir + "/" + name;
+        if (rename(from.c_str(), to.c_str()) == 0) ++moved;
+    }
+    LOGI("migrated %d root layer dirs into page_0/", moved);
+}
+
 void loadTilesIntoLayer(Layer& layer, const std::string& dir) {
     DIR* d = opendir(dir.c_str());
     if (!d) return;
@@ -1676,12 +2006,13 @@ void loadTilesIntoLayer(Layer& layer, const std::string& dir) {
     LOGI("loaded %d tiles from %s", loaded, dir.c_str());
 }
 
-void loadAllLayersFromDisk() {
+// Load every layer of a single page from <docDir>/page_<pageIdx>/ into
+// the supplied Page. Detects each layer's type by file presence
+// (shapes.bin → Vector; tile_*.bin → Raster).
+void loadPageLayersFromDisk(size_t pageIdx, Page& page) {
     if (g_docDir.empty()) return;
-
-    migrateLegacyTilesToLayer0IfNeeded();
-
-    DIR* d = opendir(g_docDir.c_str());
+    std::string root = pageDirOf(pageIdx);
+    DIR* d = opendir(root.c_str());
     if (!d) return;
 
     std::vector<int> indices;
@@ -1693,20 +2024,18 @@ void loadAllLayersFromDisk() {
         }
     }
     closedir(d);
-
     if (indices.empty()) return;
 
     std::sort(indices.begin(), indices.end());
     int maxIdx = indices.back();
-    g_layers.resize(static_cast<size_t>(maxIdx + 1));
-    for (auto& slot : g_layers) {
+    page.layers.resize(static_cast<size_t>(maxIdx + 1));
+    for (auto& slot : page.layers) {
         if (!slot) slot = std::make_unique<Layer>();
     }
 
     for (int idx : indices) {
-        std::string dirPath = g_docDir + "/layer_" + std::to_string(idx);
-        Layer& layer = *g_layers[idx];
-        // Detect type by file presence: shapes.bin → Vector; tiles → Raster.
+        std::string dirPath = root + "/layer_" + std::to_string(idx);
+        Layer& layer = *page.layers[idx];
         struct stat st;
         std::string shapesPath = dirPath + "/shapes.bin";
         if (stat(shapesPath.c_str(), &st) == 0) {
@@ -1719,6 +2048,41 @@ void loadAllLayersFromDisk() {
     }
 }
 
+void loadAllLayersFromDisk() {
+    if (g_docDir.empty()) return;
+
+    // Two-step legacy migration: bare tiles → layer_0/, root layer_* →
+    // page_0/. Both are no-ops on already-migrated docs.
+    migrateLegacyTilesToLayer0IfNeeded();
+    migrateLegacyLayersToPage0IfNeeded();
+
+    DIR* d = opendir(g_docDir.c_str());
+    if (!d) return;
+
+    std::vector<int> pageIndices;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        int idx;
+        if (sscanf(e->d_name, "page_%d", &idx) == 1 && idx >= 0) {
+            pageIndices.push_back(idx);
+        }
+    }
+    closedir(d);
+
+    if (pageIndices.empty()) return;
+
+    std::sort(pageIndices.begin(), pageIndices.end());
+    int maxIdx = pageIndices.back();
+    g_pages.resize(static_cast<size_t>(maxIdx + 1));
+    for (auto& slot : g_pages) {
+        if (!slot) slot = std::make_unique<Page>();
+    }
+    for (int idx : pageIndices) {
+        loadPageLayersFromDisk(static_cast<size_t>(idx), *g_pages[idx]);
+    }
+    LOGI("loaded %zu pages", g_pages.size());
+}
+
 void ensureLoaded() {
     if (g_loaded) return;
     g_loaded = true;
@@ -1727,6 +2091,9 @@ void ensureLoaded() {
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     loadAllLayersFromDisk();
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    // Guarantee at least one page exists post-load so subsequent code can
+    // freely call layers() / activeLayer() (which deref g_pages).
+    ensureAtLeastOnePage();
 }
 
 // ---- Vector-layer persistence --------------------------------------------
@@ -1761,7 +2128,14 @@ struct EllipseV0 {
 void saveVectorLayer(size_t layerIdx, const Layer& layer) {
     if (g_docDir.empty()) return;
 
-    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    // Ensure the page dir exists too — pageIdx-only mkdirs(2) doesn't
+    // create parent dirs.
+    std::string pageDir = pageDirOf(g_activePageIdx);
+    if (mkdir(pageDir.c_str(), 0755) != 0 && errno != EEXIST) {
+        LOGE("save vector layer %zu: mkdir page (errno=%d)", layerIdx, errno);
+        return;
+    }
+    std::string layerDir = activeLayerDir(layerIdx);
     if (mkdir(layerDir.c_str(), 0755) != 0 && errno != EEXIST) {
         LOGE("save vector layer %zu: mkdir failed (errno=%d)", layerIdx, errno);
         return;
@@ -1870,21 +2244,23 @@ void applyPendingShapes() {
     if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty())
         return;
 
+    ensureAtLeastOnePage();
+
     // Shapes append to whichever layer is active when applied. If the
     // active layer isn't vector, drop them (the shape tools shouldn't
     // have committed in the first place; UI can prevent this).
-    if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return;
-    Layer& layer = *g_layers[g_activeLayer];
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return;
+    Layer& layer = *layers()[activeLayer()];
     if (layer.type != LayerType::Vector) {
         LOGE("dropping queued shapes: active layer %zu is not vector",
-             g_activeLayer);
+             activeLayer());
         return;
     }
     for (const auto& s : lines) {
         layer.lines.push_back(s);
         UndoEntry e;
         e.op = UndoOp::VectorAdd;
-        e.layerIdx = g_activeLayer;
+        e.layerIdx = activeLayer();
         e.shapeIdx = layer.lines.size() - 1;
         e.afterShape.kind = ShapeKind::Line;
         e.afterShape.line = s;
@@ -1894,7 +2270,7 @@ void applyPendingShapes() {
         layer.rects.push_back(s);
         UndoEntry e;
         e.op = UndoOp::VectorAdd;
-        e.layerIdx = g_activeLayer;
+        e.layerIdx = activeLayer();
         e.shapeIdx = layer.rects.size() - 1;
         e.afterShape.kind = ShapeKind::Rect;
         e.afterShape.rect = s;
@@ -1904,7 +2280,7 @@ void applyPendingShapes() {
         layer.ellipses.push_back(s);
         UndoEntry e;
         e.op = UndoOp::VectorAdd;
-        e.layerIdx = g_activeLayer;
+        e.layerIdx = activeLayer();
         e.shapeIdx = layer.ellipses.size() - 1;
         e.afterShape.kind = ShapeKind::Ellipse;
         e.afterShape.ellipse = s;
@@ -1914,13 +2290,13 @@ void applyPendingShapes() {
         layer.circles.push_back(s);
         UndoEntry e;
         e.op = UndoOp::VectorAdd;
-        e.layerIdx = g_activeLayer;
+        e.layerIdx = activeLayer();
         e.shapeIdx = layer.circles.size() - 1;
         e.afterShape.kind = ShapeKind::Circle;
         e.afterShape.circle = s;
         pushUndoEntry(std::move(e));
     }
-    saveVectorLayer(g_activeLayer, layer);
+    saveVectorLayer(activeLayer(), layer);
 }
 
 // Write tile pixel bytes to disk via tmp+rename. Callable when the
@@ -1929,7 +2305,10 @@ void applyPendingShapes() {
 void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
                           const uint8_t* bytes) {
     if (g_docDir.empty()) return;
-    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    // Make sure the page dir exists; mkdir doesn't create intermediates.
+    std::string pageDir = pageDirOf(g_activePageIdx);
+    mkdir(pageDir.c_str(), 0755);   // ignore EEXIST
+    std::string layerDir = activeLayerDir(layerIdx);
     if (mkdir(layerDir.c_str(), 0755) != 0 && errno != EEXIST) {
         LOGE("can't create %s (errno=%d)", layerDir.c_str(), errno);
         return;
@@ -1959,8 +2338,8 @@ void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
 
 void saveTileToDisk(size_t layerIdx, int64_t tileK) {
     if (g_docDir.empty()) return;
-    if (layerIdx >= g_layers.size() || !g_layers[layerIdx]) return;
-    auto& tiles = g_layers[layerIdx]->tiles;
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    auto& tiles = layers()[layerIdx]->tiles;
     auto it = tiles.find(tileK);
     if (it == tiles.end()) return;
 
@@ -1987,8 +2366,8 @@ void saveTileToDisk(size_t layerIdx, int64_t tileK) {
 void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                                 size_t layerIdx) {
     if (g_current.samples.empty()) return;
-    if (layerIdx >= g_layers.size()) return;
-    Layer& layer = *g_layers[layerIdx];
+    if (layerIdx >= layers().size()) return;
+    Layer& layer = *layers()[layerIdx];
 
     // Brush/eraser are raster operations; they can't bake into a vector
     // layer. Drop the samples so they don't get re-tried on next render
@@ -2232,8 +2611,8 @@ Obb obbForCircle(const Circle& c) {
 
 bool obbForSelection(const Selection& sel, Obb& out) {
     if (sel.kind == ShapeKind::None) return false;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return false;
-    const Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return false;
+    const Layer& layer = *layers()[sel.layerIdx];
     switch (sel.kind) {
         case ShapeKind::Line:
             if (sel.shapeIdx < layer.lines.size())   { out = obbForLine(layer.lines[sel.shapeIdx]);   return true; }
@@ -2266,8 +2645,8 @@ bool obbForSelection(const Selection& sel, Obb& out) {
 // shape can't snap to its own vertices during a transform drag.
 template <typename F>
 void forEachShapeSnapTarget(const F& cb, const Selection* exclude = nullptr) {
-    for (size_t li = 0; li < g_layers.size(); ++li) {
-        const auto& layer = g_layers[li];
+    for (size_t li = 0; li < layers().size(); ++li) {
+        const auto& layer = layers()[li];
         if (!layer || layer->type != LayerType::Vector) continue;
         auto skip = [&](ShapeKind k, size_t i) {
             return exclude && exclude->kind == k
@@ -2556,8 +2935,8 @@ float distToEllipseOutline(float px, float py,
 // any prior selection). Searches in render order so the topmost shape
 // wins on overlap.
 bool hitTestActiveVectorLayer(float x, float y) {
-    if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return false;
-    Layer& layer = *g_layers[g_activeLayer];
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return false;
+    Layer& layer = *layers()[activeLayer()];
     if (layer.type != LayerType::Vector) return false;
 
     ShapeKind hitKind = ShapeKind::None;
@@ -2599,7 +2978,7 @@ bool hitTestActiveVectorLayer(float x, float y) {
         return false;
     }
     g_selection.kind     = hitKind;
-    g_selection.layerIdx = g_activeLayer;
+    g_selection.layerIdx = activeLayer();
     g_selection.shapeIdx = hitIdx;
     return true;
 }
@@ -2730,7 +3109,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         glBindVertexArray(0);
     }
 
-    if (g_layers.empty()) return;
+    if (layers().empty()) return;
 
     // Premultiplied blend is the global default; both raster tiles and
     // vector lines composite correctly under it.
@@ -2739,8 +3118,8 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
 
     bindRasterCompositePipeline(env, width, height, transform);
 
-    for (size_t i = 0; i < g_layers.size(); ++i) {
-        const auto& layer = g_layers[i];
+    for (size_t i = 0; i < layers().size(); ++i) {
+        const auto& layer = layers()[i];
         if (!layer) continue;
         if (layer->type == LayerType::Raster) {
             compositeRasterLayer(*layer);
@@ -2749,6 +3128,45 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
             // Switch back to raster pipeline for the next raster layer.
             bindRasterCompositePipeline(env, width, height, transform);
         }
+    }
+
+    // Floating raster selection (if any) — drawn over its owner layer's
+    // composite so the lifted pixels appear at their currently-translated
+    // position. The owner layer's tiles already have a hole where the
+    // selection was lifted, so this overlay completes the visible image.
+    {
+        bool   selActive = false;
+        size_t selLayerIdx = 0;
+        float  bMinX = 0, bMinY = 0, bMaxX = 0, bMaxY = 0;
+        float  panX = 0, panY = 0;
+        GLuint contentTex = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+            if (g_rasterSel.active) {
+                selActive   = true;
+                selLayerIdx = g_rasterSel.layerIdx;
+                bMinX = g_rasterSel.bboxMinX; bMinY = g_rasterSel.bboxMinY;
+                bMaxX = g_rasterSel.bboxMaxX; bMaxY = g_rasterSel.bboxMaxY;
+                panX  = g_rasterSel.panX;     panY  = g_rasterSel.panY;
+                contentTex = g_rasterSel.contentTex;
+            }
+        }
+        if (selActive && contentTex != 0) {
+            glUseProgram(g_sel.program);
+            glBindVertexArray(g_quadVao);
+            uploadMat4(env, g_sel.uTransform, transform);
+            glUniform2f(g_sel.uScreen, (float)width, (float)height);
+            glUniform2f(g_sel.uMin, bMinX + panX, bMinY + panY);
+            glUniform2f(g_sel.uMax, bMaxX + panX, bMaxY + panY);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, contentTex);
+            glUniform1i(g_sel.uContent, 0);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        (void)selLayerIdx;
     }
 
     // Selection overlay (OBB + handles) — drawn on top of everything so
@@ -2930,7 +3348,7 @@ void dropAllTilesGl(Layer& layer) {
 // Used by LayerClear redo to mirror the live clearActiveLayer path.
 void clearLayerDirOnDisk(size_t layerIdx) {
     if (g_docDir.empty()) return;
-    std::string layerDir = g_docDir + "/layer_" + std::to_string(layerIdx);
+    std::string layerDir = activeLayerDir(layerIdx);
     DIR* d = opendir(layerDir.c_str());
     if (!d) return;
     struct dirent* dirEnt;
@@ -2950,8 +3368,8 @@ void applyEntryReverse(const UndoEntry& e) {
             break;
         }
         case UndoOp::VectorAdd: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             eraseShapeAt(layer, e.afterShape.kind, e.shapeIdx);
             {
                 std::lock_guard<std::mutex> lock(g_selectionMutex);
@@ -2965,22 +3383,22 @@ void applyEntryReverse(const UndoEntry& e) {
             break;
         }
         case UndoOp::VectorDelete: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             insertShapeAt(layer, e.beforeShape.kind, e.shapeIdx, e.beforeShape);
             saveVectorLayer(e.layerIdx, layer);
             break;
         }
         case UndoOp::VectorMutate: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             assignShapeAt(layer, e.beforeShape.kind, e.shapeIdx, e.beforeShape);
             saveVectorLayer(e.layerIdx, layer);
             break;
         }
         case UndoOp::LayerClear: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             for (const auto& s : e.beforeTiles) applyTileSnap(e.layerIdx, s);
             layer.lines    = e.beforeLines;
             layer.rects    = e.beforeRects;
@@ -2994,16 +3412,16 @@ void applyEntryReverse(const UndoEntry& e) {
         case UndoOp::LayerAdd: {
             // Layer should be the topmost (other entries were undone in
             // reverse). If not, something's gone wrong; bail safely.
-            if (e.layerIdx >= g_layers.size()
-                || e.layerIdx + 1 != g_layers.size()) {
+            if (e.layerIdx >= layers().size()
+                || e.layerIdx + 1 != layers().size()) {
                 LOGE("undo LayerAdd: layer %zu isn't topmost (size=%zu)",
-                     e.layerIdx, g_layers.size());
+                     e.layerIdx, layers().size());
                 break;
             }
-            if (g_layers[e.layerIdx]) {
-                dropAllTilesGl(*g_layers[e.layerIdx]);
+            if (layers()[e.layerIdx]) {
+                dropAllTilesGl(*layers()[e.layerIdx]);
             }
-            g_layers.pop_back();
+            layers().pop_back();
             deleteLayerDirIfExists(e.layerIdx);
             {
                 std::lock_guard<std::mutex> lock(g_selectionMutex);
@@ -3011,12 +3429,12 @@ void applyEntryReverse(const UndoEntry& e) {
                     g_selection = Selection{};
                 }
             }
-            if (e.prevActiveLayer < g_layers.size()) {
-                g_activeLayer = e.prevActiveLayer;
-            } else if (!g_layers.empty()) {
-                g_activeLayer = g_layers.size() - 1;
+            if (e.prevActiveLayer < layers().size()) {
+                activeLayer() = e.prevActiveLayer;
+            } else if (!layers().empty()) {
+                activeLayer() = layers().size() - 1;
             } else {
-                g_activeLayer = 0;
+                activeLayer() = 0;
             }
             break;
         }
@@ -3031,15 +3449,15 @@ void applyEntryForward(const UndoEntry& e) {
             break;
         }
         case UndoOp::VectorAdd: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             insertShapeAt(layer, e.afterShape.kind, e.shapeIdx, e.afterShape);
             saveVectorLayer(e.layerIdx, layer);
             break;
         }
         case UndoOp::VectorDelete: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             eraseShapeAt(layer, e.beforeShape.kind, e.shapeIdx);
             {
                 std::lock_guard<std::mutex> lock(g_selectionMutex);
@@ -3053,15 +3471,15 @@ void applyEntryForward(const UndoEntry& e) {
             break;
         }
         case UndoOp::VectorMutate: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             assignShapeAt(layer, e.afterShape.kind, e.shapeIdx, e.afterShape);
             saveVectorLayer(e.layerIdx, layer);
             break;
         }
         case UndoOp::LayerClear: {
-            if (e.layerIdx >= g_layers.size() || !g_layers[e.layerIdx]) break;
-            Layer& layer = *g_layers[e.layerIdx];
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
             dropAllTilesGl(layer);
             layer.lines.clear();
             layer.rects.clear();
@@ -3076,10 +3494,10 @@ void applyEntryForward(const UndoEntry& e) {
         case UndoOp::LayerAdd: {
             auto layer = std::make_unique<Layer>();
             layer->type = e.addedLayerType;
-            g_layers.push_back(std::move(layer));
-            g_activeLayer = g_layers.size() - 1;
+            layers().push_back(std::move(layer));
+            activeLayer() = layers().size() - 1;
             if (e.addedLayerType == LayerType::Vector) {
-                saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
+                saveVectorLayer(activeLayer(), *layers()[activeLayer()]);
             }
             break;
         }
@@ -3122,6 +3540,755 @@ void applyRedo() {
     }
 }
 
+// ---- Bucket fill ----------------------------------------------------------
+//
+// Composite-source / active-layer-target flood fill bounded by the page
+// rect. Vector shapes on other layers act as boundaries because they
+// appear in the page composite even though they're not on the active
+// layer. Run on the GL thread inside the bucketFillAt JNI.
+//
+// Cost is dominated by (1) rendering the full-page composite, (2) reading
+// it back to CPU, (3) the iterative flood. For typical page sizes this is
+// a few hundred ms — the user perceives a brief freeze. Acceptable for v1.
+
+// ---- Raster selection (Phase 1: rectangular, translate-only) -----------
+
+// Free GPU resources held by an active raster selection. Idempotent.
+void disposeRasterSelectionGl() {
+    if (g_rasterSel.contentTex) {
+        glDeleteTextures(1, &g_rasterSel.contentTex);
+        g_rasterSel.contentTex = 0;
+    }
+    g_rasterSel.contentW = 0;
+    g_rasterSel.contentH = 0;
+    g_rasterSel.liftedTiles.clear();
+}
+
+// "Lift" a rectangular region of the active raster layer into a floating
+// selection: copy its pixels into a content texture and clear them from
+// the source tiles. Returns true if a selection was created. On success
+// the caller is responsible for eventually calling commit or cancel.
+bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
+    // If a selection is already active, refuse — caller should commit
+    // or cancel first. (Kotlin enforces this in the touch handler.)
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (g_rasterSel.active) return false;
+    }
+
+    // Normalize the rect.
+    if (x1 < x0) std::swap(x0, x1);
+    if (y1 < y0) std::swap(y0, y1);
+
+    // Clamp to the page rect — selecting outside the page never makes
+    // sense (the fill / draw paths already exclude pixels there too).
+    PageClip page = readPageClip();
+    if (page.active) {
+        x0 = std::max(x0, page.minX);
+        y0 = std::max(y0, page.minY);
+        x1 = std::min(x1, page.maxX);
+        y1 = std::min(y1, page.maxY);
+    }
+
+    int rectW = static_cast<int>(std::floor(x1) - std::floor(x0));
+    int rectH = static_cast<int>(std::floor(y1) - std::floor(y0));
+    if (rectW <= 0 || rectH <= 0) return false;
+
+    ensureAtLeastOneLayer();
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return false;
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Raster) return false;
+
+    int rectIX0 = static_cast<int>(std::floor(x0));
+    int rectIY0 = static_cast<int>(std::floor(y0));
+    int rectIX1 = rectIX0 + rectW;
+    int rectIY1 = rectIY0 + rectH;
+
+    // Allocate the content texture (premultiplied RGBA, sized to bbox).
+    GLuint contentTex = 0;
+    glGenTextures(1, &contentTex);
+    glBindTexture(GL_TEXTURE_2D, contentTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rectW, rectH, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // Initialize transparent so any region of the bbox not covered by
+    // an existing tile (no source content) reads as zeros.
+    {
+        std::vector<uint8_t> zeros(static_cast<size_t>(rectW) * rectH * 4, 0);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, rectW, rectH,
+                        GL_RGBA, GL_UNSIGNED_BYTE, zeros.data());
+    }
+
+    // For each tile that overlaps the rect:
+    //  1. Snapshot pre-lift bytes (for undo + cancel restoration).
+    //  2. glCopyTexSubImage2D from the tile FBO into the content texture
+    //     (orientation matches because both use bottom-up byte layout
+    //     consistent with our doc-top = byte-row-0 convention).
+    //  3. Scissor-clear the lifted region in the tile FBO.
+    int tx0 = rectIX0 / kTileSize;
+    int ty0 = rectIY0 / kTileSize;
+    int tx1 = (rectIX1 - 1) / kTileSize;
+    int ty1 = (rectIY1 - 1) / kTileSize;
+
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
+    std::vector<TileSnap> liftedTiles;
+    liftedTiles.reserve(static_cast<size_t>(tx1 - tx0 + 1) * (ty1 - ty0 + 1));
+
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            // Doc-coord intersection of tile and selection rect.
+            int tileX0 = tx * kTileSize;
+            int tileY0 = ty * kTileSize;
+            int ix0 = std::max(rectIX0, tileX0);
+            int iy0 = std::max(rectIY0, tileY0);
+            int ix1 = std::min(rectIX1, tileX0 + kTileSize);
+            int iy1 = std::min(rectIY1, tileY0 + kTileSize);
+            int iw = ix1 - ix0;
+            int ih = iy1 - iy0;
+            if (iw <= 0 || ih <= 0) continue;
+
+            // Skip tiles that don't exist (no content to lift; the
+            // content texture's zero init covers that region).
+            auto it = layer.tiles.find(tileKey(tx, ty));
+            if (it == layer.tiles.end()) continue;
+
+            // (a) Snapshot for undo / restore.
+            TileSnap snap;
+            snap.tx = tx; snap.ty = ty;
+            snap.existed = true;
+            snap.bytes.resize(kTileBytes);
+            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+            glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+                         snap.bytes.data());
+            liftedTiles.push_back(std::move(snap));
+
+            // (b) Copy the tile's intersection into the content texture.
+            int srcX = ix0 - tileX0;
+            int srcY = iy0 - tileY0;
+            int dstX = ix0 - rectIX0;
+            int dstY = iy0 - rectIY0;
+            glBindTexture(GL_TEXTURE_2D, contentTex);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0,
+                                dstX, dstY, srcX, srcY, iw, ih);
+
+            // (c) Clear the lifted pixels in the source tile.
+            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+            glViewport(0, 0, kTileSize, kTileSize);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(srcX, srcY, iw, ih);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDisable(GL_SCISSOR_TEST);
+
+            // (d) Persist the tile's new state to disk so a crash mid-
+            // selection doesn't leave the tile and the on-disk file out
+            // of sync. The disk save is required by saveTileToDisk's API.
+            saveTileToDisk(activeLayer(), tileKey(tx, ty));
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        g_rasterSel.active = true;
+        g_rasterSel.layerIdx = activeLayer();
+        g_rasterSel.bboxMinX = static_cast<float>(rectIX0);
+        g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
+        g_rasterSel.bboxMaxX = static_cast<float>(rectIX1);
+        g_rasterSel.bboxMaxY = static_cast<float>(rectIY1);
+        g_rasterSel.panX = 0.0f;
+        g_rasterSel.panY = 0.0f;
+        g_rasterSel.contentTex = contentTex;
+        g_rasterSel.contentW = rectW;
+        g_rasterSel.contentH = rectH;
+        g_rasterSel.liftedTiles = std::move(liftedTiles);
+    }
+    return true;
+}
+
+// Bake the floating selection at its current transformed position back
+// into the active layer's tiles. Pushes a single undo entry covering
+// both the original lift and the drop so undo restores the pre-lift
+// state in one step. Releases the selection.
+void commitRasterSelectionImpl() {
+    RasterSelection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return;
+        sel = g_rasterSel;            // shallow copy; we'll move liftedTiles below
+        // Empty the global so further calls don't re-process; the GL
+        // resources are still owned via the local copy and will be
+        // freed by disposeRasterSelectionGl after we apply the drop.
+        g_rasterSel.liftedTiles.clear();
+        g_rasterSel.active = false;
+    }
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) {
+        if (sel.contentTex) glDeleteTextures(1, &sel.contentTex);
+        return;
+    }
+    Layer& layer = *layers()[sel.layerIdx];
+    if (layer.type != LayerType::Raster) {
+        if (sel.contentTex) glDeleteTextures(1, &sel.contentTex);
+        return;
+    }
+
+    // Drop position in doc-pixels.
+    int dropX0 = static_cast<int>(std::floor(sel.bboxMinX + sel.panX));
+    int dropY0 = static_cast<int>(std::floor(sel.bboxMinY + sel.panY));
+    int dropX1 = dropX0 + sel.contentW;
+    int dropY1 = dropY0 + sel.contentH;
+
+    PageClip page = readPageClip();
+    if (page.active) {
+        dropX0 = std::max(dropX0, static_cast<int>(page.minX));
+        dropY0 = std::max(dropY0, static_cast<int>(page.minY));
+        dropX1 = std::min(dropX1, static_cast<int>(page.maxX));
+        dropY1 = std::min(dropY1, static_cast<int>(page.maxY));
+    }
+    int dropW = dropX1 - dropX0;
+    int dropH = dropY1 - dropY0;
+    bool willDrop = (dropW > 0 && dropH > 0);
+
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
+    // For the drop, render the content texture into each affected tile
+    // via the selection shader (premultiplied over). Build a fresh undo
+    // entry whose beforeTiles = the pre-lift snapshots and afterTiles =
+    // post-drop tile state.
+    UndoEntry entry;
+    entry.op = UndoOp::RasterStroke;
+    entry.layerIdx = sel.layerIdx;
+    entry.beforeTiles = std::move(sel.liftedTiles);
+
+    // Set of tiles touched by either lift OR drop, so undo restores both.
+    auto tileKeyForCoord = [](int tx, int ty) { return tileKey(tx, ty); };
+    std::unordered_map<int64_t, std::pair<int, int>> touchedTiles;
+    for (const auto& s : entry.beforeTiles) {
+        touchedTiles[tileKeyForCoord(s.tx, s.ty)] = {s.tx, s.ty};
+    }
+    if (willDrop) {
+        int tx0 = dropX0 / kTileSize;
+        int ty0 = dropY0 / kTileSize;
+        int tx1 = (dropX1 - 1) / kTileSize;
+        int ty1 = (dropY1 - 1) / kTileSize;
+        for (int ty = ty0; ty <= ty1; ++ty)
+            for (int tx = tx0; tx <= tx1; ++tx)
+                touchedTiles[tileKey(tx, ty)] = {tx, ty};
+    }
+
+    // Add before-snapshots for any drop-only tiles (not in the lift set).
+    {
+        std::unordered_map<int64_t, bool> haveBefore;
+        for (const auto& s : entry.beforeTiles)
+            haveBefore[tileKey(s.tx, s.ty)] = true;
+        for (auto& kv : touchedTiles) {
+            if (haveBefore[kv.first]) continue;
+            int tx = kv.second.first, ty = kv.second.second;
+            TileSnap snap;
+            snap.tx = tx; snap.ty = ty;
+            auto it = layer.tiles.find(kv.first);
+            if (it != layer.tiles.end()) {
+                snap.existed = true;
+                snap.bytes.resize(kTileBytes);
+                glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(0, 0, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+            }
+            entry.beforeTiles.push_back(std::move(snap));
+        }
+    }
+
+    // Drop: render the content texture into each affected drop-tile.
+    if (willDrop && sel.contentTex != 0) {
+        glUseProgram(g_sel.program);
+        glBindVertexArray(g_quadVao);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, sel.contentTex);
+        glUniform1i(g_sel.uContent, 0);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+        // doc → tile-buffer transform per tile: identity-scale + translate
+        // so the tile renders content at its tile-local pixel offset from
+        // the drop rect's origin.
+        // The selection shader's uMin/uMax describe the doc-coord
+        // positions of the content rect. With the tile bake transform
+        // (uTransform = identity, uScreen = (kTileSize, kTileSize)),
+        // doc-positions need to be in tile-local units. We translate
+        // uMin/uMax by -tileOriginX / -tileOriginY for each tile.
+        glUniformMatrix4fv(g_sel.uTransform, 1, GL_FALSE, kIdentity);
+        glUniform2f(g_sel.uScreen, kTileSizeF, kTileSizeF);
+
+        int tx0 = dropX0 / kTileSize;
+        int ty0 = dropY0 / kTileSize;
+        int tx1 = (dropX1 - 1) / kTileSize;
+        int ty1 = (dropY1 - 1) / kTileSize;
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                Tile& tile = getOrCreateTile(layer, tx, ty);
+                glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
+                glViewport(0, 0, kTileSize, kTileSize);
+                int tileX0 = tx * kTileSize;
+                int tileY0 = ty * kTileSize;
+                glUniform2f(g_sel.uMin,
+                            static_cast<float>(dropX0 - tileX0),
+                            static_cast<float>(dropY0 - tileY0));
+                glUniform2f(g_sel.uMax,
+                            static_cast<float>(dropX1 - tileX0),
+                            static_cast<float>(dropY1 - tileY0));
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                saveTileToDisk(sel.layerIdx, tileKey(tx, ty));
+            }
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    // Build afterTiles snapshots from the post-drop state.
+    entry.afterTiles.reserve(touchedTiles.size());
+    for (auto& kv : touchedTiles) {
+        int tx = kv.second.first, ty = kv.second.second;
+        TileSnap snap;
+        snap.tx = tx; snap.ty = ty;
+        auto it = layer.tiles.find(kv.first);
+        if (it != layer.tiles.end()) {
+            snap.existed = true;
+            snap.bytes.resize(kTileBytes);
+            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+            glReadPixels(0, 0, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+        }
+        entry.afterTiles.push_back(std::move(snap));
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+
+    if (sel.contentTex) glDeleteTextures(1, &sel.contentTex);
+
+    // Push undo entry only if anything actually differs.
+    bool diff = false;
+    // Build a key→idx map for fast pairing.
+    std::unordered_map<int64_t, size_t> beforeIdx;
+    for (size_t i = 0; i < entry.beforeTiles.size(); ++i) {
+        beforeIdx[tileKey(entry.beforeTiles[i].tx, entry.beforeTiles[i].ty)] = i;
+    }
+    for (const auto& a : entry.afterTiles) {
+        auto it = beforeIdx.find(tileKey(a.tx, a.ty));
+        if (it == beforeIdx.end()) { diff = true; break; }
+        const auto& b = entry.beforeTiles[it->second];
+        if (b.existed != a.existed
+         || (b.existed && std::memcmp(b.bytes.data(), a.bytes.data(),
+                                       b.bytes.size()) != 0)) {
+            diff = true; break;
+        }
+    }
+    if (diff) pushUndoEntry(std::move(entry));
+}
+
+// Discard the floating selection by restoring each lifted tile's
+// pre-lift bytes. No undo entry is pushed (net zero change).
+void cancelRasterSelectionImpl() {
+    std::vector<TileSnap> snaps;
+    GLuint contentTex = 0;
+    size_t layerIdx = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return;
+        snaps = std::move(g_rasterSel.liftedTiles);
+        contentTex = g_rasterSel.contentTex;
+        layerIdx = g_rasterSel.layerIdx;
+        g_rasterSel.contentTex = 0;
+        g_rasterSel.active = false;
+    }
+    if (layerIdx < layers().size() && layers()[layerIdx]) {
+        for (const auto& s : snaps) {
+            applyTileSnap(layerIdx, s);
+        }
+    }
+    if (contentTex) glDeleteTextures(1, &contentTex);
+}
+
+void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
+                     uint32_t fillRgb) {
+    PageClip page = readPageClip();
+    if (!page.active) return;
+    if (seedDocX < page.minX || seedDocX >= page.maxX ||
+        seedDocY < page.minY || seedDocY >= page.maxY) return;
+
+    int pageW = static_cast<int>(page.maxX - page.minX);
+    int pageH = static_cast<int>(page.maxY - page.minY);
+    if (pageW <= 0 || pageH <= 0) return;
+
+    // Active layer must be raster — vector layers don't have pixel tiles
+    // for the fill to land in.
+    ensureAtLeastOneLayer();
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return;
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Raster) {
+        LOGI("bucket fill: active layer is vector, ignoring");
+        return;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    auto t0 = Clock::now();
+    auto millis = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
+    // (1) One-shot composite FBO at page resolution. Doc-to-buffer
+    // transform is identity-scale + translate (page.min → 0); positive
+    // y-slope so glReadPixels' bottom-up byte order lands doc-top in
+    // byte-row-0 (matching tile-byte orientation).
+    // Drain any pre-existing GL error so the fresh diagnostics below
+    // accurately reflect THIS function's calls.
+    while (glGetError() != GL_NO_ERROR) {}
+
+    // One-shot logging of GPU limits so we can spot a "page is bigger
+    // than the device's max renderbuffer" case if it ever bites us.
+    {
+        static bool logged = false;
+        if (!logged) {
+            GLint maxTex = 0, maxRb = 0;
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+            glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRb);
+            const char* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+            const char* ren = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+            LOGI("bucket fill: GL_VERSION=%s RENDERER=%s "
+                 "MAX_TEXTURE_SIZE=%d MAX_RENDERBUFFER_SIZE=%d",
+                 ver ? ver : "?", ren ? ren : "?", maxTex, maxRb);
+            logged = true;
+        }
+    }
+
+    // Use a renderbuffer for the color attachment (more conventional for
+    // offscreen FBOs than a texture, and avoids texture-completeness
+    // quirks some drivers apply to NPOT FBO color textures). We still
+    // glReadPixels off the bound FBO afterward, just like before.
+    GLuint compFbo = 0, compRb = 0;
+    glGenRenderbuffers(1, &compRb);
+    glBindRenderbuffer(GL_RENDERBUFFER, compRb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, pageW, pageH);
+    {
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            LOGE("bucket fill: glRenderbufferStorage %dx%d failed (0x%x)",
+                 pageW, pageH, err);
+            glDeleteRenderbuffers(1, &compRb);
+            return;
+        }
+    }
+
+    glGenFramebuffers(1, &compFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, compFbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              GL_RENDERBUFFER, compRb);
+    {
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            LOGE("bucket fill: glFramebufferRenderbuffer failed (0x%x)", err);
+        }
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            LOGE("bucket fill: composite FBO incomplete: 0x%x (size=%dx%d, "
+                 "post-check err=0x%x)",
+                 status, pageW, pageH, glGetError());
+            glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+            glDeleteFramebuffers(1, &compFbo);
+            glDeleteRenderbuffers(1, &compRb);
+            return;
+        }
+    }
+
+    float t[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        -page.minX, -page.minY, 0.0f, 1.0f
+    };
+
+    // Force view scale = 1 so screen-relative widths render at their
+    // "natural" doc-px width (1:1 in this transform). Restore after.
+    uint32_t savedScaleBits = g_viewScaleBits.load();
+    {
+        float one = 1.0f;
+        uint32_t bits;
+        std::memcpy(&bits, &one, sizeof(bits));
+        g_viewScaleBits.store(bits);
+    }
+
+    jfloatArray jtransform = env->NewFloatArray(16);
+    env->SetFloatArrayRegion(jtransform, 0, 16, t);
+    auto tCompositeStart = Clock::now();
+    compositeAllLayers(env, pageW, pageH, jtransform);
+    glFinish();   // ensure render is done before timing the readback
+    auto tComposite = Clock::now();
+    env->DeleteLocalRef(jtransform);
+
+    g_viewScaleBits.store(savedScaleBits);
+
+    // (2) Read pixels and free the FBO.
+    std::vector<uint8_t> pixels(static_cast<size_t>(pageW) * pageH * 4);
+    glReadPixels(0, 0, pageW, pageH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    auto tReadback = Clock::now();
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    glDeleteFramebuffers(1, &compFbo);
+    glDeleteRenderbuffers(1, &compRb);
+
+    // (3) Iterative 4-way flood fill. RGBA Chebyshev tolerance of 16
+    // catches anti-aliased boundary pixels without over-flooding.
+    int sx = static_cast<int>(seedDocX - page.minX);
+    int sy = static_cast<int>(seedDocY - page.minY);
+    if (sx < 0 || sx >= pageW || sy < 0 || sy >= pageH) return;
+
+    constexpr int kTolerance = 16;
+    std::vector<uint8_t> mask(static_cast<size_t>(pageW) * pageH, 0);
+    const uint8_t* p0 = pixels.data() + (static_cast<size_t>(sy) * pageW + sx) * 4;
+    int seedR = p0[0], seedG = p0[1], seedB = p0[2], seedA = p0[3];
+
+    // Track the mask's bbox as we flood so the dilation scan only has
+    // to revisit the area we actually painted into, not the whole page.
+    int maskMinX = pageW, maskMaxX = -1;
+    int maskMinY = pageH, maskMaxY = -1;
+
+    std::vector<std::pair<int, int>> stack;
+    stack.reserve(1024);
+    stack.push_back({sx, sy});
+    while (!stack.empty()) {
+        auto [x, y] = stack.back();
+        stack.pop_back();
+        if (x < 0 || x >= pageW || y < 0 || y >= pageH) continue;
+        size_t off = static_cast<size_t>(y) * pageW + x;
+        if (mask[off]) continue;
+        const uint8_t* px = pixels.data() + off * 4;
+        if (std::abs(static_cast<int>(px[0]) - seedR) > kTolerance ||
+            std::abs(static_cast<int>(px[1]) - seedG) > kTolerance ||
+            std::abs(static_cast<int>(px[2]) - seedB) > kTolerance ||
+            std::abs(static_cast<int>(px[3]) - seedA) > kTolerance) continue;
+        mask[off] = 1;
+        if (x < maskMinX) maskMinX = x;
+        if (x > maskMaxX) maskMaxX = x;
+        if (y < maskMinY) maskMinY = y;
+        if (y > maskMaxY) maskMaxY = y;
+        stack.push_back({x + 1, y});
+        stack.push_back({x - 1, y});
+        stack.push_back({x, y + 1});
+        stack.push_back({x, y - 1});
+    }
+    auto tFlood = Clock::now();
+
+    // Dilate the mask outward by a few pixels so the fill bleeds into
+    // the boundary's anti-aliased gradient. Without this, even with a
+    // generous tolerance, a thin halo of un-filled "almost-but-not-quite
+    // similar to seed" pixels remains between the fill and the stroke.
+    //
+    // Implementation: frontier propagation. The naive "iterate every
+    // mask pixel each pass" approach is O(W*H) per iteration; for a
+    // ~3-megapixel mask with two iterations that was the dominant cost
+    // of the entire fill. The frontier version does ONE linear scan
+    // (which we can't avoid: we need the initial outer ring of the
+    // mask) and then per-iteration work is proportional to the mask
+    // PERIMETER, not its area — typically a 50-100x speedup.
+    constexpr int kDilatePx = 2;
+    if (maskMaxX >= maskMinX) {     // skip when flood marked nothing
+        // Restrict the initial-scan area to the mask's bbox plus the
+        // dilation distance — any pixel outside that range can't be on
+        // the dilation wavefront. Single biggest speedup of the whole
+        // dilation step on small fills in big pages.
+        int sx0 = std::max(0,     maskMinX - kDilatePx - 1);
+        int sx1 = std::min(pageW, maskMaxX + kDilatePx + 2);
+        int sy0 = std::max(0,     maskMinY - kDilatePx - 1);
+        int sy1 = std::min(pageH, maskMaxY + kDilatePx + 2);
+
+        std::vector<std::pair<int, int>> frontier;
+        frontier.reserve(8192);
+        for (int y = sy0; y < sy1; ++y) {
+            size_t row = static_cast<size_t>(y) * pageW;
+            for (int x = sx0; x < sx1; ++x) {
+                if (mask[row + x]) continue;
+                bool nb =
+                    (x > 0          && mask[row + x - 1])     ||
+                    (x + 1 < pageW  && mask[row + x + 1])     ||
+                    (y > 0          && mask[row - pageW + x]) ||
+                    (y + 1 < pageH  && mask[row + pageW + x]);
+                if (nb) frontier.emplace_back(x, y);
+            }
+        }
+        for (int iter = 0; iter < kDilatePx; ++iter) {
+            // Mark current frontier (it's now part of the dilated mask).
+            for (auto [x, y] : frontier) {
+                mask[static_cast<size_t>(y) * pageW + x] = 1;
+            }
+            // Collect next frontier from current frontier's neighbors.
+            // Mark provisionally as we go to avoid duplicates from
+            // sibling frontier pixels touching the same neighbor.
+            std::vector<std::pair<int, int>> nextFront;
+            nextFront.reserve(frontier.size() * 2);
+            for (auto [x, y] : frontier) {
+                auto consider = [&](int nx, int ny) {
+                    if (nx < 0 || nx >= pageW
+                     || ny < 0 || ny >= pageH) return;
+                    size_t off = static_cast<size_t>(ny) * pageW + nx;
+                    if (mask[off]) return;
+                    mask[off] = 1;
+                    nextFront.emplace_back(nx, ny);
+                };
+                consider(x + 1, y);
+                consider(x - 1, y);
+                consider(x, y + 1);
+                consider(x, y - 1);
+            }
+            frontier = std::move(nextFront);
+        }
+    }
+    auto tDilate = Clock::now();
+
+    // (4) Apply mask to active layer's tiles. Build the affected-tile
+    // list first so undo only snapshots tiles that actually changed.
+    int tx0 = static_cast<int>(std::floor(page.minX / kTileSizeF));
+    int tx1 = static_cast<int>(std::floor((page.maxX - 1) / kTileSizeF));
+    int ty0 = static_cast<int>(std::floor(page.minY / kTileSizeF));
+    int ty1 = static_cast<int>(std::floor((page.maxY - 1) / kTileSizeF));
+
+    std::vector<std::pair<int, int>> affected;
+    affected.reserve(static_cast<size_t>(tx1 - tx0 + 1) * (ty1 - ty0 + 1));
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        int tileDocY0 = ty * kTileSize;
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            int tileDocX0 = tx * kTileSize;
+            // Quick scan: any masked pixel in the tile's intersection with
+            // the page rect?
+            bool any = false;
+            for (int ly = 0; ly < kTileSize && !any; ++ly) {
+                int doc_y = tileDocY0 + ly;
+                if (doc_y < static_cast<int>(page.minY)
+                 || doc_y >= static_cast<int>(page.maxY)) continue;
+                size_t maskRow = static_cast<size_t>(doc_y - static_cast<int>(page.minY)) * pageW;
+                for (int lx = 0; lx < kTileSize; ++lx) {
+                    int doc_x = tileDocX0 + lx;
+                    if (doc_x < static_cast<int>(page.minX)
+                     || doc_x >= static_cast<int>(page.maxX)) continue;
+                    if (mask[maskRow + (doc_x - static_cast<int>(page.minX))]) {
+                        any = true; break;
+                    }
+                }
+            }
+            if (any) affected.emplace_back(tx, ty);
+        }
+    }
+    auto tAffected = Clock::now();
+    if (affected.empty()) return;
+
+    UndoEntry entry;
+    entry.op = UndoOp::RasterStroke;
+    entry.layerIdx = activeLayer();
+    entry.beforeTiles.reserve(affected.size());
+    entry.afterTiles.reserve(affected.size());
+
+    uint8_t fr = (fillRgb >> 16) & 0xFF;
+    uint8_t fg = (fillRgb >>  8) & 0xFF;
+    uint8_t fb =  fillRgb        & 0xFF;
+
+    GLint prevFbo2 = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo2);
+    std::vector<uint8_t> tilePixels(kTileBytes);
+    for (auto [tx, ty] : affected) {
+        int tileDocX0 = tx * kTileSize;
+        int tileDocY0 = ty * kTileSize;
+
+        // (a) Capture before-state. Skip the GPU readback for tiles that
+        // don't yet exist — they're conceptually all-transparent.
+        TileSnap before;
+        before.tx = tx; before.ty = ty;
+        auto existing = layer.tiles.find(tileKey(tx, ty));
+        if (existing != layer.tiles.end()) {
+            before.existed = true;
+            before.bytes.resize(kTileBytes);
+            glBindFramebuffer(GL_FRAMEBUFFER, existing->second.fbo);
+            glReadPixels(0, 0, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, before.bytes.data());
+            std::memcpy(tilePixels.data(), before.bytes.data(), kTileBytes);
+        } else {
+            std::memset(tilePixels.data(), 0, kTileBytes);
+        }
+
+        // (b) Apply mask in CPU.
+        for (int ly = 0; ly < kTileSize; ++ly) {
+            int doc_y = tileDocY0 + ly;
+            if (doc_y < static_cast<int>(page.minY)
+             || doc_y >= static_cast<int>(page.maxY)) continue;
+            size_t maskRow = static_cast<size_t>(doc_y - static_cast<int>(page.minY)) * pageW;
+            for (int lx = 0; lx < kTileSize; ++lx) {
+                int doc_x = tileDocX0 + lx;
+                if (doc_x < static_cast<int>(page.minX)
+                 || doc_x >= static_cast<int>(page.maxX)) continue;
+                if (!mask[maskRow + (doc_x - static_cast<int>(page.minX))]) continue;
+                size_t off = (static_cast<size_t>(ly) * kTileSize + lx) * 4;
+                // Opaque fill: replace pixel (premultiplied: src.a = 1 means
+                // the destination contribution drops to zero anyway).
+                tilePixels[off + 0] = fr;
+                tilePixels[off + 1] = fg;
+                tilePixels[off + 2] = fb;
+                tilePixels[off + 3] = 255;
+            }
+        }
+
+        // (c) Upload + persist + record undo. tilePixels is now the new
+        // tile state, so it doubles as the after-snapshot bytes.
+        Tile& tile = getOrCreateTile(layer, tx, ty);
+        glBindTexture(GL_TEXTURE_2D, tile.texture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kTileSize, kTileSize,
+                        GL_RGBA, GL_UNSIGNED_BYTE, tilePixels.data());
+        writeTileBytesToDisk(activeLayer(), tx, ty, tilePixels.data());
+
+        TileSnap after;
+        after.tx = tx; after.ty = ty;
+        after.existed = true;
+        after.bytes.resize(kTileBytes);
+        std::memcpy(after.bytes.data(), tilePixels.data(), kTileBytes);
+        entry.beforeTiles.push_back(std::move(before));
+        entry.afterTiles.push_back(std::move(after));
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo2);
+
+    auto tApply = Clock::now();
+
+    // Push undo entry if any tile actually changed (a fill that hit only
+    // already-fill-color pixels would produce identical before/after).
+    bool diff = false;
+    for (size_t i = 0; i < entry.beforeTiles.size() && !diff; ++i) {
+        const auto& b = entry.beforeTiles[i];
+        const auto& a = entry.afterTiles[i];
+        if (b.existed != a.existed
+         || (b.existed && std::memcmp(b.bytes.data(), a.bytes.data(),
+                                       b.bytes.size()) != 0)) {
+            diff = true;
+        }
+    }
+    if (diff) pushUndoEntry(std::move(entry));
+    auto tEnd = Clock::now();
+
+    LOGI("bucket fill timings (ms): composite=%.1f readback=%.1f flood=%.1f "
+         "dilate=%.1f detect=%.1f apply=%.1f undo=%.1f total=%.1f "
+         "tiles=%zu pageW=%d pageH=%d",
+         millis(tCompositeStart, tComposite),
+         millis(tComposite, tReadback),
+         millis(tReadback, tFlood),
+         millis(tFlood, tDilate),
+         millis(tDilate, tAffected),
+         millis(tAffected, tApply),
+         millis(tApply, tEnd),
+         millis(t0, tEnd),
+         affected.size(), pageW, pageH);
+}
+
 }  // namespace
 
 // ---- JNI ------------------------------------------------------------------
@@ -3136,6 +4303,22 @@ Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring 
     LOGI("document dir = %s", g_docDir.c_str());
 }
 
+// Switch the active document at runtime. Frees the current doc's GL
+// state, clears selection / undo / pending writes, and points g_docDir
+// at the new path. Lazy-loads the new doc on the next render entrypoint.
+// Queued through the action drain so all GL work happens on the GL thread.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_loadDocument(
+        JNIEnv* env, jobject, jstring jpath) {
+    const char* str = env->GetStringUTFChars(jpath, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(g_pendingDocPathMutex);
+        g_pendingDocPath = str;
+    }
+    env->ReleaseStringUTFChars(jpath, str);
+    enqueuePendingAction(kActionLoadDocument);
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setTool(JNIEnv*, jobject, jint tool) {
     g_currentTool.store(tool);
@@ -3145,6 +4328,103 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setBrushColor(JNIEnv*, jobject, jint rgb) {
     // Mask to 24 bits in case caller passes a packed ARGB; we ignore alpha.
     g_currentBrushColor.store(static_cast<uint32_t>(rgb) & 0x00FFFFFFu);
+}
+
+// Brush size scale — multiplier on the per-pressure dab radius. Snapshot
+// at beginStroke so a slider change mid-stroke doesn't visibly split a
+// stroke. Pass any positive float; ignored if non-finite or <= 0.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setBrushSize(JNIEnv*, jobject, jfloat scale) {
+    if (!(scale > 0.0f) || !std::isfinite(scale)) return;
+    uint32_t bits;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    g_brushSizeScaleBits.store(bits);
+}
+
+// Vector tool line width (doc-px). Read at addLine/addRectangle/etc time;
+// the captured width travels with the shape forever after. Existing
+// shapes are unaffected by later changes.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setVectorLineWidth(JNIEnv*, jobject, jfloat width) {
+    if (!(width > 0.0f) || !std::isfinite(width)) return;
+    uint32_t bits;
+    std::memcpy(&bits, &width, sizeof(bits));
+    g_vectorLineWidthBits.store(bits);
+}
+
+// Bucket fill at (x, y) in doc-pixels using the current brush color.
+// Uses the page composite as the boundary source (so vector outlines on
+// other layers can act as boundaries) and writes pixels into the active
+// raster layer's tiles. No-op if the active layer is vector or the seed
+// is outside the page bounds. Synchronous on the GL thread; commits
+// directly to disk and pushes a single undo entry covering the change.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_bucketFillAt(
+        JNIEnv* env, jobject, jfloat x, jfloat y) {
+    ensureInited();
+    ensureLoaded();
+    applyPendingLayerActions();
+    applyPendingShapes();
+    ensureAtLeastOneLayer();
+    uint32_t fillRgb = g_currentBrushColor.load();
+    applyBucketFill(env, x, y, fillRgb);
+}
+
+// ---- Raster selection JNIs ----------------------------------------------
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_beginRasterSelection(
+        JNIEnv*, jobject, jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    ensureInited();
+    ensureLoaded();
+    applyPendingLayerActions();
+    applyPendingShapes();
+    ensureAtLeastOneLayer();
+    return liftRasterSelectionRect(x0, y0, x1, y1) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_translateRasterSelection(
+        JNIEnv*, jobject, jfloat dx, jfloat dy) {
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    if (!g_rasterSel.active) return;
+    g_rasterSel.panX += dx;
+    g_rasterSel.panY += dy;
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_commitRasterSelection(JNIEnv*, jobject) {
+    ensureInited();
+    ensureLoaded();
+    commitRasterSelectionImpl();
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_cancelRasterSelection(JNIEnv*, jobject) {
+    ensureInited();
+    cancelRasterSelectionImpl();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_hasRasterSelection(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    return g_rasterSel.active ? JNI_TRUE : JNI_FALSE;
+}
+
+// Hit-test: is the doc-coord point currently inside the floating
+// selection's transformed bbox? Used by the touch handler to decide
+// between "drag to translate" and "tap outside = commit".
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_rasterSelectionContains(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    if (!g_rasterSel.active) return JNI_FALSE;
+    float minX = g_rasterSel.bboxMinX + g_rasterSel.panX;
+    float minY = g_rasterSel.bboxMinY + g_rasterSel.panY;
+    float maxX = g_rasterSel.bboxMaxX + g_rasterSel.panX;
+    float maxY = g_rasterSel.bboxMaxY + g_rasterSel.panY;
+    return (x >= minX && x < maxX && y >= minY && y < maxY)
+           ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
@@ -3217,7 +4497,7 @@ Java_com_bk_drawing_NativeRenderer_addLine(
     l.x0 = x0; l.y0 = y0;
     l.x1 = x1; l.y1 = y1;
     l.color = g_currentBrushColor.load();
-    l.width = kDefaultLineWidth;
+    l.width = currentVectorLineWidth();
     std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
     g_pendingLines.push_back(l);
 }
@@ -3231,7 +4511,7 @@ Java_com_bk_drawing_NativeRenderer_addRectangle(
     r.x1 = x1; r.y1 = y1;
     r.rotation = 0.0f;
     r.color = g_currentBrushColor.load();
-    r.width = kDefaultLineWidth;
+    r.width = currentVectorLineWidth();
     std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
     g_pendingRects.push_back(r);
 }
@@ -3248,7 +4528,7 @@ Java_com_bk_drawing_NativeRenderer_addEllipse(
     e.ry = std::fabs(y1 - y0) * 0.5f;
     e.rotation = 0.0f;
     e.color = g_currentBrushColor.load();
-    e.width = kDefaultLineWidth;
+    e.width = currentVectorLineWidth();
     std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
     g_pendingEllipses.push_back(e);
 }
@@ -3267,7 +4547,7 @@ Java_com_bk_drawing_NativeRenderer_addCircle(
     float dy = y1 - y0;
     c.radius = std::sqrt(dx * dx + dy * dy);
     c.color = g_currentBrushColor.load();
-    c.width = kDefaultLineWidth;
+    c.width = currentVectorLineWidth();
     std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
     g_pendingCircles.push_back(c);
 }
@@ -3349,10 +4629,10 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
         // Lines don't have a rotation field; snapshot initial endpoints
         // so we can recompute from initial + delta on each update.
         if (sel.kind == ShapeKind::Line
-            && sel.layerIdx < g_layers.size()
-            && g_layers[sel.layerIdx]
-            && sel.shapeIdx < g_layers[sel.layerIdx]->lines.size()) {
-            g_drag.initialLine = g_layers[sel.layerIdx]->lines[sel.shapeIdx];
+            && sel.layerIdx < layers().size()
+            && layers()[sel.layerIdx]
+            && sel.shapeIdx < layers()[sel.layerIdx]->lines.size()) {
+            g_drag.initialLine = layers()[sel.layerIdx]->lines[sel.shapeIdx];
         }
         g_transformBeforeSel = sel;
         snapshotSelectionShape(sel, g_transformBeforeShape);
@@ -3484,8 +4764,8 @@ void applyMoveTo(float x, float y) {
         d   = g_drag;
     }
     if (d.mode != DragMode::Move || sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
-    Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
     if (layer.type != LayerType::Vector) return;
 
     Obb obb;
@@ -3524,8 +4804,8 @@ void applyScaleTo(float x, float y) {
         d   = g_drag;
     }
     if (d.mode != DragMode::Scale || sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
-    Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
 
     // Snap the dragged handle's pen position against other shapes'
     // targets (excluding self) before recomputing extents.
@@ -3611,8 +4891,8 @@ void applyRotateTo(float x, float y) {
         d   = g_drag;
     }
     if (d.mode != DragMode::Rotate || sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
-    Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
 
     float curAngle = std::atan2(y - d.centerY, x - d.centerX);
     float delta = curAngle - d.initialPenAngle;
@@ -3741,8 +5021,8 @@ Java_com_bk_drawing_NativeRenderer_translateSelection(
         sel = g_selection;
     }
     if (sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
-    Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
     if (layer.type != LayerType::Vector) return;
     translateShape(layer, sel, dx, dy);
 }
@@ -3767,8 +5047,8 @@ Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
         g_selection = Selection{};
     }
     if (sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= g_layers.size() || !g_layers[sel.layerIdx]) return;
-    Layer& layer = *g_layers[sel.layerIdx];
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
     if (layer.type != LayerType::Vector) return;
 
     // Snapshot the shape before erase, for undo.
@@ -3823,15 +5103,15 @@ Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_persistActiveVectorLayer(
         JNIEnv*, jobject) {
-    if (g_activeLayer >= g_layers.size() || !g_layers[g_activeLayer]) return;
-    if (g_layers[g_activeLayer]->type != LayerType::Vector) return;
-    saveVectorLayer(g_activeLayer, *g_layers[g_activeLayer]);
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return;
+    if (layers()[activeLayer()]->type != LayerType::Vector) return;
+    saveVectorLayer(activeLayer(), *layers()[activeLayer()]);
 }
 
 // Live preview during shape-tool drag. Color follows the current brush
-// color; width follows kDefaultLineWidth. shapeType matches the
-// addXxx-call shape semantics in renderShapePreviewToFront. If
-// `snapped` is true, also draws a snap-marker overlay at (x1, y1).
+// color; width follows the current vector-line-width slider. shapeType
+// matches the addXxx-call shape semantics in renderShapePreviewToFront.
+// If `snapped` is true, also draws a snap-marker overlay at (x1, y1).
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_renderShapePreview(
         JNIEnv* env, jobject,
@@ -3844,7 +5124,7 @@ Java_com_bk_drawing_NativeRenderer_renderShapePreview(
     uint32_t rgb = g_currentBrushColor.load();
     renderShapePreviewToFront(env, width, height, transform,
                               shapeType, x0, y0, x1, y1,
-                              rgb, kDefaultLineWidth, /*alpha=*/0.7f,
+                              rgb, currentVectorLineWidth(), /*alpha=*/0.7f,
                               snapped == JNI_TRUE);
 }
 
@@ -3905,15 +5185,161 @@ Java_com_bk_drawing_NativeRenderer_discardStroke(JNIEnv*, jobject) {
 // Read accessors for UI display. Called from the UI thread; the values may
 // momentarily be stale relative to queued addLayer/cycleActiveLayer
 // actions (which apply on the GL thread) but the discrepancy resolves on
-// the next stroke or render and is fine for status text.
+// the next stroke or render and is fine for status text. They tolerate
+// the not-yet-loaded state (g_pages empty) by returning 0.
 JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_getLayerCount(JNIEnv*, jobject) {
-    return static_cast<jint>(g_layers.size());
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return 0;
+    return static_cast<jint>(g_pages[g_activePageIdx]->layers.size());
 }
 
 JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_getActiveLayer(JNIEnv*, jobject) {
-    return static_cast<jint>(g_activeLayer);
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return 0;
+    return static_cast<jint>(g_pages[g_activePageIdx]->activeLayer);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageCount(JNIEnv*, jobject) {
+    return static_cast<jint>(g_pages.size());
+}
+
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getActivePage(JNIEnv*, jobject) {
+    return static_cast<jint>(g_activePageIdx);
+}
+
+// Page navigation. Both queue through the pending-action drain so the
+// mutation runs on the GL thread alongside other state changes (and
+// shapes pending in g_pendingShapes get applied to the OLD page first).
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_addPage(JNIEnv*, jobject) {
+    enqueuePendingAction(kActionAddPage);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_switchPage(JNIEnv*, jobject, jint idx) {
+    if (idx < 0) return;
+    g_pendingSwitchPage.store(idx);
+    enqueuePendingAction(kActionSwitchPage);
+}
+
+// Render a given page's composite into an Android Bitmap (must be
+// ARGB_8888 / RGBA_8888 in NDK terms). Used by the sidebar to draw page
+// thumbnails. Synchronous on the GL thread — callers should invoke this
+// from a callback that already runs there (e.g. via forceRedraw of a
+// hidden offscreen surface) OR via the framework's renderer callback.
+//
+// In practice we accept calling from any GL-thread context, including
+// inside an onDrawMultiBufferedLayer callback after the main composite
+// has finished. The swapping of g_activePageIdx is restored before
+// return so the caller's state is untouched.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
+        JNIEnv* env, jobject,
+        jint pageIdx, jobject bitmap) {
+    ensureInited();
+    ensureLoaded();
+    if (pageIdx < 0 || static_cast<size_t>(pageIdx) >= g_pages.size()) return;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        LOGE("thumbnail: bitmap format %d not RGBA_8888", info.format);
+        return;
+    }
+    int w = static_cast<int>(info.width);
+    int h = static_cast<int>(info.height);
+    if (w <= 0 || h <= 0) return;
+
+    // Save state we're about to clobber.
+    size_t   savedPage      = g_activePageIdx;
+    uint32_t savedScaleBits = g_viewScaleBits.load();
+    GLint    prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
+    g_activePageIdx = static_cast<size_t>(pageIdx);
+
+    // Fit the page rect into (w, h) with letterboxing. The transform is
+    // doc → buffer with the same y direction in both spaces; combined with
+    // glReadPixels' bottom-up byte order, this lands doc-top at the top
+    // row of the bitmap (no row flip needed during memcpy).
+    PageClip page = readPageClip();
+    float pageW = page.active ? (page.maxX - page.minX) : static_cast<float>(w);
+    float pageH = page.active ? (page.maxY - page.minY) : static_cast<float>(h);
+    float minX  = page.active ? page.minX : 0.0f;
+    float minY  = page.active ? page.minY : 0.0f;
+    float s = std::min(static_cast<float>(w) / pageW,
+                       static_cast<float>(h) / pageH);
+    float offsetX = (static_cast<float>(w) - s * pageW) * 0.5f;
+    float offsetY = (static_cast<float>(h) - s * pageH) * 0.5f;
+    float t[16] = {
+        s,    0.0f, 0.0f, 0.0f,
+        0.0f, s,    0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        offsetX - minX * s,
+        offsetY - minY * s,
+        0.0f, 1.0f
+    };
+
+    // Mirror the thumbnail scale into g_viewScaleBits so screen-relative
+    // widths (page outline etc.) come out as a consistent number of
+    // thumbnail pixels regardless of doc/thumbnail size.
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &s, sizeof(bits));
+        g_viewScaleBits.store(bits);
+    }
+
+    // Cached thumbnail FBO + color attachment (resized when dimensions
+    // change). Static is fine — only used from the GL thread.
+    static GLuint thumbFbo = 0, thumbTex = 0;
+    static int thumbW = 0, thumbH = 0;
+    if (thumbW != w || thumbH != h) {
+        if (thumbFbo) { glDeleteFramebuffers(1, &thumbFbo); thumbFbo = 0; }
+        if (thumbTex) { glDeleteTextures(1, &thumbTex);     thumbTex = 0; }
+        glGenTextures(1, &thumbTex);
+        glBindTexture(GL_TEXTURE_2D, thumbTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glGenFramebuffers(1, &thumbFbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, thumbTex, 0);
+        thumbW = w; thumbH = h;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo);
+
+    // compositeAllLayers takes a jfloatArray; wrap our local matrix.
+    jfloatArray transformArr = env->NewFloatArray(16);
+    env->SetFloatArrayRegion(transformArr, 0, 16, t);
+    compositeAllLayers(env, w, h, transformArr);
+    env->DeleteLocalRef(transformArr);
+
+    // Read pixels back. The bitmap may have stride > w*4 (rare for
+    // ARGB_8888, but possible). Copy row-by-row to honor stride; the
+    // y-flip in our transform already orients doc-top at bitmap-top, so
+    // this is a straight memcpy per row.
+    std::vector<uint8_t> buf(static_cast<size_t>(w) * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) == 0 && pixels) {
+        uint8_t* dst = static_cast<uint8_t*>(pixels);
+        for (int y = 0; y < h; ++y) {
+            std::memcpy(dst + y * info.stride,
+                        buf.data() + static_cast<size_t>(y) * w * 4,
+                        static_cast<size_t>(w) * 4);
+        }
+        AndroidBitmap_unlockPixels(env, bitmap);
+    }
+
+    // Restore caller state.
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    g_viewScaleBits.store(savedScaleBits);
+    g_activePageIdx = savedPage;
 }
 
 JNIEXPORT void JNICALL
@@ -3924,7 +5350,7 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     applyPendingShapes();
     ensureAtLeastOneLayer();
 
-    g_strokeTarget = g_activeLayer;
+    g_strokeTarget = activeLayer();
     g_strokeTool   = g_currentTool.load();
     // Snapshot brush RGB so mid-stroke color changes don't split a stroke.
     {
@@ -3934,6 +5360,8 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
         g_strokeBrushColor[2] = ( rgb        & 0xFFu) / 255.0f;
         g_strokeBrushColor[3] = kBrushAlpha;
     }
+    // Same idea for the brush size — fix it for the duration of the stroke.
+    g_strokeBrushSizeScale = currentBrushSizeScale();
     // Both brush and eraser strokes use the WYSIWYG preview path so that
     // strokes appear under layers-above-active correctly. Defer the
     // setup to first extendStroke (we don't have width/height/transform
@@ -3943,14 +5371,16 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     g_liveEmitter.reset();
 }
 
-JNIEXPORT void JNICALL
-Java_com_bk_drawing_NativeRenderer_extendStroke(
-        JNIEnv* env, jobject,
-        jint width, jint height,
-        jfloatArray transform,
-        jfloat x, jfloat y, jfloat pressure) {
+// Shared body for extendStroke / extendStrokePredicted. `persist=true`
+// adds the sample to g_current.samples so commitStroke bakes it; the
+// predicted variant skips the push so its dabs only ever live in the
+// front buffer (they get cleared on the next multi-buffer pass).
+static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
+                             jfloatArray transform,
+                             jfloat x, jfloat y, jfloat pressure,
+                             bool persist) {
     ensureInited();
-    g_current.samples.push_back({x, y, pressure});
+    if (persist) g_current.samples.push_back({x, y, pressure});
 
     // Both brush and eraser run through the same WYSIWYG preview pipeline:
     // accumulate the dab's coverage into g_coverage, then composite a
@@ -4021,6 +5451,30 @@ Java_com_bk_drawing_NativeRenderer_extendStroke(
 }
 
 JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_extendStroke(
+        JNIEnv* env, jobject,
+        jint width, jint height,
+        jfloatArray transform,
+        jfloat x, jfloat y, jfloat pressure) {
+    extendStrokeImpl(env, width, height, transform, x, y, pressure,
+                     /*persist=*/true);
+}
+
+// Like extendStroke but the sample isn't recorded into g_current.samples,
+// so commitStroke won't bake it. Used for motion-predicted dabs that
+// render into the front buffer to mask input latency — they vanish on
+// the next multi-buffer pass without ever becoming permanent.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_extendStrokePredicted(
+        JNIEnv* env, jobject,
+        jint width, jint height,
+        jfloatArray transform,
+        jfloat x, jfloat y, jfloat pressure) {
+    extendStrokeImpl(env, width, height, transform, x, y, pressure,
+                     /*persist=*/false);
+}
+
+JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     ensureInited();
 
@@ -4032,15 +5486,15 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     applyPendingShapes();
     ensureAtLeastOneLayer();
 
-    size_t layerIdx = g_strokeTarget < g_layers.size() ? g_strokeTarget
-                                                       : g_layers.size() - 1;
+    size_t layerIdx = g_strokeTarget < layers().size() ? g_strokeTarget
+                                                       : layers().size() - 1;
 
     // Snapshot tiles in the stroke's bbox BEFORE bake (only meaningful
     // for raster layers; bake is a no-op for vector). Skip snapshot if
     // there are no samples — the bake is a no-op too.
-    bool   snapForUndo = (layerIdx < g_layers.size()
-                          && g_layers[layerIdx]
-                          && g_layers[layerIdx]->type == LayerType::Raster);
+    bool   snapForUndo = (layerIdx < layers().size()
+                          && layers()[layerIdx]
+                          && layers()[layerIdx]->type == LayerType::Raster);
     int    tx0 = 0, tx1 = 0, ty0 = 0, ty1 = 0;
     UndoEntry entry;
     if (snapForUndo && currentStrokeTileBbox(tx0, tx1, ty0, ty1)) {
@@ -4061,7 +5515,7 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
         // snapshot) — important because glReadPixels stalls the pipeline
         // and the front-buffered renderer's commit can otherwise overrun
         // a vsync, briefly double-rendering the stroke during the swap.
-        Layer& layer = *g_layers[layerIdx];
+        Layer& layer = *layers()[layerIdx];
         size_t cellCount = static_cast<size_t>((tx1 - tx0 + 1))
                          * static_cast<size_t>((ty1 - ty0 + 1));
         entry.afterTiles.reserve(cellCount);

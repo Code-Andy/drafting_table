@@ -21,7 +21,11 @@ import kotlin.math.sin
 sealed class StrokeAction {
     data class Sample(
         val x: Float, val y: Float, val pressure: Float,
-        val isNewStroke: Boolean
+        val isNewStroke: Boolean,
+        // Predicted samples render into the front buffer to mask input
+        // latency but are never baked into the doc on commit (so the
+        // committed stroke matches the actual pen path, not the guesses).
+        val predicted: Boolean = false
     ) : StrokeAction()
 
     data class ShapePreview(
@@ -35,14 +39,18 @@ sealed class StrokeAction {
 // Only BRUSH and ERASER correspond to native "stroke tools" (running
 // through beginStroke / extendStroke / commitStroke). The shape tools
 // have their own gesture path and don't update the native stroke tool.
+// BUCKET is a click-to-act tool with its own native entrypoint; nativeId
+// is unused for it.
 enum class Tool(val nativeId: Int) {
-    BRUSH    (0),
-    ERASER   (1),
-    LINE     (2),
-    RECTANGLE(3),
-    CIRCLE   (4),
-    ELLIPSE  (5),
-    SELECT   (6);
+    BRUSH      (0),
+    ERASER     (1),
+    BUCKET     (-1),
+    LINE       (2),
+    RECTANGLE  (3),
+    CIRCLE     (4),
+    ELLIPSE    (5),
+    SELECT     (6),
+    SELECT_RECT(-1);    // raster rectangle marquee; no native tool id
 
     /** Shape-type code passed to NativeRenderer for shape tools. */
     val shapeType: Int
@@ -81,11 +89,19 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     if (param.isNewStroke) {
                         NativeRenderer.beginStroke()
                     }
-                    NativeRenderer.extendStroke(
-                        bufferInfo.width, bufferInfo.height,
-                        composed,
-                        param.x, param.y, param.pressure
-                    )
+                    if (param.predicted) {
+                        NativeRenderer.extendStrokePredicted(
+                            bufferInfo.width, bufferInfo.height,
+                            composed,
+                            param.x, param.y, param.pressure
+                        )
+                    } else {
+                        NativeRenderer.extendStroke(
+                            bufferInfo.width, bufferInfo.height,
+                            composed,
+                            param.x, param.y, param.pressure
+                        )
+                    }
                 }
                 is StrokeAction.ShapePreview -> {
                     NativeRenderer.renderShapePreview(
@@ -119,11 +135,63 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 NativeRenderer.commitStroke()
             }
             cancelNextCommit = false
+            // Drain a queued bucket fill before the main render so the
+            // newly-painted tiles show up in this very pass.
+            val bucket = pendingBucketFill
+            if (bucket != null) {
+                pendingBucketFill = null
+                NativeRenderer.bucketFillAt(bucket.x, bucket.y)
+            }
             NativeRenderer.renderDocument(
                 bufferInfo.width, bufferInfo.height,
                 composed
             )
+            // Refresh page thumbnails for the sidebar. By default we only
+            // re-render the ACTIVE page (the only one whose pixels can
+            // have changed since the last multi-buffer pass under normal
+            // drawing). setThumbnailTargets / requestFullThumbnailRefresh
+            // sets a one-shot flag to refresh all entries the next time
+            // around (used after addPage / switchPage / sidebar rebuild).
+            val targets = thumbnailTargets
+            if (targets != null && targets.isNotEmpty()) {
+                val pageCount  = NativeRenderer.getPageCount()
+                val activePage = NativeRenderer.getActivePage()
+                val refreshAll = thumbnailRefreshAllOnce
+                thumbnailRefreshAllOnce = false
+
+                for ((idx, bitmap) in targets) {
+                    if (idx !in 0 until pageCount) continue
+                    if (refreshAll || idx == activePage) {
+                        NativeRenderer.renderPageThumbnail(idx, bitmap)
+                    }
+                }
+                post { onThumbnailsUpdated?.invoke() }
+            }
         }
+    }
+
+    // Map of page index → Bitmap to write thumbnail pixels into. Set by
+    // MainActivity each time the sidebar is (re)built. Read on the GL
+    // thread; the map itself is only ever replaced wholesale, never
+    // mutated in place.
+    @Volatile
+    private var thumbnailTargets: Map<Int, android.graphics.Bitmap>? = null
+    @Volatile
+    private var thumbnailRefreshAllOnce = false
+
+    /** Notified on the UI thread after every batch of thumbnails finishes
+     *  rendering. The sidebar uses this to ImageView.invalidate() each item. */
+    var onThumbnailsUpdated: (() -> Unit)? = null
+
+    fun setThumbnailTargets(targets: Map<Int, android.graphics.Bitmap>?) {
+        thumbnailTargets = targets
+        thumbnailRefreshAllOnce = true
+    }
+
+    /** Force every registered thumbnail to refresh on the next multi-buffer
+     *  pass, even those for non-active pages. */
+    fun requestFullThumbnailRefresh() {
+        thumbnailRefreshAllOnce = true
     }
 
     private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
@@ -213,14 +281,24 @@ class DrawingSurfaceView @JvmOverloads constructor(
     /** Public so MainActivity's tool button can route through the same
      *  code path the stylus side-button uses. Cycles through every tool. */
     fun toggleTool() {
+        // Auto-commit any floating raster selection before swapping tools
+        // so the user doesn't lose their work or end up with a stranded
+        // floating overlay belonging to a tool they can no longer interact
+        // with. Cheap no-op when nothing is selected.
+        if (NativeRenderer.hasRasterSelection()) {
+            NativeRenderer.commitRasterSelection()
+            forceRedraw()
+        }
         currentTool = when (currentTool) {
-            Tool.BRUSH     -> Tool.ERASER
-            Tool.ERASER    -> Tool.LINE
-            Tool.LINE      -> Tool.RECTANGLE
-            Tool.RECTANGLE -> Tool.CIRCLE
-            Tool.CIRCLE    -> Tool.ELLIPSE
-            Tool.ELLIPSE   -> Tool.SELECT
-            Tool.SELECT    -> Tool.BRUSH
+            Tool.BRUSH       -> Tool.ERASER
+            Tool.ERASER      -> Tool.BUCKET
+            Tool.BUCKET      -> Tool.LINE
+            Tool.LINE        -> Tool.RECTANGLE
+            Tool.RECTANGLE   -> Tool.CIRCLE
+            Tool.CIRCLE      -> Tool.ELLIPSE
+            Tool.ELLIPSE     -> Tool.SELECT
+            Tool.SELECT      -> Tool.SELECT_RECT
+            Tool.SELECT_RECT -> Tool.BRUSH
         }
         // Native only knows about the raster stroke tools (brush/eraser);
         // shape and select tools are handled entirely on the Kotlin side
@@ -314,6 +392,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 cancelNextCommit = true
                 renderer?.commit()
             }
+            Tool.BUCKET -> {
+                // Click-to-act, nothing in flight to cancel.
+            }
             Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE -> {
                 renderer?.commit()
                 p1Snapped = false
@@ -324,6 +405,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     selectMode = 0
                     selectChanged = false
                 }
+            }
+            Tool.SELECT_RECT -> {
+                // If mid-define, cancel the rectangle preview; the
+                // floating selection (if any) survives the gesture.
+                if (selRectMode == SelRectMode.DEFINE) {
+                    renderer?.commit()
+                }
+                selRectMode = SelRectMode.NONE
             }
         }
         gestureP1Id = event.getPointerId(p1Index)
@@ -442,10 +531,139 @@ class DrawingSurfaceView @JvmOverloads constructor(
         }
         return when (currentTool) {
             Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
+            Tool.BUCKET             -> handleBucketEvent(event)
             Tool.SELECT             -> handleSelectEvent(event)
+            Tool.SELECT_RECT        -> handleSelectRectEvent(r, event)
             else                    -> handleShapeEvent(r, event, currentTool.shapeType)
         }
     }
+
+    // ---- Raster selection (rectangle marquee) ------------------------
+    //
+    // Three sub-modes inside this handler:
+    //   - DEFINE: no selection active → drag draws a preview rectangle.
+    //     On UP the rect lifts the underlying pixels into a floating
+    //     selection (handled entirely on the native side).
+    //   - TRANSLATE: selection active and ACTION_DOWN landed inside its
+    //     bbox → drag translates the floating selection.
+    //   - COMMIT_THEN_DEFINE: selection active and ACTION_DOWN landed
+    //     outside → commit it, then start a new DEFINE in the same gesture.
+    private enum class SelRectMode { NONE, DEFINE, TRANSLATE }
+    private var selRectMode = SelRectMode.NONE
+    private var selRectStartX = 0f
+    private var selRectStartY = 0f
+    private var selRectLastX = 0f
+    private var selRectLastY = 0f
+    // Live preview of the rect being defined, in doc-px (only valid while
+    // selRectMode == DEFINE).
+    private var selRectPreviewX0 = 0f
+    private var selRectPreviewY0 = 0f
+    private var selRectPreviewX1 = 0f
+    private var selRectPreviewY1 = 0f
+
+    private fun handleSelectRectEvent(
+        r: GLFrontBufferedRenderer<StrokeAction>,
+        event: MotionEvent
+    ): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                viewToDoc(event.x, event.y, tmpDoc)
+                val dx = tmpDoc[0]; val dy = tmpDoc[1]
+                if (NativeRenderer.hasRasterSelection()
+                    && NativeRenderer.rasterSelectionContains(dx, dy)) {
+                    // TRANSLATE mode: drag the floating selection.
+                    selRectMode = SelRectMode.TRANSLATE
+                    selRectLastX = dx
+                    selRectLastY = dy
+                } else {
+                    // If a selection exists, commit it first.
+                    if (NativeRenderer.hasRasterSelection()) {
+                        NativeRenderer.commitRasterSelection()
+                    }
+                    selRectMode = SelRectMode.DEFINE
+                    selRectStartX = dx
+                    selRectStartY = dy
+                    selRectPreviewX0 = dx; selRectPreviewY0 = dy
+                    selRectPreviewX1 = dx; selRectPreviewY1 = dy
+                    forceRedraw()
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                viewToDoc(event.x, event.y, tmpDoc)
+                val dx = tmpDoc[0]; val dy = tmpDoc[1]
+                when (selRectMode) {
+                    SelRectMode.DEFINE -> {
+                        selRectPreviewX1 = dx
+                        selRectPreviewY1 = dy
+                        // Render a rectangle outline on the front buffer
+                        // so the user sees what they're selecting. Reuse
+                        // the existing ShapePreview code path with the
+                        // RECTANGLE shape type (1).
+                        r.renderFrontBufferedLayer(
+                            StrokeAction.ShapePreview(
+                                shapeType = 1,
+                                x0 = selRectPreviewX0, y0 = selRectPreviewY0,
+                                x1 = selRectPreviewX1, y1 = selRectPreviewY1,
+                                snapped = false
+                            )
+                        )
+                    }
+                    SelRectMode.TRANSLATE -> {
+                        val mdx = dx - selRectLastX
+                        val mdy = dy - selRectLastY
+                        if (mdx != 0f || mdy != 0f) {
+                            NativeRenderer.translateRasterSelection(mdx, mdy)
+                            selRectLastX = dx
+                            selRectLastY = dy
+                            forceRedraw()
+                        }
+                    }
+                    SelRectMode.NONE -> {}
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                when (selRectMode) {
+                    SelRectMode.DEFINE -> {
+                        // Clear the front-buffer preview rectangle.
+                        r.commit()
+                        // Lift the rect — native handles the empty-rect case.
+                        NativeRenderer.beginRasterSelection(
+                            selRectPreviewX0, selRectPreviewY0,
+                            selRectPreviewX1, selRectPreviewY1
+                        )
+                        forceRedraw()
+                    }
+                    SelRectMode.TRANSLATE -> {
+                        // Stay floating; user can drag again or tap
+                        // outside to commit.
+                    }
+                    SelRectMode.NONE -> {}
+                }
+                selRectMode = SelRectMode.NONE
+            }
+        }
+        return true
+    }
+
+    /** Bucket tool: tap-to-fill. The native fill needs a current GL
+     *  context (it runs a full-page composite, glReadPixels, etc.), and
+     *  no GL context is current on the UI thread — so we just stash the
+     *  request and trigger a multi-buffer pass. The pass's GL-thread
+     *  callback (onDrawMultiBufferedLayer) actually runs the fill. */
+    private fun handleBucketEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            viewToDoc(event.x, event.y, tmpDoc)
+            pendingBucketFill = PendingBucketFill(tmpDoc[0], tmpDoc[1])
+            forceRedraw()
+        }
+        return true
+    }
+
+    private data class PendingBucketFill(val x: Float, val y: Float)
+    // Single volatile reference packages both coords + request flag — UI
+    // thread writes a fully-constructed object, GL thread reads it whole.
+    @Volatile
+    private var pendingBucketFill: PendingBucketFill? = null
 
     // Drag state for the SELECT tool.
     private var selectMode = 0          // 0=none, 1=move, 2=scale, 3=rotate

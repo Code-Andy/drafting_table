@@ -14,6 +14,7 @@ target_link_libraries(drawing PRIVATE
     GLESv3
     EGL
     android
+    jnigraphics      # AndroidBitmap_lockPixels for thumbnail readback
     ${log-lib}
 )
 
