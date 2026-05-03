@@ -34,6 +34,21 @@ sealed class StrokeAction {
         val x1: Float, val y1: Float,
         val snapped: Boolean            // shows snap marker at (x1, y1)
     ) : StrokeAction()
+
+    /** Live preview of the lasso (freeform selection) path during drag.
+     *  Points are doc-coords [x0,y0,x1,y1,...]. `closed` is typically
+     *  false during drag (no implicit closing edge while still drawing). */
+    data class LassoPreview(
+        val points: FloatArray,
+        val closed: Boolean
+    ) : StrokeAction() {
+        override fun equals(other: Any?): Boolean =
+            other is LassoPreview
+                && closed == other.closed
+                && points.contentEquals(other.points)
+        override fun hashCode(): Int =
+            31 * points.contentHashCode() + closed.hashCode()
+    }
 }
 
 // Only BRUSH and ERASER correspond to native "stroke tools" (running
@@ -50,7 +65,8 @@ enum class Tool(val nativeId: Int) {
     CIRCLE     (4),
     ELLIPSE    (5),
     SELECT     (6),
-    SELECT_RECT(-1);    // raster rectangle marquee; no native tool id
+    SELECT_RECT (-1),    // raster rectangle marquee; no native tool id
+    SELECT_LASSO(-1);    // raster freeform marquee; no native tool id
 
     /** Shape-type code passed to NativeRenderer for shape tools. */
     val shapeType: Int
@@ -112,6 +128,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         param.snapped
                     )
                 }
+                is StrokeAction.LassoPreview -> {
+                    NativeRenderer.renderLassoPathPreview(
+                        bufferInfo.width, bufferInfo.height,
+                        composed,
+                        param.points, param.closed
+                    )
+                }
             }
         }
 
@@ -141,6 +164,42 @@ class DrawingSurfaceView @JvmOverloads constructor(
             if (bucket != null) {
                 pendingBucketFill = null
                 NativeRenderer.bucketFillAt(bucket.x, bucket.y)
+            }
+            // Drain raster-selection ops in the order they're allowed:
+            // cancel → commit → begin. Commit before begin so a "tap
+            // outside, define a new rect" gesture in one swipe drops the
+            // old selection before lifting the new one.
+            if (pendingCancelRasterSel) {
+                pendingCancelRasterSel = false
+                NativeRenderer.cancelRasterSelection()
+            }
+            if (pendingCommitRasterSel) {
+                pendingCommitRasterSel = false
+                NativeRenderer.commitRasterSelection()
+            }
+            val beginSel = pendingBeginRasterSel
+            if (beginSel != null) {
+                pendingBeginRasterSel = null
+                NativeRenderer.beginRasterSelection(
+                    beginSel.x0, beginSel.y0, beginSel.x1, beginSel.y1
+                )
+            }
+            val beginLasso = pendingBeginLassoSel
+            if (beginLasso != null) {
+                pendingBeginLassoSel = null
+                NativeRenderer.beginLassoSelection(beginLasso)
+            }
+            // Copy is a snapshot of the current selection, so drain it
+            // BEFORE paste (which may auto-commit and replace the active
+            // selection). Drain after begin so a fresh just-lifted
+            // selection is also copyable in the same gesture.
+            if (pendingCopySel) {
+                pendingCopySel = false
+                NativeRenderer.copySelection()
+            }
+            if (pendingPasteSel) {
+                pendingPasteSel = false
+                NativeRenderer.pasteSelection()
             }
             NativeRenderer.renderDocument(
                 bufferInfo.width, bufferInfo.height,
@@ -278,15 +337,57 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  on-screen tool button label. */
     var onToolChanged: ((Tool) -> Unit)? = null
 
+    /** Snapshot the active floating raster selection's pixels into the
+     *  native clipboard. Selection is left unchanged. Queued onto the
+     *  next multi-buffer pass since the snapshot uses a temp FBO +
+     *  glReadPixels. No-op (silently) if no selection is active. */
+    fun queueCopySelection() {
+        pendingCopySel = true
+        forceRedraw()
+    }
+
+    /** Create a fresh floating raster selection from the native
+     *  clipboard, at the same doc-coord OBB as the original copy.
+     *  Auto-commits any existing floating sel first. Queued onto the
+     *  next multi-buffer pass (texture allocation + upload). If the
+     *  current tool can't interact with floating selections (i.e.
+     *  isn't SELECT_RECT/SELECT_LASSO), switch to SELECT_RECT so the
+     *  user can immediately drag/scale/rotate the pasted content. */
+    fun queuePasteSelection() {
+        if (currentTool != Tool.SELECT_RECT && currentTool != Tool.SELECT_LASSO) {
+            currentTool = Tool.SELECT_RECT
+            onToolChanged?.invoke(currentTool)
+        }
+        pendingPasteSel = true
+        forceRedraw()
+    }
+
+    /** Switch directly to `tool`. Used by the tool-rail buttons. Same
+     *  auto-commit-on-switch behavior as toggleTool, and notifies
+     *  onToolChanged so the UI mirror updates. No-op if already on it. */
+    fun setTool(tool: Tool) {
+        if (currentTool == tool) return
+        if (NativeRenderer.hasRasterSelection()) {
+            pendingCommitRasterSel = true
+            forceRedraw()
+        }
+        currentTool = tool
+        if (currentTool == Tool.BRUSH || currentTool == Tool.ERASER) {
+            NativeRenderer.setTool(currentTool.nativeId)
+        }
+        Log.i("DrawingApp", "tool -> ${currentTool.name.lowercase()}")
+        onToolChanged?.invoke(currentTool)
+    }
+
     /** Public so MainActivity's tool button can route through the same
      *  code path the stylus side-button uses. Cycles through every tool. */
     fun toggleTool() {
         // Auto-commit any floating raster selection before swapping tools
         // so the user doesn't lose their work or end up with a stranded
         // floating overlay belonging to a tool they can no longer interact
-        // with. Cheap no-op when nothing is selected.
+        // with. Queued because commit needs a live GL context.
         if (NativeRenderer.hasRasterSelection()) {
-            NativeRenderer.commitRasterSelection()
+            pendingCommitRasterSel = true
             forceRedraw()
         }
         currentTool = when (currentTool) {
@@ -297,8 +398,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
             Tool.RECTANGLE   -> Tool.CIRCLE
             Tool.CIRCLE      -> Tool.ELLIPSE
             Tool.ELLIPSE     -> Tool.SELECT
-            Tool.SELECT      -> Tool.SELECT_RECT
-            Tool.SELECT_RECT -> Tool.BRUSH
+            Tool.SELECT       -> Tool.SELECT_RECT
+            Tool.SELECT_RECT  -> Tool.SELECT_LASSO
+            Tool.SELECT_LASSO -> Tool.BRUSH
         }
         // Native only knows about the raster stroke tools (brush/eraser);
         // shape and select tools are handled entirely on the Kotlin side
@@ -406,11 +508,17 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     selectChanged = false
                 }
             }
-            Tool.SELECT_RECT -> {
-                // If mid-define, cancel the rectangle preview; the
-                // floating selection (if any) survives the gesture.
+            Tool.SELECT_RECT, Tool.SELECT_LASSO -> {
+                // If mid-define, cancel the marquee preview (rect or
+                // polyline); the floating selection (if any) survives.
                 if (selRectMode == SelRectMode.DEFINE) {
+                    lassoPathBuf.clear()
                     renderer?.commit()
+                }
+                // If mid-interact, end the drag cleanly so its mode flag
+                // doesn't carry into the next gesture.
+                if (selRectMode == SelRectMode.INTERACT) {
+                    NativeRenderer.endRasterInteraction()
                 }
                 selRectMode = SelRectMode.NONE
             }
@@ -534,26 +642,24 @@ class DrawingSurfaceView @JvmOverloads constructor(
             Tool.BUCKET             -> handleBucketEvent(event)
             Tool.SELECT             -> handleSelectEvent(event)
             Tool.SELECT_RECT        -> handleSelectRectEvent(r, event)
+            Tool.SELECT_LASSO       -> handleSelectLassoEvent(r, event)
             else                    -> handleShapeEvent(r, event, currentTool.shapeType)
         }
     }
 
     // ---- Raster selection (rectangle marquee) ------------------------
     //
-    // Three sub-modes inside this handler:
-    //   - DEFINE: no selection active → drag draws a preview rectangle.
-    //     On UP the rect lifts the underlying pixels into a floating
-    //     selection (handled entirely on the native side).
-    //   - TRANSLATE: selection active and ACTION_DOWN landed inside its
-    //     bbox → drag translates the floating selection.
-    //   - COMMIT_THEN_DEFINE: selection active and ACTION_DOWN landed
-    //     outside → commit it, then start a new DEFINE in the same gesture.
-    private enum class SelRectMode { NONE, DEFINE, TRANSLATE }
+    // Rectangle marquee gesture mode.
+    //   NONE     : not currently dragging
+    //   DEFINE   : rubber-banding the marquee that will become the lift rect
+    //   INTERACT : driving an in-progress move/scale/rotate of the floating
+    //              selection (mode chosen by beginRasterInteractionAt at
+    //              ACTION_DOWN — body=move, corner=scale, top=rotate).
+    //              ACTION_DOWN that misses both the body and any handle
+    //              commits the existing selection and falls through to
+    //              DEFINE in the same gesture.
+    private enum class SelRectMode { NONE, DEFINE, INTERACT }
     private var selRectMode = SelRectMode.NONE
-    private var selRectStartX = 0f
-    private var selRectStartY = 0f
-    private var selRectLastX = 0f
-    private var selRectLastY = 0f
     // Live preview of the rect being defined, in doc-px (only valid while
     // selRectMode == DEFINE).
     private var selRectPreviewX0 = 0f
@@ -569,20 +675,20 @@ class DrawingSurfaceView @JvmOverloads constructor(
             MotionEvent.ACTION_DOWN -> {
                 viewToDoc(event.x, event.y, tmpDoc)
                 val dx = tmpDoc[0]; val dy = tmpDoc[1]
-                if (NativeRenderer.hasRasterSelection()
-                    && NativeRenderer.rasterSelectionContains(dx, dy)) {
-                    // TRANSLATE mode: drag the floating selection.
-                    selRectMode = SelRectMode.TRANSLATE
-                    selRectLastX = dx
-                    selRectLastY = dy
+                // Try a handle / body hit on the active floating selection
+                // first. Returns 1 (move), 2 (scale), or 3 (rotate) on hit;
+                // 0 means no active selection OR the tap fell outside it.
+                val hit = NativeRenderer.beginRasterInteractionAt(dx, dy)
+                if (hit != 0) {
+                    selRectMode = SelRectMode.INTERACT
+                    forceRedraw()
                 } else {
-                    // If a selection exists, commit it first.
+                    // Tap missed the selection (or there is none). Commit
+                    // any existing selection so it bakes before a new lift.
                     if (NativeRenderer.hasRasterSelection()) {
-                        NativeRenderer.commitRasterSelection()
+                        pendingCommitRasterSel = true
                     }
                     selRectMode = SelRectMode.DEFINE
-                    selRectStartX = dx
-                    selRectStartY = dy
                     selRectPreviewX0 = dx; selRectPreviewY0 = dy
                     selRectPreviewX1 = dx; selRectPreviewY1 = dy
                     forceRedraw()
@@ -608,15 +714,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                             )
                         )
                     }
-                    SelRectMode.TRANSLATE -> {
-                        val mdx = dx - selRectLastX
-                        val mdy = dy - selRectLastY
-                        if (mdx != 0f || mdy != 0f) {
-                            NativeRenderer.translateRasterSelection(mdx, mdy)
-                            selRectLastX = dx
-                            selRectLastY = dy
-                            forceRedraw()
-                        }
+                    SelRectMode.INTERACT -> {
+                        NativeRenderer.updateRasterInteractionAt(dx, dy)
+                        forceRedraw()
                     }
                     SelRectMode.NONE -> {}
                 }
@@ -624,18 +724,108 @@ class DrawingSurfaceView @JvmOverloads constructor(
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 when (selRectMode) {
                     SelRectMode.DEFINE -> {
-                        // Clear the front-buffer preview rectangle.
-                        r.commit()
-                        // Lift the rect — native handles the empty-rect case.
-                        NativeRenderer.beginRasterSelection(
+                        // Queue the lift; r.commit() below clears the
+                        // preview rectangle and triggers the multi-buffer
+                        // pass that drains the queued operations on the
+                        // GL thread (where they actually have a context).
+                        pendingBeginRasterSel = PendingBeginRasterSel(
                             selRectPreviewX0, selRectPreviewY0,
                             selRectPreviewX1, selRectPreviewY1
                         )
+                        r.commit()
+                    }
+                    SelRectMode.INTERACT -> {
+                        // Selection stays floating; user can drag again
+                        // or tap outside to commit.
+                        NativeRenderer.endRasterInteraction()
+                    }
+                    SelRectMode.NONE -> {}
+                }
+                selRectMode = SelRectMode.NONE
+            }
+        }
+        return true
+    }
+
+    // Live polyline buffer for the lasso DEFINE phase. Cleared at each
+    // ACTION_DOWN / ACTION_UP. Held as a flat list to avoid allocating
+    // a Pair per sample; converted to a FloatArray for the native call.
+    private val lassoPathBuf = ArrayList<Float>(64)
+    // Throttle: only append a new point if at least this many doc-px from
+    // the last one. Keeps the per-MOVE polyline render cost bounded on
+    // long, dense gestures.
+    private val lassoMinSpacingDoc: Float
+        get() = 1.0f / viewScale
+
+    private fun handleSelectLassoEvent(
+        r: GLFrontBufferedRenderer<StrokeAction>,
+        event: MotionEvent
+    ): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                viewToDoc(event.x, event.y, tmpDoc)
+                val dx = tmpDoc[0]; val dy = tmpDoc[1]
+                // Same handle/body hit-test as the rect tool: any active
+                // floating selection takes priority over starting a new
+                // lasso path.
+                val hit = NativeRenderer.beginRasterInteractionAt(dx, dy)
+                if (hit != 0) {
+                    selRectMode = SelRectMode.INTERACT
+                    forceRedraw()
+                } else {
+                    if (NativeRenderer.hasRasterSelection()) {
+                        pendingCommitRasterSel = true
+                    }
+                    selRectMode = SelRectMode.DEFINE
+                    lassoPathBuf.clear()
+                    lassoPathBuf.add(dx); lassoPathBuf.add(dy)
+                    forceRedraw()
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                viewToDoc(event.x, event.y, tmpDoc)
+                val dx = tmpDoc[0]; val dy = tmpDoc[1]
+                when (selRectMode) {
+                    SelRectMode.DEFINE -> {
+                        val n = lassoPathBuf.size
+                        val lastX = lassoPathBuf[n - 2]
+                        val lastY = lassoPathBuf[n - 1]
+                        val ddx = dx - lastX; val ddy = dy - lastY
+                        val minSp = lassoMinSpacingDoc
+                        if (ddx * ddx + ddy * ddy >= minSp * minSp) {
+                            lassoPathBuf.add(dx); lassoPathBuf.add(dy)
+                        }
+                        // Re-render the entire path; the front-buffer
+                        // shader clears first so this isn't additive.
+                        r.renderFrontBufferedLayer(
+                            StrokeAction.LassoPreview(
+                                points = lassoPathBuf.toFloatArray(),
+                                closed = false
+                            )
+                        )
+                    }
+                    SelRectMode.INTERACT -> {
+                        NativeRenderer.updateRasterInteractionAt(dx, dy)
                         forceRedraw()
                     }
-                    SelRectMode.TRANSLATE -> {
-                        // Stay floating; user can drag again or tap
-                        // outside to commit.
+                    SelRectMode.NONE -> {}
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                when (selRectMode) {
+                    SelRectMode.DEFINE -> {
+                        // Need at least 3 distinct points to form a polygon.
+                        if (lassoPathBuf.size >= 6) {
+                            pendingBeginLassoSel = lassoPathBuf.toFloatArray()
+                        }
+                        lassoPathBuf.clear()
+                        // r.commit() clears the front-buffered preview and
+                        // drives the multi-buffer pass that drains the
+                        // lasso lift queue on the GL thread.
+                        r.commit()
+                    }
+                    SelRectMode.INTERACT -> {
+                        NativeRenderer.endRasterInteraction()
                     }
                     SelRectMode.NONE -> {}
                 }
@@ -664,6 +854,27 @@ class DrawingSurfaceView @JvmOverloads constructor(
     // thread writes a fully-constructed object, GL thread reads it whole.
     @Volatile
     private var pendingBucketFill: PendingBucketFill? = null
+
+    // Raster selection lift / commit / cancel — same pattern as bucket
+    // fill. The native impls all need a current GL context (they run
+    // glCopyTexSubImage2D, scissor-clear, snapshot read-backs, etc.) so
+    // they can't run from the touch-handler thread.
+    private data class PendingBeginRasterSel(
+        val x0: Float, val y0: Float, val x1: Float, val y1: Float
+    )
+    @Volatile
+    private var pendingBeginRasterSel: PendingBeginRasterSel? = null
+    @Volatile
+    private var pendingCommitRasterSel = false
+    @Volatile
+    private var pendingCancelRasterSel = false
+    // Lasso lift queue: a flat [x0,y0,x1,y1,...] doc-coord polyline.
+    @Volatile
+    private var pendingBeginLassoSel: FloatArray? = null
+    @Volatile
+    private var pendingCopySel = false
+    @Volatile
+    private var pendingPasteSel = false
 
     // Drag state for the SELECT tool.
     private var selectMode = 0          // 0=none, 1=move, 2=scale, 3=rotate
@@ -799,12 +1010,20 @@ class DrawingSurfaceView @JvmOverloads constructor(
         return true
     }
 
+    private var pageBoundsInitialized = false
+
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
+        Log.i("DrawingApp", "onSizeChanged ${oldw}x${oldh} -> ${w}x${h}")
         // First time we know the surface size, kick a multi-buffer pass so
         // the saved document loads and shows immediately on app launch
-        // (rather than only appearing after the first stroke commit).
-        if (oldw == 0 && oldh == 0 && w > 0 && h > 0) {
+        // (rather than only appearing after the first stroke commit). The
+        // gate used to be `(oldw == 0 && oldh == 0)`, but with the new
+        // multi-column layout the surface can be measured at an
+        // intermediate non-zero size first and we'd silently skip the
+        // bounds set. Track explicitly instead.
+        if (!pageBoundsInitialized && w > 0 && h > 0) {
+            pageBoundsInitialized = true
             // Page-boundary rectangle defaults to the initial visible
             // viewport — what the user sees as "the page" at startup.
             NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())

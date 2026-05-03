@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Read(//c/Program Files/Android/**)",
+      "Read(//c/Users/ben/.gradle/wrapper/**)",
+      "Bash(export GRADLE=\"/c/Users/ben/.gradle/wrapper/dists/gradle-8.7-bin/bhs2wmbdwecv87pi65oeuq5iu/gradle-8.7/bin/gradle\")",
+      "Bash(/c/Users/ben/.gradle/wrapper/dists/gradle-8.7-bin/bhs2wmbdwecv87pi65oeuq5iu/gradle-8.7/bin/gradle -p /c/Users/ben/Documents/drawing_app compileDebugKotlin)",
+      "WebFetch(domain:api.anthropic.com)",
+      "Read(//c/Users/ben/.claude/projects/C--Users-ben-Documents-drawing-app/f3fea3b6-9d16-47ba-b629-0ff2947980dc/tool-results/**)",
+      "Bash(zcat /c/Users/ben/.claude/projects/C--Users-ben-Documents-drawing-app/f3fea3b6-9d16-47ba-b629-0ff2947980dc/tool-results/webfetch-1777838332718-9b1v69.bin)",
+      "Bash(adb logcat *)",
+      "Bash(adb devices *)",
+      "Bash(adb shell *)",
+      "PowerShell(adb *)"
     ]
   }
 }

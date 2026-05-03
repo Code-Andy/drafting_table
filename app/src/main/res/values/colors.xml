@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Warm paper palette from Concept A v4. Used everywhere the UI sits over
+    real paper-feel surfaces. Single accent (sienna) for active state; a
+    secondary ink-blue accent is reserved for future annotation use.
+-->
+<resources>
+    <color name="paper">#F5F0E6</color>          <!-- warm off-white canvas    -->
+    <color name="paperDeep">#EDE5D2</color>      <!-- deeper warm panel surface -->
+    <color name="ink">#2A2620</color>            <!-- warm near-black ink       -->
+    <color name="inkSoft">#6B6357</color>        <!-- mid warm gray             -->
+    <color name="inkFaint">#B8AE9B</color>       <!-- faint stroke / hint       -->
+    <color name="rule">#D9CFB8</color>           <!-- hairline rule             -->
+    <color name="accent">#3A4F6B</color>         <!-- ink-blue secondary accent -->
+    <color name="hot">#B5482E</color>            <!-- warm sienna, active state -->
+    <color name="bezel">#1A1714</color>          <!-- outside the canvas        -->
+
+    <!-- Disabled-state ink (stub sliders, etc.) -->
+    <color name="inkDisabled">#C8BFA9</color>
+</resources>

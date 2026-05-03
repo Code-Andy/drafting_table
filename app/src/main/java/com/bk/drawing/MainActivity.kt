@@ -2,80 +2,104 @@ package com.bk.drawing
 
 import android.app.AlertDialog
 import android.content.Context
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.GridLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.res.ResourcesCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 
+/**
+ * Main UI host. Layout follows the Concept A v4 design:
+ *
+ *   ┌─────┬───────┬──────────┬─────────────────────────────┐
+ *   │tool │ pages │  layer   │           canvas            │
+ *   │rail │  bar  │  panel   │         (drawing)           │
+ *   │56dp │ 84dp  │  180dp   │       (weight = 1)          │
+ *   ├─────┴───────┴──────────┴─────────────────────────────┤
+ *   │                  status bar (28dp)                   │
+ *   └──────────────────────────────────────────────────────┘
+ *
+ * Floating chrome (undo/redo chip) is positioned over the canvas frame.
+ */
 class MainActivity : AppCompatActivity() {
 
     private var drawingView: DrawingSurfaceView? = null
-    private lateinit var toolButton: Button
-    private lateinit var layerButton: Button
-    private lateinit var gridButton: Button
-    private lateinit var snapButton: Button
 
-    // Grid cycles off → lines → dots → off.
-    private var gridState = 0   // 0 = off, 1 = lines, 2 = dots
-    private var snapEnabled = true
+    // ---- Tool rail ------------------------------------------------------
+    // Rail tiles are pure Views with isSelected() driving their bg drawable
+    // and tint. We keep references so onToolChanged can flip selection
+    // without rebuilding the rail.
+    private val railToolTiles  = mutableMapOf<Tool, ImageView>()
+    private lateinit var gridRailTile:   ImageView   // also used as panel toggle
+    private lateinit var pagesRailTile:  ImageView
 
-    // Local prediction of native layer state. Initialized from a one-shot
-    // read after the GL thread has had a chance to load tiles from disk.
-    private var layerCount = 1
-    private var activeLayerIndex = 0
+    // ---- Layer panel ----------------------------------------------------
+    private lateinit var layerListContainer: LinearLayout
+    private lateinit var layerActiveHeading: TextView
+    private lateinit var sizeSlider: SeekBar
+    private lateinit var sizeSliderLabel: TextView
+    private lateinit var sizeValueLabel: TextView
+    private lateinit var colorChip: View
 
-    // Page sidebar.
+    // ---- Status bar -----------------------------------------------------
+    private lateinit var statusToolText:  TextView
+    private lateinit var statusDocText:   TextView
+    private lateinit var statusGridText:  TextView
+    private lateinit var statusSnapText:  TextView
+    private lateinit var statusPageText:  TextView
+
+    // ---- Page sidebar (restyled to 84dp) -------------------------------
     private lateinit var sidebarScroll: ScrollView
     private lateinit var sidebarLayout: LinearLayout
+    private lateinit var docsButton:    LinearLayout
+    private lateinit var docsButtonLabel: TextView
     private val pageItems = mutableListOf<PageSidebarItem>()
-    private val kSidebarWidthDp    = 130
-    private val kThumbMaxWidthDp   = 110
-    private val kThumbMaxHeightDp  = 200   // generous: aspect drives the actual size
-    // Native-state mirrors. Used by onThumbnailsUpdated to detect drift
-    // (e.g. switchPage took longer than expected) and self-heal by
-    // rebuilding the sidebar — avoids the timing-fragile postDelayed
-    // pattern around GL-thread state changes.
+    private val kSidebarWidthDp   = 84
+    private val kThumbWidthDp     = 60       // matches design (60×78)
+    private val kThumbHeightDp    = 78
     private var lastBuiltActivePage = -1
     private var lastBuiltPageCount  = -1
 
     private data class PageSidebarItem(
         val container: LinearLayout,
+        val frame: FrameLayout,
         val imageView: ImageView,
-        val label: TextView,
+        val numberBadge: TextView,
         val bitmap: Bitmap,
         var pageIdx: Int
     )
 
-    // Document state. Multiple documents live under filesDir/documents/<name>/.
-    // The current doc's name is mirrored into SharedPreferences so we can
-    // re-open it on next launch.
-    private lateinit var docNameLabel: TextView
-    private var currentDocName: String = ""
+    // ---- App state mirrors ---------------------------------------------
+    private var gridState = 0          // 0 = off, 1 = lines, 2 = dots
+    private var snapEnabled = true
+    private var layerCount = 1
+    private var activeLayerIndex = 0
+    private var currentToolMirror: Tool = Tool.BRUSH
     private val kPrefsName = "drawing_app_prefs"
     private val kPrefLastDoc = "last_doc"
     private val kDocumentsRootName = "documents"
+    private var currentDocName: String = ""
 
-    // Brush size + vector width sliders. Geometric (log-scale) progress
-    // mapping so equal-distance ticks produce equal-ratio size changes.
-    // Persisted across launches.
-    private lateinit var brushSizeLabel: TextView
-    private lateinit var vectorWidthLabel: TextView
+    // ---- Brush + vector width (single slider routes to the right one) --
     private var brushSizeScale = 1.0f
     private var vectorLineWidth = 2.0f
     private val kPrefBrushSize     = "brush_size_scale"
@@ -87,18 +111,20 @@ class MainActivity : AppCompatActivity() {
 
     // Preset brush palette — 0xRRGGBB. First entry is the default.
     private val palette = intArrayOf(
-        0x14171F,   // dark blue-black (default)
-        0xB02828,   // red
-        0xC07020,   // orange
-        0xB8A020,   // mustard
-        0x408840,   // green
-        0x3060B8,   // blue
-        0x782878,   // purple
-        0x806040    // brown
+        0x14171F, 0xB02828, 0xC07020, 0xB8A020,
+        0x408840, 0x3060B8, 0x782878, 0x806040
     )
+    private var currentColorRgb = palette[0]
+
+    // ---- Fonts (downloadable) ------------------------------------------
+    private var fontMono:          Typeface? = null
+    private var fontMonoSemibold:  Typeface? = null
+    private var fontInter:         Typeface? = null
+    private var fontInterSemibold: Typeface? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        loadFonts()
 
         // Migrate the legacy single-doc layout, then pick which document
         // to open: last-used (if it still exists), the only doc on disk,
@@ -111,12 +137,9 @@ class MainActivity : AppCompatActivity() {
         currentDocName = initialDoc
         rememberDocName(initialDoc)
         val docDir = docDirFor(initialDoc).apply { mkdirs() }
-        // Use the synchronous setter here (not loadDocument) — at startup
-        // there's nothing in-memory yet, so the queued-action path isn't
-        // needed and we'd just incur an extra render before anything loads.
         NativeRenderer.setDocumentDir(docDir.absolutePath)
 
-        // Restore brush size + vector width from prefs and push to native.
+        // Restore brush size + vector width and push to native.
         brushSizeScale = prefs().getFloat(kPrefBrushSize, 1.0f)
             .coerceIn(kBrushSizeMin, kBrushSizeMax)
         vectorLineWidth = prefs().getFloat(kPrefVectorWidth, 2.0f)
@@ -131,26 +154,33 @@ class MainActivity : AppCompatActivity() {
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
-        // Root: horizontal LinearLayout — page sidebar on the left, then a
-        // FrameLayout that hosts the canvas and the right-side button panel.
-        // Touches dispatch to topmost child first, so taps on the sidebar
-        // and panel never reach the SurfaceView underneath them.
-        val root = LinearLayout(this).apply {
+        // Outer column: main horizontal row (rail + sidebar + panel + canvas)
+        // on top, status bar pinned across the bottom.
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.paper))
+        }
+
+        val mainRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
 
-        sidebarScroll = buildSidebarScroll()
-        root.addView(
-            sidebarScroll,
-            LinearLayout.LayoutParams(
-                kSidebarWidthDp.dp,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        )
+        mainRow.addView(buildToolRail(),
+            LinearLayout.LayoutParams(56.dp, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        val canvasFrame = FrameLayout(this)
+        sidebarScroll = buildPageSidebar()
+        mainRow.addView(sidebarScroll,
+            LinearLayout.LayoutParams(kSidebarWidthDp.dp, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        mainRow.addView(buildLayerPanel(),
+            LinearLayout.LayoutParams(180.dp, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        // Canvas frame: drawing surface + floating undo/redo chip on top.
+        val canvasFrame = FrameLayout(this).apply {
+            setBackgroundColor(getColor(R.color.bezel))
+        }
         val canvas = DrawingSurfaceView(this).also { v ->
-            v.onToolChanged = { tool -> updateToolButton(tool) }
+            v.onToolChanged = { tool -> onToolChanged(tool) }
             v.onThumbnailsUpdated = { onThumbnailsUpdated() }
             canvasFrame.addView(
                 v,
@@ -161,16 +191,22 @@ class MainActivity : AppCompatActivity() {
             )
         }
         drawingView = canvas
-
-        canvasFrame.addView(buildButtonPanel(), topRightPanelParams())
-        root.addView(
+        canvasFrame.addView(buildUndoRedoChip(), undoRedoChipParams())
+        mainRow.addView(
             canvasFrame,
-            LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f   // weight = 1
-            )
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f)
         )
 
-        setContentView(root)
+        outer.addView(
+            mainRow,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f
+            )
+        )
+        outer.addView(buildStatusBar(),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp))
+
+        setContentView(outer)
 
         // Opt into the highest refresh rate the panel offers (90 Hz on the MovinkPad).
         val highest = display?.supportedModes?.maxByOrNull { it.refreshRate }
@@ -180,11 +216,17 @@ class MainActivity : AppCompatActivity() {
             window.attributes = attrs
         }
 
-        // Once the GL thread has had time to ensureLoaded(), pull the real
-        // layer/page state so the sidebar and layer button reflect reality.
+        // Apply initial selection state to the brush tile.
+        onToolChanged(Tool.BRUSH)
+        // Push the persisted color into native and reflect it in the chip.
+        NativeRenderer.setBrushColor(currentColorRgb)
+        updateColorChip()
+        // Once the GL thread has had time to ensureLoaded(), pull real
+        // layer/page state and rebuild the panels.
         canvas.postDelayed({
             syncLayerStateFromNative()
             rebuildSidebar()
+            rebuildLayerList()
         }, 250L)
     }
 
@@ -194,10 +236,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // Volume keys still cycle/add layers — useful when finger-touching
-    // buttons isn't convenient mid-sketch. Also catch stylus-button
-    // keycodes here, in case the device reports stylus buttons as keys
-    // rather than as MotionEvent button bits.
+    /** Volume keys cycle/add layers; stylus side-button cycles tools. */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val keyCode = event.keyCode
         when (keyCode) {
@@ -221,173 +260,990 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchKeyEvent(event)
     }
 
-    // ---- UI construction -------------------------------------------------
+    // ====================================================================
+    // Tool rail
+    // ====================================================================
 
-    private fun buildButtonPanel(): LinearLayout {
+    /** Vertical rail of icon tiles. Sections separated by hairline rules.
+     *  Wrapped in a ScrollView so it gracefully degrades on shorter screens. */
+    private fun buildToolRail(): View {
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setBackgroundColor(getColor(R.color.paperDeep))
+        }
+        val rail = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, 8.dp, 0, 8.dp)
+        }
+        // Right-edge hairline so the rail visually separates from the
+        // sidebar / layer panel even when paperDeep is the same tone.
+        rail.addView(View(this).apply {
+            setBackgroundColor(getColor(R.color.rule))
+        }, LinearLayout.LayoutParams(0, 0))   // placeholder, replaced below
+
+        // Menu (top of rail): opens overflow popover with rarely-used actions.
+        rail.addView(toolTile(R.drawable.ic_menu, "menu", isToggle = false) {
+            showOverflowMenu(it)
+        })
+        rail.addView(railRule())
+
+        rail.addView(railSectionLabel("DRAW"))
+        rail.addView(makeRailToolTile(Tool.BRUSH,   R.drawable.ic_pen,    "brush"))
+        rail.addView(makeRailToolTile(Tool.ERASER,  R.drawable.ic_eraser, "eraser"))
+        rail.addView(makeRailToolTile(Tool.BUCKET,  R.drawable.ic_bucket, "bucket"))
+
+        rail.addView(railRule())
+        rail.addView(railSectionLabel("BUILD"))
+        rail.addView(makeRailToolTile(Tool.LINE,        R.drawable.ic_line,          "line"))
+        rail.addView(makeRailToolTile(Tool.RECTANGLE,   R.drawable.ic_rect,          "rectangle"))
+        rail.addView(makeRailToolTile(Tool.CIRCLE,      R.drawable.ic_circle,        "circle"))
+        rail.addView(makeRailToolTile(Tool.ELLIPSE,     R.drawable.ic_ellipse,       "ellipse"))
+        rail.addView(makeRailToolTile(Tool.SELECT,      R.drawable.ic_vector_select, "vector select"))
+        rail.addView(makeRailToolTile(Tool.SELECT_RECT, R.drawable.ic_select,        "marquee"))
+        rail.addView(makeRailToolTile(Tool.SELECT_LASSO,R.drawable.ic_lasso,         "lasso"))
+
+        rail.addView(railRule())
+        // Panel toggles. layers/color are present for design fidelity but
+        // don't toggle anything in Phase 1 (their panels are always shown
+        // in the layer column), so they stay unselected to avoid the
+        // visual clutter of every tile reading as active. pages + grid
+        // do reflect real state.
+        rail.addView(toolTile(R.drawable.ic_layers, "layers", isToggle = false) { /* no-op */ })
+        pagesRailTile = toolTile(R.drawable.ic_pages, "pages", isToggle = false) { tile ->
+            togglePageSidebar()
+            tile.isSelected = sidebarScroll.visibility == View.VISIBLE
+        } as ImageView
+        pagesRailTile.isSelected = true
+        rail.addView(pagesRailTile)
+        rail.addView(toolTile(R.drawable.ic_color, "color", isToggle = false) { /* no-op */ })
+        gridRailTile = toolTile(R.drawable.ic_grid, "grid", isToggle = false) { tile ->
+            cycleGrid()
+            tile.isSelected = (gridState != 0)
+        } as ImageView
+        rail.addView(gridRailTile)
+
+        scroll.addView(rail, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        return scroll
+    }
+
+    private fun railRule(): View = View(this).apply {
+        setBackgroundColor(getColor(R.color.rule))
+        layoutParams = LinearLayout.LayoutParams(36.dp, 1.dp).apply {
+            topMargin = 6.dp; bottomMargin = 4.dp
+        }
+    }
+
+    private fun railSectionLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 8f
+        typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+        letterSpacing = 0.12f
+        setTextColor(getColor(R.color.inkFaint))
+        gravity = Gravity.CENTER
+        setPadding(0, 2.dp, 0, 2.dp)
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun makeRailToolTile(tool: Tool, iconRes: Int, label: String): ImageView {
+        val tile = toolTile(iconRes, label, isToggle = false) { drawingView?.setTool(tool) }
+                as ImageView
+        railToolTiles[tool] = tile
+        return tile
+    }
+
+    /**
+     * Generic 44dp icon tile. `isToggle` toggles `isSelected` on tap;
+     * non-toggle tiles fire `onClick` and the caller manages state.
+     */
+    private fun toolTile(iconRes: Int, label: String,
+                         isToggle: Boolean,
+                         onClick: (ImageView) -> Unit): View {
+        val tile = ImageView(this).apply {
+            setImageResource(iconRes)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.tool_tile_bg, theme)
+            setPadding(10.dp, 10.dp, 10.dp, 10.dp)
+            contentDescription = label
+            imageTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_selected),
+                        intArrayOf()),
+                intArrayOf(getColor(R.color.hot), getColor(R.color.ink))
+            )
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                if (isToggle) isSelected = !isSelected
+                onClick(this)
+            }
+        }
+        tile.layoutParams = LinearLayout.LayoutParams(44.dp, 44.dp).apply {
+            topMargin = 2.dp; bottomMargin = 2.dp
+        }
+        return tile
+    }
+
+    /** Reflect the active tool by toggling `isSelected` on the rail tiles. */
+    private fun onToolChanged(tool: Tool) {
+        for ((t, tile) in railToolTiles) tile.isSelected = (t == tool)
+        currentToolMirror = tool
+        if (::statusToolText.isInitialized) {
+            statusToolText.text = "◇ ${tool.displayName.lowercase()}"
+        }
+        if (::sizeSliderLabel.isInitialized) {
+            updateSizeSliderForTool()
+        }
+    }
+
+    private val Tool.displayName: String
+        get() = when (this) {
+            Tool.BRUSH        -> "brush"
+            Tool.ERASER       -> "eraser"
+            Tool.BUCKET       -> "bucket"
+            Tool.LINE         -> "line"
+            Tool.RECTANGLE    -> "rect"
+            Tool.CIRCLE       -> "circle"
+            Tool.ELLIPSE      -> "ellipse"
+            Tool.SELECT       -> "select"
+            Tool.SELECT_RECT  -> "marquee"
+            Tool.SELECT_LASSO -> "lasso"
+        }
+
+    // ====================================================================
+    // Layer panel: LAYERS + BRUSH + COLOR
+    // ====================================================================
+
+    private fun buildLayerPanel(): View {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            val pad = 12.dp
-            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(getColor(R.color.paper))
         }
+        // Right-edge hairline (between layer panel and canvas frame).
+        // We add the rule as a sibling inside an outer FrameLayout so the
+        // rule doesn't take vertical space inside the column.
+        val wrapper = FrameLayout(this)
+        wrapper.addView(panel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        wrapper.addView(View(this).apply {
+            setBackgroundColor(getColor(R.color.rule))
+        }, FrameLayout.LayoutParams(1.dp, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.END))
 
-        toolButton = Button(this).apply {
-            text = "Brush"
-            alpha = 0.92f
-            setOnClickListener { drawingView?.toggleTool() }
+        // ---- LAYERS section ----
+        panel.addView(buildLayerHeader(),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp))
+        layerListContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
-        panel.addView(toolButton, panelChildParams())
+        panel.addView(layerListContainer,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        val undoButton = Button(this).apply {
-            text = "Undo"
-            alpha = 0.92f
-            setOnClickListener { userUndo() }
+        panel.addView(panelDivider())
+
+        // ---- BRUSH section ----
+        panel.addView(buildBrushSection(),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        panel.addView(panelDivider())
+
+        // ---- COLOR section ----
+        panel.addView(buildColorSection(),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        return wrapper
+    }
+
+    private fun panelDivider(): View = View(this).apply {
+        setBackgroundColor(getColor(R.color.rule))
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 1.dp)
+    }
+
+    private fun buildLayerHeader(): View {
+        val header = FrameLayout(this).apply {
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.panel_section_header, theme)
         }
-        panel.addView(undoButton, panelChildParams())
-
-        val redoButton = Button(this).apply {
-            text = "Redo"
-            alpha = 0.92f
-            setOnClickListener { userRedo() }
+        layerActiveHeading = TextView(this).apply {
+            text = "LAYERS"
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 10f
+            letterSpacing = 0.08f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 0, 0, 0)
         }
-        panel.addView(redoButton, panelChildParams())
+        header.addView(layerActiveHeading, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.START or Gravity.CENTER_VERTICAL
+        ))
 
-        val addButton = Button(this).apply {
-            text = "+ Layer"
-            alpha = 0.92f
+        // + raster layer
+        val plus = ImageView(this).apply {
+            setImageResource(R.drawable.ic_plus)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            setPadding(8.dp, 4.dp, 4.dp, 4.dp)
+            contentDescription = "add layer"
+            isClickable = true; isFocusable = true
             setOnClickListener { userAddLayer() }
         }
-        panel.addView(addButton, panelChildParams())
-
-        val addVectorButton = Button(this).apply {
-            text = "+ V Layer"
-            alpha = 0.92f
-            setOnClickListener { userAddVectorLayer() }
+        // ⋯ overflow → vector-layer / clear / delete
+        val more = ImageView(this).apply {
+            setImageResource(R.drawable.ic_more)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            setPadding(4.dp, 4.dp, 8.dp, 4.dp)
+            contentDescription = "more"
+            isClickable = true; isFocusable = true
+            setOnClickListener { showLayerOverflow(it) }
         }
-        panel.addView(addVectorButton, panelChildParams())
-
-        layerButton = Button(this).apply {
-            text = "Layer 1/1"
-            alpha = 0.92f
-            setOnClickListener { userCycleLayer() }
+        val rightRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(plus, LinearLayout.LayoutParams(28.dp, 28.dp))
+            addView(more, LinearLayout.LayoutParams(32.dp, 28.dp))
         }
-        panel.addView(layerButton, panelChildParams())
-
-        val clearButton = Button(this).apply {
-            text = "Clear"
-            alpha = 0.92f
-            setOnClickListener { userClearLayer() }
-        }
-        panel.addView(clearButton, panelChildParams())
-
-        gridButton = Button(this).apply {
-            text = "Grid: off"
-            alpha = 0.92f
-            setOnClickListener { cycleGrid() }
-        }
-        panel.addView(gridButton, panelChildParams())
-
-        val deleteButton = Button(this).apply {
-            text = "Delete"
-            alpha = 0.92f
-            setOnClickListener { userDeleteSelection() }
-        }
-        panel.addView(deleteButton, panelChildParams())
-
-        snapButton = Button(this).apply {
-            text = "Snap: on"
-            alpha = 0.92f
-            setOnClickListener { toggleSnap() }
-        }
-        panel.addView(snapButton, panelChildParams())
-
-        val resetViewButton = Button(this).apply {
-            text = "Reset View"
-            alpha = 0.92f
-            setOnClickListener { drawingView?.resetView() }
-        }
-        panel.addView(resetViewButton, panelChildParams())
-
-        panel.addView(buildBrushSizeSlider(), panelChildParams())
-        panel.addView(buildVectorWidthSlider(), panelChildParams())
-        panel.addView(buildColorGrid(), panelChildParams())
-
-        return panel
+        header.addView(rightRow, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.END or Gravity.CENTER_VERTICAL
+        ))
+        return header
     }
 
-    /** Brush-size slider (geometric mapping from progress 0..100 → scale
-     *  kBrushSizeMin..kBrushSizeMax). 1× lands at progress=50. */
-    private fun buildBrushSizeSlider(): View {
+    /** Re-render the layer list. Called whenever layer state changes. */
+    private fun rebuildLayerList() {
+        layerListContainer.removeAllViews()
+        // We don't have per-layer name/visibility on the native side yet;
+        // present each layer as "layer N" / "vector N" with the active row
+        // highlighted. The list is in display order (top = highest index).
+        // Rows have a fixed height: the active row's MATCH_PARENT sienna
+        // left bar would otherwise fight WRAP_CONTENT and inflate the
+        // whole row to fill the panel.
+        for (idx in (layerCount - 1) downTo 0) {
+            layerListContainer.addView(buildLayerRow(idx),
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 32.dp))
+            layerListContainer.addView(View(this).apply {
+                setBackgroundColor(getColor(R.color.rule))
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 1.dp))
+        }
+    }
+
+    private fun buildLayerRow(idx: Int): View {
+        val isActive = (idx == activeLayerIndex)
+        val row = FrameLayout(this).apply {
+            setBackgroundColor(
+                if (isActive) getColor(R.color.paperDeep) else Color.TRANSPARENT)
+            // 2dp sienna left bar for active; transparent otherwise.
+            if (isActive) {
+                addView(View(this@MainActivity).apply {
+                    setBackgroundColor(getColor(R.color.hot))
+                }, FrameLayout.LayoutParams(2.dp,
+                    ViewGroup.LayoutParams.MATCH_PARENT))
+            }
+            isClickable = true; isFocusable = true
+            setOnClickListener {
+                // Cycle to this layer. Native cycleActiveLayer goes one at
+                // a time, so we cycle until we land on idx.
+                while (activeLayerIndex != idx) userCycleLayer()
+            }
+        }
+        val rowContent = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 0, 10.dp, 0)
+            minimumHeight = 28.dp
+        }
+        // Eye icon — visual only for now (no per-layer visibility natively).
+        val eye = ImageView(this).apply {
+            setImageResource(R.drawable.ic_eye)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.ink))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+        }
+        rowContent.addView(eye, LinearLayout.LayoutParams(20.dp, 20.dp).apply {
+            rightMargin = 8.dp
+        })
+        // Name (placeholder labels until layer naming exists natively).
+        val name = TextView(this).apply {
+            text = "layer ${idx + 1}"
+            typeface = if (isActive) fontMonoSemibold ?: Typeface.MONOSPACE
+                       else fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.ink))
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            maxLines = 1
+        }
+        rowContent.addView(name, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        // Type tag (R / V) — we don't have layer-type on the layer count
+        // mirror, so always show R for Phase 1.
+        val tag = TextView(this).apply {
+            text = "R"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 8f
+            setTextColor(getColor(R.color.inkFaint))
+            setPadding(4.dp, 1.dp, 4.dp, 1.dp)
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.chrome_chip_bg, theme)
+        }
+        rowContent.addView(tag)
+
+        row.addView(rowContent, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER_VERTICAL))
+        return row
+    }
+
+    private fun buildBrushSection(): View {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            alpha = 0.92f
         }
-        brushSizeLabel = TextView(this).apply {
-            textSize = 11f
-            text = formatBrushSizeLabel(brushSizeScale)
+        // Header
+        val header = FrameLayout(this).apply {
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.panel_section_header, theme)
         }
-        container.addView(brushSizeLabel)
+        val headerLabel = TextView(this).apply {
+            text = "BRUSH"
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 10f
+            letterSpacing = 0.08f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 0, 10.dp, 0)
+        }
+        header.addView(headerLabel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.START or Gravity.CENTER_VERTICAL))
+        container.addView(header,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp))
 
-        val seek = SeekBar(this).apply {
+        // Active "size" slider routes to brush vs vector width based on tool.
+        sizeSliderLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.inkSoft))
+            text = "size"
+        }
+        sizeValueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.END
+        }
+        sizeSlider = SeekBar(this).apply {
             max = 100
             progress = brushScaleToProgress(brushSizeScale)
-            // 120 dp gives a usable touch target without bloating the panel.
-            layoutParams = LinearLayout.LayoutParams(120.dp,
-                ViewGroup.LayoutParams.WRAP_CONTENT)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val s = progressToBrushScale(p)
-                    brushSizeScale = s
-                    brushSizeLabel.text = formatBrushSizeLabel(s)
-                    NativeRenderer.setBrushSize(s)
+                    if (!fromUser) return
+                    if (currentToolEditsVector()) {
+                        val w = progressToVectorWidth(p)
+                        vectorLineWidth = w
+                        sizeValueLabel.text = "%.1f".format(w)
+                        NativeRenderer.setVectorLineWidth(w)
+                    } else {
+                        val s = progressToBrushScale(p)
+                        brushSizeScale = s
+                        sizeValueLabel.text = "%.2fx".format(s)
+                        NativeRenderer.setBrushSize(s)
+                    }
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {
-                    prefs().edit().putFloat(kPrefBrushSize, brushSizeScale).apply()
+                    if (currentToolEditsVector()) {
+                        prefs().edit().putFloat(kPrefVectorWidth, vectorLineWidth).apply()
+                    } else {
+                        prefs().edit().putFloat(kPrefBrushSize, brushSizeScale).apply()
+                    }
                 }
             })
         }
-        container.addView(seek)
+        container.addView(buildSliderRow(sizeSliderLabel, sizeSlider, sizeValueLabel))
+
+        // Disabled stubs — placeholders for future α / smoothing / pressure features.
+        for ((stubLabel, stubVal) in listOf("α" to "100", "smth" to "0.0", "press" to "—")) {
+            container.addView(buildSliderRow(
+                makeStubSliderLabel(stubLabel),
+                makeStubSlider(),
+                makeStubValueLabel(stubVal)
+            ))
+        }
+        // Push the initial value display.
+        updateSizeSliderForTool()
         return container
     }
 
-    /** Vector line width slider (geometric mapping). */
-    private fun buildVectorWidthSlider(): View {
+    private fun buildSliderRow(label: View, slider: View, valueLabel: View): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 4.dp, 10.dp, 4.dp)
+        }
+        row.addView(label, LinearLayout.LayoutParams(36.dp,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(slider, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        row.addView(valueLabel, LinearLayout.LayoutParams(36.dp,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        return row
+    }
+
+    private fun makeStubSliderLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        typeface = fontMono ?: Typeface.MONOSPACE
+        textSize = 9f
+        setTextColor(getColor(R.color.inkDisabled))
+    }
+
+    private fun makeStubSlider(): SeekBar = SeekBar(this).apply {
+        max = 100
+        progress = 100
+        isEnabled = false
+        alpha = 0.55f
+    }
+
+    private fun makeStubValueLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        typeface = fontMono ?: Typeface.MONOSPACE
+        textSize = 9f
+        setTextColor(getColor(R.color.inkDisabled))
+        gravity = Gravity.END
+    }
+
+    private fun currentToolEditsVector(): Boolean = when (currentToolMirror) {
+        Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE -> true
+        else -> false
+    }
+
+    /** Refresh the size slider's progress / value display when the tool
+     *  changes (or after a one-shot sync at startup). */
+    private fun updateSizeSliderForTool() {
+        if (currentToolEditsVector()) {
+            sizeSliderLabel.text = "width"
+            sizeSlider.progress = vectorWidthToProgress(vectorLineWidth)
+            sizeValueLabel.text = "%.1f".format(vectorLineWidth)
+        } else {
+            sizeSliderLabel.text = "size"
+            sizeSlider.progress = brushScaleToProgress(brushSizeScale)
+            sizeValueLabel.text = "%.2fx".format(brushSizeScale)
+        }
+    }
+
+    private fun buildColorSection(): View {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            alpha = 0.92f
         }
-        vectorWidthLabel = TextView(this).apply {
-            textSize = 11f
-            text = formatVectorWidthLabel(vectorLineWidth)
+        // Header with a small color chip on the right.
+        val header = FrameLayout(this).apply {
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.panel_section_header, theme)
         }
-        container.addView(vectorWidthLabel)
-
-        val seek = SeekBar(this).apply {
-            max = 100
-            progress = vectorWidthToProgress(vectorLineWidth)
-            layoutParams = LinearLayout.LayoutParams(120.dp,
-                ViewGroup.LayoutParams.WRAP_CONTENT)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val w = progressToVectorWidth(p)
-                    vectorLineWidth = w
-                    vectorWidthLabel.text = formatVectorWidthLabel(w)
-                    NativeRenderer.setVectorLineWidth(w)
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {
-                    prefs().edit().putFloat(kPrefVectorWidth, vectorLineWidth).apply()
-                }
+        val headerLabel = TextView(this).apply {
+            text = "COLOR"
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 10f
+            letterSpacing = 0.08f
+            setTextColor(getColor(R.color.ink))
+            setPadding(10.dp, 0, 0, 0)
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(headerLabel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.START or Gravity.CENTER_VERTICAL))
+        colorChip = View(this).apply {
+            setBackgroundColor(0xFF000000.toInt() or currentColorRgb)
+        }
+        header.addView(colorChip, FrameLayout.LayoutParams(18.dp, 14.dp,
+            Gravity.END or Gravity.CENTER_VERTICAL).apply {
+                marginEnd = 10.dp
             })
+        container.addView(header,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp))
+
+        // 8-swatch grid (placeholder for the full HSV picker that's
+        // designed but not implemented — Phase 2).
+        val grid = GridLayout(this).apply {
+            columnCount = 4
+            setPadding(10.dp, 8.dp, 10.dp, 12.dp)
         }
-        container.addView(seek)
+        palette.forEach { rgb ->
+            val swatch = View(this).apply {
+                setBackgroundColor(0xFF000000.toInt() or rgb)
+                setOnClickListener {
+                    NativeRenderer.setBrushColor(rgb)
+                    currentColorRgb = rgb
+                    updateColorChip()
+                }
+            }
+            val lp = GridLayout.LayoutParams().apply {
+                width  = 30.dp
+                height = 22.dp
+                setMargins(2.dp, 2.dp, 2.dp, 2.dp)
+            }
+            grid.addView(swatch, lp)
+        }
+        container.addView(grid)
         return container
     }
 
-    private fun formatBrushSizeLabel(scale: Float) =
-        "Brush: %.2f×".format(scale)
-    private fun formatVectorWidthLabel(w: Float) =
-        "Width: %.1f px".format(w)
+    private fun updateColorChip() {
+        if (::colorChip.isInitialized) {
+            colorChip.setBackgroundColor(0xFF000000.toInt() or currentColorRgb)
+        }
+    }
+
+    // ====================================================================
+    // Page sidebar (84dp wide, restyled)
+    // ====================================================================
+
+    private fun buildPageSidebar(): ScrollView {
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setBackgroundColor(getColor(R.color.paper))
+        }
+        sidebarLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        // Right-edge hairline so the sidebar visually ends.
+        val container = FrameLayout(this)
+        container.addView(sidebarLayout, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        container.addView(View(this).apply {
+            setBackgroundColor(getColor(R.color.rule))
+        }, FrameLayout.LayoutParams(1.dp, ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.END))
+        scroll.addView(container, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        return scroll
+    }
+
+    /** DOCS button at the top of the sidebar — opens the doc picker. */
+    private fun buildDocsButton(): View {
+        val tile = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.panel_section_header, theme)
+            setPadding(0, 8.dp, 0, 8.dp)
+            isClickable = true; isFocusable = true
+            setOnClickListener { showDocsMenu(it) }
+        }
+        val icon = ImageView(this).apply {
+            setImageResource(R.drawable.ic_docs)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.ink))
+        }
+        tile.addView(icon, LinearLayout.LayoutParams(16.dp, 16.dp))
+        docsButtonLabel = TextView(this).apply {
+            text = "DOCS"
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 10f
+            letterSpacing = 0.1f
+            setTextColor(getColor(R.color.ink))
+            setPadding(6.dp, 0, 6.dp, 0)
+        }
+        tile.addView(docsButtonLabel)
+        val chev = ImageView(this).apply {
+            setImageResource(R.drawable.ic_chev_d)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+        }
+        tile.addView(chev, LinearLayout.LayoutParams(12.dp, 12.dp))
+        docsButton = tile
+        return tile
+    }
+
+    /** Recreate every sidebar entry from current page state. */
+    private fun rebuildSidebar() {
+        sidebarLayout.removeAllViews()
+        pageItems.clear()
+
+        // DOCS header — replaces the old name-label + new/open/delete row.
+        sidebarLayout.addView(buildDocsButton(),
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val pageCount = NativeRenderer.getPageCount().coerceAtLeast(1)
+        val active    = NativeRenderer.getActivePage()
+        for (i in 0 until pageCount) {
+            val item = createPageSidebarItem(i, isActive = (i == active))
+            pageItems.add(item)
+            sidebarLayout.addView(item.container, sidebarItemParams())
+        }
+
+        // + Page row, designed as a dashed-frame thumbnail.
+        sidebarLayout.addView(buildAddPageRow(), sidebarItemParams())
+
+        lastBuiltPageCount  = pageCount
+        lastBuiltActivePage = active
+
+        drawingView?.setThumbnailTargets(
+            pageItems.associate { it.pageIdx to it.bitmap }
+        )
+        drawingView?.forceRedraw()
+    }
+
+    private fun buildAddPageRow(): View {
+        val frame = FrameLayout(this).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { userAddPage() }
+        }
+        val plus = ImageView(this).apply {
+            setImageResource(R.drawable.ic_plus)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+        }
+        // Render via a thin-bordered View so the dashed-frame impression
+        // comes through without needing a custom dashed drawable.
+        val box = View(this).apply {
+            background = makeDashedFrame()
+        }
+        frame.addView(box, FrameLayout.LayoutParams(kThumbWidthDp.dp, 36.dp,
+            Gravity.CENTER))
+        frame.addView(plus, FrameLayout.LayoutParams(20.dp, 20.dp,
+            Gravity.CENTER))
+        return frame
+    }
+
+    private fun makeDashedFrame(): android.graphics.drawable.Drawable {
+        val s = android.graphics.drawable.GradientDrawable()
+        s.shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+        s.setColor(Color.TRANSPARENT)
+        s.setStroke(1.dp,
+            getColor(R.color.inkFaint),
+            /* dashWidth */ 4f * resources.displayMetrics.density,
+            /* dashGap   */ 3f * resources.displayMetrics.density)
+        return s
+    }
+
+    private fun createPageSidebarItem(idx: Int, isActive: Boolean): PageSidebarItem {
+        val thumbW = kThumbWidthDp.dp
+        val thumbH = kThumbHeightDp.dp
+        val bitmap = Bitmap.createBitmap(thumbW, thumbH, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.WHITE)
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            isClickable = true; isFocusable = true
+            setOnClickListener {
+                NativeRenderer.switchPage(idx)
+                drawingView?.forceRedraw()
+            }
+        }
+
+        // Thumbnail frame holds the bitmap + a corner page-number badge.
+        val frame = FrameLayout(this).apply {
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.page_thumb_bg, theme)
+            isSelected = isActive
+            setPadding(2.dp, 2.dp, 2.dp, 2.dp)
+        }
+        val imageView = ImageView(this).apply {
+            setImageBitmap(bitmap)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        frame.addView(imageView, FrameLayout.LayoutParams(thumbW, thumbH))
+
+        val numberBadge = TextView(this).apply {
+            text = String.format("%02d", idx + 1)
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 8f
+            setTextColor(getColor(if (isActive) R.color.hot else R.color.inkSoft))
+            setPadding(2.dp, 0, 0, 0)
+        }
+        frame.addView(numberBadge, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.START or Gravity.TOP))
+
+        container.addView(frame)
+
+        return PageSidebarItem(container, frame, imageView, numberBadge, bitmap, idx)
+    }
+
+    private fun sidebarItemParams() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    ).apply {
+        topMargin = 6.dp
+        bottomMargin = 0
+    }
+
+    private fun togglePageSidebar() {
+        sidebarScroll.visibility =
+            if (sidebarScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+    }
+
+    // ====================================================================
+    // Floating chrome (undo / redo chip)
+    // ====================================================================
+
+    private fun buildUndoRedoChip(): View {
+        val chip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = ResourcesCompat.getDrawable(
+                resources, R.drawable.chrome_chip_bg, theme)
+            setPadding(8.dp, 6.dp, 8.dp, 6.dp)
+        }
+        val undo = ImageView(this).apply {
+            setImageResource(R.drawable.ic_undo)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.ink))
+            isClickable = true; isFocusable = true
+            contentDescription = "undo"
+            setOnClickListener { userUndo() }
+            setPadding(2.dp, 2.dp, 6.dp, 2.dp)
+        }
+        val redo = ImageView(this).apply {
+            setImageResource(R.drawable.ic_redo)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.ink))
+            isClickable = true; isFocusable = true
+            contentDescription = "redo"
+            setOnClickListener { userRedo() }
+            setPadding(6.dp, 2.dp, 2.dp, 2.dp)
+        }
+        chip.addView(undo, LinearLayout.LayoutParams(28.dp, 22.dp))
+        chip.addView(redo, LinearLayout.LayoutParams(28.dp, 22.dp))
+        return chip
+    }
+
+    private fun undoRedoChipParams() = FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    ).apply {
+        gravity = Gravity.TOP or Gravity.START
+        topMargin  = 16.dp
+        marginStart = 16.dp
+    }
+
+    // ====================================================================
+    // Status bar
+    // ====================================================================
+
+    private fun buildStatusBar(): View {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(getColor(R.color.paperDeep))
+            setPadding(12.dp, 0, 12.dp, 0)
+        }
+        // Top hairline so the bar feels separated from the canvas above.
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        wrapper.addView(View(this).apply {
+            setBackgroundColor(getColor(R.color.rule))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1.dp))
+        wrapper.addView(bar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f))
+
+        statusDocText  = makeStatusText("doc · $currentDocName")
+        statusToolText = makeStatusText("◇ ${currentToolMirror.displayName.lowercase()}")
+        statusGridText = makeStatusText("grid: off")
+        statusSnapText = makeStatusText("snap: on")
+        statusPageText = makeStatusText("page —")
+
+        bar.addView(statusDocText,  statusItemLp())
+        bar.addView(statusToolText, statusItemLp())
+        bar.addView(statusGridText, statusItemLp())
+        bar.addView(statusSnapText, statusItemLp())
+        // Spacer pushes pageText to the right edge.
+        bar.addView(View(this), LinearLayout.LayoutParams(
+            0, 0, 1.0f))
+        bar.addView(statusPageText, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        return wrapper
+    }
+
+    private fun makeStatusText(initial: String): TextView = TextView(this).apply {
+        text = initial
+        typeface = fontMono ?: Typeface.MONOSPACE
+        textSize = 9f
+        setTextColor(getColor(R.color.inkSoft))
+    }
+
+    private fun statusItemLp() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    ).apply { marginEnd = 18.dp }
+
+    private fun updateStatusBarPage() {
+        if (!::statusPageText.isInitialized) return
+        val pc = NativeRenderer.getPageCount().coerceAtLeast(1)
+        val ap = NativeRenderer.getActivePage().coerceIn(0, pc - 1)
+        statusPageText.text = "page ${String.format("%02d", ap + 1)} / $pc"
+    }
+
+    // ====================================================================
+    // Overflow menus
+    // ====================================================================
+
+    private fun showOverflowMenu(anchor: View) {
+        val menu = PopupMenu(this, anchor, Gravity.END)
+        menu.menu.add("Reset view")
+        menu.menu.add("Snap: ${if (snapEnabled) "on" else "off"}")
+        menu.menu.add("Delete selection")
+        menu.menu.add("Copy")
+        menu.menu.add("Paste")
+        menu.setOnMenuItemClickListener { item ->
+            when (item.title.toString()) {
+                "Reset view"        -> drawingView?.resetView()
+                "Delete selection"  -> userDeleteSelection()
+                "Copy"              -> drawingView?.queueCopySelection()
+                "Paste"             -> drawingView?.queuePasteSelection()
+                else -> if (item.title.toString().startsWith("Snap:")) toggleSnap()
+            }
+            true
+        }
+        menu.show()
+    }
+
+    private fun showLayerOverflow(anchor: View) {
+        val menu = PopupMenu(this, anchor, Gravity.END)
+        menu.menu.add("+ Vector layer")
+        menu.menu.add("Clear active layer")
+        menu.setOnMenuItemClickListener { item ->
+            when (item.title.toString()) {
+                "+ Vector layer"     -> userAddVectorLayer()
+                "Clear active layer" -> userClearLayer()
+            }
+            true
+        }
+        menu.show()
+    }
+
+    private fun showDocsMenu(anchor: View) {
+        val menu = PopupMenu(this, anchor, Gravity.END)
+        // Prefix the active doc with • so the user sees what's open.
+        for (name in listDocumentNames()) {
+            menu.menu.add(if (name == currentDocName) "• $name" else "  $name")
+        }
+        menu.menu.add("+ New document")
+        menu.menu.add("Delete current")
+        menu.setOnMenuItemClickListener { item ->
+            val title = item.title.toString()
+            when {
+                title == "+ New document" -> userNewDocument()
+                title == "Delete current" -> userDeleteCurrentDocument()
+                else -> {
+                    val name = title.removePrefix("• ").removePrefix("  ").trim()
+                    if (name != currentDocName) switchToDocument(name)
+                }
+            }
+            true
+        }
+        menu.show()
+    }
+
+    // ====================================================================
+    // State sync + action helpers (preserved from previous implementation)
+    // ====================================================================
+
+    private fun syncLayerStateFromNative() {
+        val count = NativeRenderer.getLayerCount().coerceAtLeast(1)
+        val active = NativeRenderer.getActiveLayer().coerceIn(0, count - 1)
+        layerCount = count
+        activeLayerIndex = active
+        if (::layerListContainer.isInitialized) rebuildLayerList()
+        updateStatusBarPage()
+    }
+
+    private fun userAddLayer() {
+        NativeRenderer.addLayer()
+        layerCount++
+        activeLayerIndex = layerCount - 1
+        rebuildLayerList()
+    }
+
+    private fun userAddVectorLayer() {
+        NativeRenderer.addVectorLayer()
+        layerCount++
+        activeLayerIndex = layerCount - 1
+        rebuildLayerList()
+    }
+
+    private fun userCycleLayer() {
+        NativeRenderer.cycleActiveLayer()
+        activeLayerIndex = (activeLayerIndex + 1) % layerCount
+        rebuildLayerList()
+    }
+
+    private fun userClearLayer() {
+        NativeRenderer.clearActiveLayer()
+        drawingView?.forceRedraw()
+    }
+
+    private fun userDeleteSelection() {
+        if (NativeRenderer.hasSelection()) {
+            NativeRenderer.deleteSelection()
+            drawingView?.forceRedraw()
+        }
+    }
+
+    private fun toggleSnap() {
+        snapEnabled = !snapEnabled
+        NativeRenderer.setSnapEnabled(snapEnabled)
+        if (::statusSnapText.isInitialized) {
+            statusSnapText.text = if (snapEnabled) "snap: on" else "snap: off"
+        }
+    }
+
+    private fun userUndo() {
+        NativeRenderer.undo()
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
+    private fun userRedo() {
+        NativeRenderer.redo()
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
+    private fun cycleGrid() {
+        gridState = (gridState + 1) % 3
+        when (gridState) {
+            0 -> {
+                NativeRenderer.setGridEnabled(false)
+            }
+            1 -> {
+                NativeRenderer.setGridStyle(1)
+                NativeRenderer.setGridEnabled(true)
+            }
+            2 -> {
+                NativeRenderer.setGridStyle(2)
+                NativeRenderer.setGridEnabled(true)
+            }
+        }
+        if (::statusGridText.isInitialized) {
+            statusGridText.text = when (gridState) {
+                0 -> "grid: off"; 1 -> "grid: lines"; else -> "grid: dots"
+            }
+        }
+        drawingView?.forceRedraw()
+    }
+
+    // ---- Slider geometric mappings (unchanged from previous version) ----
 
     private fun progressToBrushScale(p: Int): Float =
         (kBrushSizeMin * Math.pow(
@@ -407,150 +1263,7 @@ class MainActivity : AppCompatActivity() {
             / Math.log((kVectorWidthMax / kVectorWidthMin).toDouble())
             * 100).toInt().coerceIn(0, 100)
 
-    private fun cycleGrid() {
-        gridState = (gridState + 1) % 3
-        when (gridState) {
-            0 -> {
-                NativeRenderer.setGridEnabled(false)
-                gridButton.text = "Grid: off"
-            }
-            1 -> {
-                NativeRenderer.setGridStyle(1)
-                NativeRenderer.setGridEnabled(true)
-                gridButton.text = "Grid: lines"
-            }
-            2 -> {
-                NativeRenderer.setGridStyle(2)
-                NativeRenderer.setGridEnabled(true)
-                gridButton.text = "Grid: dots"
-            }
-        }
-        drawingView?.forceRedraw()
-    }
-
-    private fun buildColorGrid(): GridLayout {
-        val grid = GridLayout(this).apply {
-            columnCount = 4
-            alpha = 0.92f
-        }
-        palette.forEach { rgb ->
-            val swatch = View(this).apply {
-                setBackgroundColor(0xFF000000.toInt() or rgb)
-                setOnClickListener { NativeRenderer.setBrushColor(rgb) }
-            }
-            val lp = GridLayout.LayoutParams().apply {
-                width  = 32.dp
-                height = 32.dp
-                setMargins(2.dp, 2.dp, 2.dp, 2.dp)
-            }
-            grid.addView(swatch, lp)
-        }
-        return grid
-    }
-
-    private fun topRightPanelParams() = FrameLayout.LayoutParams(
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply {
-        gravity = Gravity.TOP or Gravity.END
-        topMargin = 24.dp
-        marginEnd  = 24.dp
-    }
-
-    private fun panelChildParams() = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply {
-        topMargin = 4.dp
-        bottomMargin = 4.dp
-    }
-
-    // ---- State updates ---------------------------------------------------
-
-    private fun syncLayerStateFromNative() {
-        val count = NativeRenderer.getLayerCount().coerceAtLeast(1)
-        val active = NativeRenderer.getActiveLayer().coerceIn(0, count - 1)
-        layerCount = count
-        activeLayerIndex = active
-        updateLayerButton()
-    }
-
-    private fun updateToolButton(tool: Tool) {
-        toolButton.text = when (tool) {
-            Tool.BRUSH       -> "Brush"
-            Tool.ERASER      -> "Eraser"
-            Tool.BUCKET      -> "Bucket"
-            Tool.LINE        -> "Line"
-            Tool.RECTANGLE   -> "Rect"
-            Tool.CIRCLE      -> "Circle"
-            Tool.ELLIPSE     -> "Ellipse"
-            Tool.SELECT      -> "Select"
-            Tool.SELECT_RECT -> "Marquee"
-        }
-    }
-
-    private fun updateLayerButton() {
-        layerButton.text = "Layer ${activeLayerIndex + 1}/$layerCount"
-    }
-
-    private fun userAddLayer() {
-        NativeRenderer.addLayer()
-        layerCount++
-        activeLayerIndex = layerCount - 1
-        updateLayerButton()
-    }
-
-    private fun userAddVectorLayer() {
-        NativeRenderer.addVectorLayer()
-        layerCount++
-        activeLayerIndex = layerCount - 1
-        updateLayerButton()
-    }
-
-    private fun userCycleLayer() {
-        NativeRenderer.cycleActiveLayer()
-        activeLayerIndex = (activeLayerIndex + 1) % layerCount
-        updateLayerButton()
-    }
-
-    private fun userClearLayer() {
-        NativeRenderer.clearActiveLayer()
-        // The clear is a queued action that applies on the GL thread.
-        // Force a multi-buffer redraw so the cleared state shows up right
-        // away (otherwise it only appears after the next stroke commit).
-        drawingView?.forceRedraw()
-    }
-
-    private fun userDeleteSelection() {
-        if (NativeRenderer.hasSelection()) {
-            NativeRenderer.deleteSelection()
-            drawingView?.forceRedraw()
-        }
-    }
-
-    private fun toggleSnap() {
-        snapEnabled = !snapEnabled
-        NativeRenderer.setSnapEnabled(snapEnabled)
-        snapButton.text = if (snapEnabled) "Snap: on" else "Snap: off"
-    }
-
-    private fun userUndo() {
-        NativeRenderer.undo()
-        // Undo runs on the GL thread on the next render; trigger one and
-        // resync our local layer-state mirror once it's had a chance to
-        // apply (LayerAdd / LayerClear undos can change layer count or
-        // active index).
-        drawingView?.forceRedraw()
-        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
-    }
-
-    private fun userRedo() {
-        NativeRenderer.redo()
-        drawingView?.forceRedraw()
-        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
-    }
-
-    // ---- Document I/O ----------------------------------------------------
+    // ---- Document I/O ---------------------------------------------------
 
     private fun documentsRoot(): File =
         File(filesDir, kDocumentsRootName).apply { mkdirs() }
@@ -563,7 +1276,6 @@ class MainActivity : AppCompatActivity() {
             ?.sorted()
             ?: emptyList()
 
-    /** Pick a fresh "Untitled N" not already on disk. */
     private fun nextUntitledName(): String {
         val existing = listDocumentNames().toSet()
         var n = 1
@@ -571,18 +1283,14 @@ class MainActivity : AppCompatActivity() {
         return "Untitled $n"
     }
 
-    /** Move the legacy single-doc filesDir/document/ to filesDir/documents/document/
-     *  the first time this version of the app runs. No-op if there's
-     *  nothing to migrate or migration already happened. */
+    /** Move filesDir/document/ → filesDir/documents/document/ on first run. */
     private fun migrateLegacyDocumentIfNeeded() {
         val legacy = File(filesDir, "document")
         if (!legacy.isDirectory) return
         val target = docDirFor("document")
-        if (target.exists()) return     // already migrated or naming collision
+        if (target.exists()) return
         if (!documentsRoot().exists()) documentsRoot().mkdirs()
-        if (legacy.renameTo(target)) {
-            android.util.Log.i("DrawingApp", "migrated legacy document/ → documents/document/")
-        } else {
+        if (!legacy.renameTo(target)) {
             android.util.Log.e("DrawingApp", "failed to migrate legacy document/")
         }
     }
@@ -593,19 +1301,13 @@ class MainActivity : AppCompatActivity() {
     }
     private fun lastOpenedDocName(): String? = prefs().getString(kPrefLastDoc, null)
 
-    /** Switch to the given doc on the native side, persist as last-opened,
-     *  and refresh the sidebar / labels. Creates the directory if absent. */
     private fun switchToDocument(name: String) {
         val dir = docDirFor(name).apply { mkdirs() }
         currentDocName = name
         rememberDocName(name)
-        if (::docNameLabel.isInitialized) docNameLabel.text = name
+        if (::statusDocText.isInitialized) statusDocText.text = "doc · $name"
         NativeRenderer.loadDocument(dir.absolutePath)
-        // Force redraw triggers the action drain (close current + set new
-        // path); subsequent multi-buffer pass loads the new doc.
         drawingView?.forceRedraw()
-        // Reset our sidebar mirrors so onThumbnailsUpdated triggers a
-        // rebuild against the new doc's page state.
         lastBuiltPageCount = -1
         lastBuiltActivePage = -1
     }
@@ -614,27 +1316,6 @@ class MainActivity : AppCompatActivity() {
         switchToDocument(nextUntitledName())
     }
 
-    private fun userOpenDocument() {
-        val docs = listDocumentNames()
-        if (docs.isEmpty()) {
-            // Nothing to open; treat as new.
-            userNewDocument()
-            return
-        }
-        val items = docs.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Open document")
-            .setItems(items) { _, which ->
-                val picked = items[which]
-                if (picked != currentDocName) switchToDocument(picked)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    /** Two-step delete with a confirmation dialog. After deletion, switch
-     *  to another existing doc (or create a fresh Untitled if the deleted
-     *  doc was the only one) so we never end up in a no-document state. */
     private fun userDeleteCurrentDocument() {
         val toDelete = currentDocName
         if (toDelete.isEmpty()) return
@@ -647,251 +1328,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun performDelete(name: String) {
-        // Pick a target to switch to BEFORE deleting on disk: the first
-        // remaining doc, or a fresh Untitled if `name` was the only one.
         val others = listDocumentNames().filter { it != name }
         val target = others.firstOrNull() ?: nextUntitledName()
         switchToDocument(target)
-        // The native side queues a closeCurrentDocument; by the time the
-        // action drains it points at `target`, not `name`. Auto-save only
-        // happens on stroke commit / explicit persist, neither of which
-        // can race here (user isn't drawing during a confirm dialog).
         val ok = docDirFor(name).deleteRecursively()
-        if (!ok) {
-            android.util.Log.e("DrawingApp", "deleteRecursively($name) failed")
-        }
+        if (!ok) android.util.Log.e("DrawingApp", "deleteRecursively($name) failed")
     }
 
-    // ---- Page sidebar ----------------------------------------------------
-
-    private fun buildSidebarScroll(): ScrollView {
-        val scroll = ScrollView(this).apply {
-            isFillViewport = true
-            setBackgroundColor(0xFFE8EAEEu.toInt())
-        }
-        sidebarLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            val pad = 8.dp
-            setPadding(pad, pad, pad, pad)
-        }
-        scroll.addView(
-            sidebarLayout,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-        return scroll
-    }
-
-    /** Document name + New/Open buttons. Lives at the top of the sidebar
-     *  above the page list. The label updates whenever switchToDocument
-     *  runs so the user can always see which doc is open. */
-    private fun buildDocHeader(): View {
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, 8.dp)
-        }
-        docNameLabel = TextView(this).apply {
-            text = currentDocName
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 6.dp)
-            setTextColor(0xFF222222u.toInt())
-            // Long-press to rename — deferred for a later pass.
-        }
-        container.addView(
-            docNameLabel,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        val newBtn = Button(this).apply {
-            text = "New"
-            alpha = 0.92f
-            setOnClickListener { userNewDocument() }
-        }
-        val openBtn = Button(this).apply {
-            text = "Open"
-            alpha = 0.92f
-            setOnClickListener { userOpenDocument() }
-        }
-        val btnParams = LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
-        ).apply { setMargins(2.dp, 0, 2.dp, 0) }
-        row.addView(newBtn, btnParams)
-        row.addView(openBtn, btnParams)
-        container.addView(
-            row,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-        // Delete on its own row, visually de-emphasized so a stray tap
-        // is harder; the confirmation dialog is the real safety net.
-        val deleteBtn = Button(this).apply {
-            text = "Delete"
-            alpha = 0.85f
-            setOnClickListener { userDeleteCurrentDocument() }
-        }
-        container.addView(
-            deleteBtn,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(2.dp, 4.dp, 2.dp, 0) }
-        )
-        return container
-    }
-
-    /** Recreate every sidebar entry from current page state. Called after
-     *  any change that affects page count or active page. Cheap — pages
-     *  are typically a handful, and the bitmap allocations are small. */
-    private fun rebuildSidebar() {
-        sidebarLayout.removeAllViews()
-        pageItems.clear()
-
-        // Doc header (name + New/Open) sits above the page list and a
-        // thin separator line.
-        sidebarLayout.addView(
-            buildDocHeader(),
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-        val sep = View(this).apply { setBackgroundColor(0xFFB0B4BAu.toInt()) }
-        sidebarLayout.addView(
-            sep,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 1.dp
-            ).apply { setMargins(0, 4.dp, 0, 4.dp) }
-        )
-
-        val pageCount = NativeRenderer.getPageCount().coerceAtLeast(1)
-        val active    = NativeRenderer.getActivePage()
-        for (i in 0 until pageCount) {
-            val item = createPageSidebarItem(i, isActive = (i == active))
-            pageItems.add(item)
-            sidebarLayout.addView(item.container, sidebarItemParams())
-        }
-
-        val addButton = Button(this).apply {
-            text = "+ Page"
-            alpha = 0.92f
-            setOnClickListener { userAddPage() }
-        }
-        sidebarLayout.addView(addButton, sidebarItemParams())
-
-        // Record what we just rendered so onThumbnailsUpdated can detect
-        // post-build drift (the GL thread may apply a queued switch/add
-        // after this rebuild) and re-rebuild itself.
-        lastBuiltPageCount  = pageCount
-        lastBuiltActivePage = active
-
-        // Hand the live Bitmaps to the renderer so the next multi-buffer
-        // pass populates them; trigger that pass via forceRedraw.
-        drawingView?.setThumbnailTargets(
-            pageItems.associate { it.pageIdx to it.bitmap }
-        )
-        drawingView?.forceRedraw()
-    }
-
-    /** Thumbnail size in pixels matching the page's aspect ratio, fit
-     *  inside the sidebar width / max height bounds. Falls back to the
-     *  raw maximums if the SurfaceView hasn't been laid out yet. */
-    private fun thumbDimensions(): Pair<Int, Int> {
-        val maxW = kThumbMaxWidthDp.dp
-        val maxH = kThumbMaxHeightDp.dp
-        val pageW = drawingView?.width ?: 0
-        val pageH = drawingView?.height ?: 0
-        if (pageW <= 0 || pageH <= 0) return Pair(maxW, maxH)
-        val aspect = pageH.toFloat() / pageW.toFloat()
-        return if (maxW * aspect <= maxH) {
-            Pair(maxW, (maxW * aspect).toInt().coerceAtLeast(1))
-        } else {
-            Pair((maxH / aspect).toInt().coerceAtLeast(1), maxH)
-        }
-    }
-
-    private fun createPageSidebarItem(idx: Int, isActive: Boolean): PageSidebarItem {
-        val (thumbW, thumbH) = thumbDimensions()
-        val bitmap = Bitmap.createBitmap(thumbW, thumbH, Bitmap.Config.ARGB_8888)
-        bitmap.eraseColor(Color.WHITE)
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            val pad = 4.dp
-            setPadding(pad, pad, pad, pad)
-            // Active page gets a thin accent border via a colored bg.
-            setBackgroundColor(
-                if (isActive) 0xFF4080FFu.toInt() else 0x00000000
-            )
-            isClickable = true
-            isFocusable = true
-            setOnClickListener {
-                // Always enqueue — native no-ops if idx is already active.
-                // We don't read getActivePage() here because it can be
-                // stale relative to queued switches (last-write-wins on
-                // the native side; the optimistic skip used to silently
-                // eat the user's tap if the sidebar showed stale state).
-                NativeRenderer.switchPage(idx)
-                drawingView?.forceRedraw()
-                // syncLayerStateFromNative & sidebar rebuild are driven
-                // by onThumbnailsUpdated when native state changes.
-            }
-        }
-
-        val imageView = ImageView(this).apply {
-            setImageBitmap(bitmap)
-            setBackgroundColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(thumbW, thumbH)
-        }
-        container.addView(imageView)
-
-        val label = TextView(this).apply {
-            text = "Page ${idx + 1}"
-            gravity = Gravity.CENTER
-            textSize = 11f
-            setTextColor(if (isActive) Color.WHITE else 0xFF333333u.toInt())
-            setPadding(0, 4.dp, 0, 0)
-        }
-        container.addView(
-            label,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-
-        return PageSidebarItem(container, imageView, label, bitmap, idx)
-    }
-
-    private fun sidebarItemParams() = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply {
-        topMargin = 4.dp
-        bottomMargin = 4.dp
-    }
+    // ---- Page sidebar wiring -------------------------------------------
 
     private fun userAddPage() {
         NativeRenderer.addPage()
         drawingView?.forceRedraw()
-        // Sidebar rebuild + layer-state sync happen in onThumbnailsUpdated
-        // once the GL thread has actually applied the queued addPage.
     }
 
-    /** Called on the UI thread after the renderer finishes a thumbnail pass.
-     *  Drives sidebar self-healing: any time native page state diverges
-     *  from what the sidebar last rendered, rebuild it. This avoids the
-     *  timing fragility of postDelayed callbacks waiting on GL drains. */
     private fun onThumbnailsUpdated() {
         for (item in pageItems) item.imageView.invalidate()
         val pc = NativeRenderer.getPageCount()
@@ -900,9 +1350,37 @@ class MainActivity : AppCompatActivity() {
             syncLayerStateFromNative()
             rebuildSidebar()
         }
+        updateStatusBarPage()
     }
 
-    // ---- Helpers ---------------------------------------------------------
+    // ---- Fonts (downloadable) ------------------------------------------
+
+    private fun loadFonts() {
+        // The synchronous ResourcesCompat.getFont throws Resources$
+        // NotFoundException when downloadable fonts can't be resolved
+        // on the calling thread (e.g. provider unreachable, GMS query
+        // pending, signature mismatch). We never want that to crash
+        // the activity — fall back to the system mono/sans Typeface,
+        // which the rest of the UI consumes through `?:` defaults.
+        //
+        // The async path (ResourcesCompat.getFont with FontCallback)
+        // would let the real fonts swap in once they download; we can
+        // wire that in a follow-up if the system mono isn't acceptable.
+        fontMono          = tryLoadFont(R.font.jetbrains_mono)
+        fontMonoSemibold  = tryLoadFont(R.font.jetbrains_mono_semibold)
+        fontInter         = tryLoadFont(R.font.inter)
+        fontInterSemibold = tryLoadFont(R.font.inter_semibold)
+    }
+
+    private fun tryLoadFont(@androidx.annotation.FontRes id: Int): Typeface? = try {
+        ResourcesCompat.getFont(this, id)
+    } catch (t: Throwable) {
+        android.util.Log.w("DrawingApp",
+            "downloadable font ${resources.getResourceEntryName(id)} unavailable: $t")
+        null
+    }
+
+    // ---- Helpers --------------------------------------------------------
 
     private val Int.dp: Int
         get() = (this * resources.displayMetrics.density).toInt()

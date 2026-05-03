@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Tool-rail tile background. Active tile gets the warm "paperDeep"
+    fill + sienna 1dp outline (matches the v4 design); inactive is
+    transparent so only the icon shows.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_selected="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/paperDeep" />
+            <stroke android:width="1dp" android:color="@color/hot" />
+            <corners android:radius="3dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@android:color/transparent" />
+            <corners android:radius="3dp" />
+        </shape>
+    </item>
+</selector>

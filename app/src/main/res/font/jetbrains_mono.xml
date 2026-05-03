@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Downloadable JetBrains Mono via the Google Fonts provider.
+    On first use, GMS fetches the matching TTF and caches it.
+    No APK weight; falls back to the default monospace if the
+    provider is unreachable.
+-->
+<font-family xmlns:app="http://schemas.android.com/apk/res-auto"
+    app:fontProviderAuthority="com.google.android.gms.fonts"
+    app:fontProviderPackage="com.google.android.gms"
+    app:fontProviderQuery="name=JetBrains+Mono&amp;weight=400&amp;besteffort=true"
+    app:fontProviderCerts="@array/com_google_android_gms_fonts_certs">
+</font-family>

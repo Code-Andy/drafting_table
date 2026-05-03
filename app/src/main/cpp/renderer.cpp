@@ -412,16 +412,36 @@ void main() {
 // Translation lives in (uMin, uMax) — the caller adjusts these by the
 // pan offset, so this shader doesn't need to know about transforms
 // beyond the standard doc→buffer matrix.
+//
+// Page-clip via FS discard: lets the caller render at the unclamped
+// drop bounds (preserving aspect ratio) while clipping the off-page
+// portion at the fragment level. Caller passes uPageMin/Max in the
+// SAME coord frame as uMin/uMax (doc-coords for the overlay path,
+// tile-local for the commit-into-tile path).
 const char* kSelVS = R"(#version 300 es
 layout(location = 0) in vec2 aQuad;
 out vec2 vUv;
+out vec2 vDocPos;
 uniform mat4 uTransform;
 uniform vec2 uScreen;
-uniform vec2 uMin;
-uniform vec2 uMax;
+// Four placement corners — one per quad UV corner. Layout:
+//   uC0 = UV (0,0) = top-left,   uC1 = UV (1,0) = top-right,
+//   uC2 = UV (1,1) = bottom-right, uC3 = UV (0,1) = bottom-left.
+// During the doc-space overlay these are doc-pixels; during the
+// per-tile commit bake they are tile-local pixels (origin subtracted
+// out by the caller). The mapping is bilinear over the quad UV; for an
+// affine placement (scale + rotation) this collapses to exactly the
+// affine transform of the source rect.
+uniform vec2 uC0;
+uniform vec2 uC1;
+uniform vec2 uC2;
+uniform vec2 uC3;
 void main() {
     vec2 t = aQuad * 0.5 + 0.5;
-    vec2 docPos = mix(uMin, uMax, t);
+    vec2 top = mix(uC0, uC1, t.x);
+    vec2 bot = mix(uC3, uC2, t.x);
+    vec2 docPos = mix(top, bot, t.y);
+    vDocPos = docPos;
     vec4 bufPx  = uTransform * vec4(docPos, 0.0, 1.0);
     vec2 ndc = (bufPx.xy / uScreen) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
@@ -432,9 +452,18 @@ void main() {
 const char* kSelFS = R"(#version 300 es
 precision mediump float;
 in vec2 vUv;
+in vec2 vDocPos;
 uniform sampler2D uContent;     // premultiplied selection content
+uniform vec2 uPageMin;
+uniform vec2 uPageMax;
+uniform int  uPageActive;
 out vec4 outColor;
 void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
     outColor = texture(uContent, vUv);
 }
 )";
@@ -576,9 +605,14 @@ struct SelProg {
     GLuint program    = 0;
     GLint  uTransform = -1;
     GLint  uScreen    = -1;
-    GLint  uMin       = -1;
-    GLint  uMax       = -1;
+    GLint  uC0        = -1;
+    GLint  uC1        = -1;
+    GLint  uC2        = -1;
+    GLint  uC3        = -1;
     GLint  uContent   = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
 };
 
 struct ViewFbo {
@@ -943,11 +977,18 @@ ShapeData g_transformBeforeShape;
 struct RasterSelection {
     bool   active = false;
     size_t layerIdx = 0;
-    // Original bbox of the lift, in doc-pixels.
+    // Original bbox of the lift, in doc-pixels — the rectangle from which
+    // pixels were copied into contentTex. Doesn't change after lift.
     float  bboxMinX = 0.0f, bboxMinY = 0.0f;
     float  bboxMaxX = 0.0f, bboxMaxY = 0.0f;
-    // Current translation applied to the floating selection.
-    float  panX = 0.0f, panY = 0.0f;
+    // Current placement OBB in doc-pixels — the floating selection's
+    // position/size/orientation. Initial state mirrors the lift bbox
+    // (centerX/Y at bbox midpoint, halfW/H at half the lift dimensions,
+    // rotation 0). Translate/scale/rotate drags mutate these in place;
+    // the source contentTex is unchanged.
+    float  centerX = 0.0f, centerY = 0.0f;
+    float  halfW   = 0.0f, halfH   = 0.0f;
+    float  rotation = 0.0f;
     // RGBA texture holding the lifted pixels, sized to the bbox in
     // doc-pixels (premultiplied to match tile storage).
     GLuint contentTex = 0;
@@ -958,6 +999,22 @@ struct RasterSelection {
 };
 std::mutex      g_rasterSelMutex;
 RasterSelection g_rasterSel;
+
+// Cross-document raster clipboard. Holds the content bytes (RGBA8,
+// premultiplied, contentW × contentH) plus the placement OBB at the
+// time of copy. Paste creates a fresh floating selection at the same
+// doc-coord OBB. Persists for the process lifetime; cleared only by an
+// explicit overwrite (i.e. another copy).
+struct RasterClipboard {
+    bool   present  = false;
+    int    w        = 0, h = 0;
+    float  centerX  = 0.0f, centerY = 0.0f;
+    float  halfW    = 0.0f, halfH   = 0.0f;
+    float  rotation = 0.0f;
+    std::vector<uint8_t> bytes;
+};
+std::mutex       g_rasterClipboardMutex;
+RasterClipboard  g_rasterClipboard;
 
 size_t computeEntrySize(const UndoEntry& e) {
     size_t s = sizeof(UndoEntry);
@@ -1160,8 +1217,11 @@ void ensureAtLeastOnePage();
 void closeCurrentDocument();
 void ensureLoaded();
 bool liftRasterSelectionRect(float x0, float y0, float x1, float y1);
+bool liftRasterSelectionPolygon(const float* points, size_t nPoints);
 void commitRasterSelectionImpl();
 void cancelRasterSelectionImpl();
+void copyRasterSelectionImpl();
+bool pasteRasterSelectionImpl();
 void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
                                  jfloatArray transform);
 void compositeRasterLayer(const Layer& layer);
@@ -1512,9 +1572,14 @@ void ensureInited() {
     g_sel.program    = linkProgram(kSelVS, kSelFS);
     g_sel.uTransform = glGetUniformLocation(g_sel.program, "uTransform");
     g_sel.uScreen    = glGetUniformLocation(g_sel.program, "uScreen");
-    g_sel.uMin       = glGetUniformLocation(g_sel.program, "uMin");
-    g_sel.uMax       = glGetUniformLocation(g_sel.program, "uMax");
+    g_sel.uC0        = glGetUniformLocation(g_sel.program, "uC0");
+    g_sel.uC1        = glGetUniformLocation(g_sel.program, "uC1");
+    g_sel.uC2        = glGetUniformLocation(g_sel.program, "uC2");
+    g_sel.uC3        = glGetUniformLocation(g_sel.program, "uC3");
     g_sel.uContent   = glGetUniformLocation(g_sel.program, "uContent");
+    g_sel.uPageMin    = glGetUniformLocation(g_sel.program, "uPageMin");
+    g_sel.uPageMax    = glGetUniformLocation(g_sel.program, "uPageMax");
+    g_sel.uPageActive = glGetUniformLocation(g_sel.program, "uPageActive");
 
     const float verts[] = {
         -1.0f, -1.0f,
@@ -2609,6 +2674,13 @@ Obb obbForCircle(const Circle& c) {
     return { c.cx, c.cy, c.radius, c.radius, 0.0f };
 }
 
+// OBB for the floating raster selection (its placement, not the source
+// lift bbox — those diverge once the user scales/rotates). Caller must
+// hold g_rasterSelMutex; helper is just the field-shuffle.
+Obb obbForRasterSelection(const RasterSelection& s) {
+    return { s.centerX, s.centerY, s.halfW, s.halfH, s.rotation };
+}
+
 bool obbForSelection(const Selection& sel, Obb& out) {
     if (sel.kind == ShapeKind::None) return false;
     if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return false;
@@ -2782,6 +2854,41 @@ void rotateHandlePosition(const Obb& o, float& outX, float& outY) {
 // Number of scale handles for the shape (2 for Line, 4 for others).
 int scaleHandleCount(ShapeKind kind) {
     return (kind == ShapeKind::Line) ? 2 : 4;
+}
+
+// Render the OBB outline + 4 scale handles + rotate handle for an
+// arbitrary Obb (used by the floating raster selection, which has no
+// owning shape). Caller must have the line program + page-clip-off
+// uniforms bound.
+void renderObbWithHandles(const Obb& obb) {
+    float outlineW = vpxToDoc(kSelectionOutlineWidthViewPx);
+    float handleSz = vpxToDoc(kHandleSizeViewPx);
+
+    float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
+    rotateLocalToWorld(obb, -obb.hw, -obb.hh, c0x, c0y);
+    rotateLocalToWorld(obb, +obb.hw, -obb.hh, c1x, c1y);
+    rotateLocalToWorld(obb, +obb.hw, +obb.hh, c2x, c2y);
+    rotateLocalToWorld(obb, -obb.hw, +obb.hh, c3x, c3y);
+    drawLineSegment(c0x, c0y, c1x, c1y, kHandleColor, outlineW, 1.0f);
+    drawLineSegment(c1x, c1y, c2x, c2y, kHandleColor, outlineW, 1.0f);
+    drawLineSegment(c2x, c2y, c3x, c3y, kHandleColor, outlineW, 1.0f);
+    drawLineSegment(c3x, c3y, c0x, c0y, kHandleColor, outlineW, 1.0f);
+
+    // 4 corner scale handles. Reuse scaleHandlePosition with kind=Rect.
+    for (int i = 0; i < 4; ++i) {
+        float hx, hy;
+        scaleHandlePosition(obb, ShapeKind::Rect, i, hx, hy);
+        drawHandle(hx, hy, handleSz, kHandleColor);
+    }
+
+    // Rotate handle: tether line from top-edge midpoint, then handle.
+    float anchorX, anchorY;
+    rotateLocalToWorld(obb, 0.0f, -obb.hh, anchorX, anchorY);
+    float rhX, rhY;
+    rotateHandlePosition(obb, rhX, rhY);
+    drawLineSegment(anchorX, anchorY, rhX, rhY,
+                    kHandleColor, outlineW, 1.0f);
+    drawHandle(rhX, rhY, handleSz, kHandleColor);
 }
 
 // Renders the OBB outline + scale handles + rotate handle for the given
@@ -3136,28 +3243,36 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
     // selection was lifted, so this overlay completes the visible image.
     {
         bool   selActive = false;
-        size_t selLayerIdx = 0;
-        float  bMinX = 0, bMinY = 0, bMaxX = 0, bMaxY = 0;
-        float  panX = 0, panY = 0;
+        Obb    selObb{};
         GLuint contentTex = 0;
         {
             std::lock_guard<std::mutex> lock(g_rasterSelMutex);
             if (g_rasterSel.active) {
                 selActive   = true;
-                selLayerIdx = g_rasterSel.layerIdx;
-                bMinX = g_rasterSel.bboxMinX; bMinY = g_rasterSel.bboxMinY;
-                bMaxX = g_rasterSel.bboxMaxX; bMaxY = g_rasterSel.bboxMaxY;
-                panX  = g_rasterSel.panX;     panY  = g_rasterSel.panY;
-                contentTex = g_rasterSel.contentTex;
+                selObb      = obbForRasterSelection(g_rasterSel);
+                contentTex  = g_rasterSel.contentTex;
             }
         }
         if (selActive && contentTex != 0) {
+            // Compute the four placement corners in doc-coords.
+            float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
+            rotateLocalToWorld(selObb, -selObb.hw, -selObb.hh, c0x, c0y);
+            rotateLocalToWorld(selObb, +selObb.hw, -selObb.hh, c1x, c1y);
+            rotateLocalToWorld(selObb, +selObb.hw, +selObb.hh, c2x, c2y);
+            rotateLocalToWorld(selObb, -selObb.hw, +selObb.hh, c3x, c3y);
             glUseProgram(g_sel.program);
             glBindVertexArray(g_quadVao);
             uploadMat4(env, g_sel.uTransform, transform);
             glUniform2f(g_sel.uScreen, (float)width, (float)height);
-            glUniform2f(g_sel.uMin, bMinX + panX, bMinY + panY);
-            glUniform2f(g_sel.uMax, bMaxX + panX, bMaxY + panY);
+            glUniform2f(g_sel.uC0, c0x, c0y);
+            glUniform2f(g_sel.uC1, c1x, c1y);
+            glUniform2f(g_sel.uC2, c2x, c2y);
+            glUniform2f(g_sel.uC3, c3x, c3y);
+            // Page-clip in doc-coords: matches the dab/line/grid pattern,
+            // so the off-page portion is fragment-discarded rather than
+            // squashing the geometry.
+            uploadPageClip(g_sel.uPageMin, g_sel.uPageMax,
+                           g_sel.uPageActive, readPageClip());
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, contentTex);
             glUniform1i(g_sel.uContent, 0);
@@ -3166,7 +3281,6 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             glBindTexture(GL_TEXTURE_2D, 0);
         }
-        (void)selLayerIdx;
     }
 
     // Selection overlay (OBB + handles) — drawn on top of everything so
@@ -3181,7 +3295,16 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         snapMx = g_drag.snapX;
         snapMy = g_drag.snapY;
     }
-    if (sel.kind != ShapeKind::None) {
+    bool rasterSelActive = false;
+    Obb  rasterSelObb{};
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (g_rasterSel.active) {
+            rasterSelActive = true;
+            rasterSelObb = obbForRasterSelection(g_rasterSel);
+        }
+    }
+    if (sel.kind != ShapeKind::None || rasterSelActive) {
         glUseProgram(g_lineProg.program);
         glBindVertexArray(g_quadVao);
         uploadMat4(env, g_lineProg.uTransform, transform);
@@ -3191,7 +3314,12 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
                        g_lineProg.uPageActive,
                        PageClip{false, 0, 0, 0, 0});
-        renderSelectionOverlay(sel);
+        if (sel.kind != ShapeKind::None) {
+            renderSelectionOverlay(sel);
+        }
+        if (rasterSelActive) {
+            renderObbWithHandles(rasterSelObb);
+        }
         if (snapActive) {
             drawSnapMarker(snapMx, snapMy);
         }
@@ -3262,6 +3390,45 @@ void renderShapePreviewToFront(JNIEnv* env, jint width, jint height,
     // at that endpoint so the user can see what they snapped to.
     if (snapped) {
         drawSnapMarker(x1, y1);
+    }
+    glBindVertexArray(0);
+}
+
+// Render a polyline (the in-progress lasso path) into the bound
+// framebuffer. Clears first so successive previews replace rather than
+// accumulate, mirroring renderShapePreviewToFront. Closing edge from
+// points[n-1] → points[0] is drawn iff `closed` is true.
+void renderLassoPathToFront(JNIEnv* env, jint width, jint height,
+                            jfloatArray transform,
+                            const float* points, size_t nPoints,
+                            uint32_t rgb, float lineWidth, float alpha,
+                            bool closed) {
+    glViewport(0, 0, width, height);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (nPoints < 2) {
+        return;
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_lineProg.program);
+    glBindVertexArray(g_quadVao);
+    uploadMat4(env, g_lineProg.uTransform, transform);
+    glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+    {
+        PageClip pageClip = readPageClip();
+        uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                       g_lineProg.uPageActive, pageClip);
+    }
+    for (size_t i = 0; i + 1 < nPoints; ++i) {
+        drawLineSegment(points[2*i],   points[2*i+1],
+                        points[2*i+2], points[2*i+3],
+                        rgb, lineWidth, alpha);
+    }
+    if (closed && nPoints >= 3) {
+        drawLineSegment(points[2*(nPoints-1)],   points[2*(nPoints-1)+1],
+                        points[0],               points[1],
+                        rgb, lineWidth, alpha);
     }
     glBindVertexArray(0);
 }
@@ -3564,6 +3731,229 @@ void disposeRasterSelectionGl() {
     g_rasterSel.liftedTiles.clear();
 }
 
+// CPU scanline polygon fill into a single-channel R8 buffer. Output
+// pixel (i, j) covers doc-coords (offsetX + i, offsetY + j); inside-
+// polygon pixels are 255, outside are 0. Uses the even-odd rule so
+// self-intersecting lasso paths fill the way users expect (the bounded
+// regions are filled). `points` is interleaved [x0,y0,x1,y1,...].
+//
+// Cost is O(bufH * nPoints + bufW * filled-pixels). For typical lasso
+// sizes (a few hundred px / a few hundred points) this is well under a
+// frame on the device.
+void rasterizePolygonMask(const float* points, size_t nPoints,
+                          int offsetX, int offsetY, int bufW, int bufH,
+                          uint8_t* outBuf) {
+    std::memset(outBuf, 0, static_cast<size_t>(bufW) * bufH);
+    if (nPoints < 3) return;
+
+    std::vector<float> xs;
+    xs.reserve(16);
+    for (int j = 0; j < bufH; ++j) {
+        float y = static_cast<float>(offsetY + j) + 0.5f;  // pixel-center
+        xs.clear();
+        for (size_t i = 0; i < nPoints; ++i) {
+            size_t k = (i + 1) % nPoints;
+            float ax = points[2*i],   ay = points[2*i+1];
+            float bx = points[2*k],   by = points[2*k+1];
+            // Half-open interval rule: each vertex counts in exactly one
+            // adjacent edge, so vertices and horizontal edges don't
+            // double-count. (ay <= y < by) OR (by <= y < ay).
+            bool crosses = (ay <= y && by >  y) || (by <= y && ay >  y);
+            if (!crosses) continue;
+            float t = (y - ay) / (by - ay);
+            xs.push_back(ax + t * (bx - ax));
+        }
+        if (xs.size() < 2) continue;
+        std::sort(xs.begin(), xs.end());
+        for (size_t pi = 0; pi + 1 < xs.size(); pi += 2) {
+            int x0i = static_cast<int>(std::ceil (xs[pi]   - offsetX));
+            int x1i = static_cast<int>(std::floor(xs[pi+1] - offsetX));
+            x0i = std::max(0, x0i);
+            x1i = std::min(bufW, x1i);
+            if (x1i > x0i) {
+                std::memset(outBuf + static_cast<size_t>(j) * bufW + x0i,
+                            255, static_cast<size_t>(x1i - x0i));
+            }
+        }
+    }
+}
+
+// "Lift" a polygonal region of the active raster layer into a floating
+// selection. Same overall flow as liftRasterSelectionRect but the lift
+// shape is the polygon-filled area (even-odd rule) of the supplied
+// closed polyline. Pixels outside the polygon (and outside the page
+// rect) are not lifted; both contentTex and the source-tile clear are
+// masked accordingly. Caller is responsible for commit or cancel.
+//
+// `points` is interleaved [x0,y0,x1,y1,...] of `nPoints` doc-coord
+// vertices, implicit closing edge from points[n-1] → points[0].
+bool liftRasterSelectionPolygon(const float* points, size_t nPoints) {
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (g_rasterSel.active) return false;
+    }
+    if (nPoints < 3) return false;
+
+    // Polygon AABB.
+    float pMinX = points[0], pMinY = points[1];
+    float pMaxX = pMinX,     pMaxY = pMinY;
+    for (size_t i = 1; i < nPoints; ++i) {
+        pMinX = std::min(pMinX, points[2*i]);
+        pMinY = std::min(pMinY, points[2*i+1]);
+        pMaxX = std::max(pMaxX, points[2*i]);
+        pMaxY = std::max(pMaxY, points[2*i+1]);
+    }
+
+    // Clamp the bbox to the page rect — pixels outside the page are
+    // always blank in the doc model and lifting them is meaningless.
+    PageClip page = readPageClip();
+    if (page.active) {
+        pMinX = std::max(pMinX, page.minX);
+        pMinY = std::max(pMinY, page.minY);
+        pMaxX = std::min(pMaxX, page.maxX);
+        pMaxY = std::min(pMaxY, page.maxY);
+    }
+    int rectIX0 = static_cast<int>(std::floor(pMinX));
+    int rectIY0 = static_cast<int>(std::floor(pMinY));
+    int rectIX1 = static_cast<int>(std::ceil (pMaxX));
+    int rectIY1 = static_cast<int>(std::ceil (pMaxY));
+    int rectW = rectIX1 - rectIX0;
+    int rectH = rectIY1 - rectIY0;
+    if (rectW <= 0 || rectH <= 0) return false;
+
+    ensureAtLeastOneLayer();
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return false;
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Raster) return false;
+
+    // Rasterize the polygon mask once for the whole bbox.
+    std::vector<uint8_t> mask(static_cast<size_t>(rectW) * rectH);
+    rasterizePolygonMask(points, nPoints,
+                         rectIX0, rectIY0, rectW, rectH, mask.data());
+
+    // Allocate the content texture (premultiplied RGBA, sized to bbox)
+    // and an accumulator buffer we'll glTexSubImage2D from once at the
+    // end. Skipping per-tile sub-image uploads avoids a glReadPixels +
+    // glTexSubImage2D round-trip per tile.
+    GLuint contentTex = 0;
+    glGenTextures(1, &contentTex);
+    glBindTexture(GL_TEXTURE_2D, contentTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rectW, rectH, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    std::vector<uint8_t> contentBytes(
+        static_cast<size_t>(rectW) * rectH * 4, 0);
+
+    int tx0 = rectIX0 / kTileSize;
+    int ty0 = rectIY0 / kTileSize;
+    int tx1 = (rectIX1 - 1) / kTileSize;
+    int ty1 = (rectIY1 - 1) / kTileSize;
+
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
+    std::vector<TileSnap> liftedTiles;
+    liftedTiles.reserve(static_cast<size_t>(tx1 - tx0 + 1)
+                      * static_cast<size_t>(ty1 - ty0 + 1));
+
+    std::vector<uint8_t> tileBytes(kTileBytes);
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            int tileX0 = tx * kTileSize;
+            int tileY0 = ty * kTileSize;
+            int ix0 = std::max(rectIX0, tileX0);
+            int iy0 = std::max(rectIY0, tileY0);
+            int ix1 = std::min(rectIX1, tileX0 + kTileSize);
+            int iy1 = std::min(rectIY1, tileY0 + kTileSize);
+            if (ix1 <= ix0 || iy1 <= iy0) continue;
+
+            auto it = layer.tiles.find(tileKey(tx, ty));
+            if (it == layer.tiles.end()) continue;
+
+            // Read the entire tile; cheap (one glReadPixels per tile)
+            // and avoids partial-row/column glReadPixels arithmetic.
+            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+            glReadPixels(0, 0, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, tileBytes.data());
+
+            // Pre-lift snapshot for undo + cancel restoration.
+            TileSnap snap;
+            snap.tx = tx; snap.ty = ty;
+            snap.existed = true;
+            snap.bytes = tileBytes;        // copy
+            liftedTiles.push_back(std::move(snap));
+
+            // For each pixel inside the tile-bbox intersection that the
+            // mask marks as inside-polygon, copy into contentBytes and
+            // zero out in the modified tile bytes.
+            bool tileTouched = false;
+            for (int y = iy0; y < iy1; ++y) {
+                int tileLocalY = y - tileY0;
+                int bboxLocalY = y - rectIY0;
+                const uint8_t* maskRow =
+                    mask.data() + static_cast<size_t>(bboxLocalY) * rectW;
+                for (int x = ix0; x < ix1; ++x) {
+                    int bboxLocalX = x - rectIX0;
+                    if (maskRow[bboxLocalX] == 0) continue;
+                    int tileLocalX = x - tileX0;
+                    size_t tilePxIdx =
+                        (static_cast<size_t>(tileLocalY) * kTileSize
+                         + tileLocalX) * 4;
+                    size_t bboxPxIdx =
+                        (static_cast<size_t>(bboxLocalY) * rectW
+                         + bboxLocalX) * 4;
+                    contentBytes[bboxPxIdx + 0] = tileBytes[tilePxIdx + 0];
+                    contentBytes[bboxPxIdx + 1] = tileBytes[tilePxIdx + 1];
+                    contentBytes[bboxPxIdx + 2] = tileBytes[tilePxIdx + 2];
+                    contentBytes[bboxPxIdx + 3] = tileBytes[tilePxIdx + 3];
+                    tileBytes[tilePxIdx + 0] = 0;
+                    tileBytes[tilePxIdx + 1] = 0;
+                    tileBytes[tilePxIdx + 2] = 0;
+                    tileBytes[tilePxIdx + 3] = 0;
+                    tileTouched = true;
+                }
+            }
+            if (tileTouched) {
+                uploadTileBytesAndSave(activeLayer(), tx, ty,
+                                       tileBytes.data());
+            } else {
+                // Tile didn't actually intersect the polygon — drop the
+                // pre-lift snapshot we pushed above so we don't pollute
+                // the lift's undo set with no-op tiles.
+                liftedTiles.pop_back();
+            }
+        }
+    }
+
+    glBindTexture(GL_TEXTURE_2D, contentTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, rectW, rectH,
+                    GL_RGBA, GL_UNSIGNED_BYTE, contentBytes.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        g_rasterSel.active = true;
+        g_rasterSel.layerIdx = activeLayer();
+        g_rasterSel.bboxMinX = static_cast<float>(rectIX0);
+        g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
+        g_rasterSel.bboxMaxX = static_cast<float>(rectIX1);
+        g_rasterSel.bboxMaxY = static_cast<float>(rectIY1);
+        g_rasterSel.centerX  = (rectIX0 + rectIX1) * 0.5f;
+        g_rasterSel.centerY  = (rectIY0 + rectIY1) * 0.5f;
+        g_rasterSel.halfW    = rectW * 0.5f;
+        g_rasterSel.halfH    = rectH * 0.5f;
+        g_rasterSel.rotation = 0.0f;
+        g_rasterSel.contentTex = contentTex;
+        g_rasterSel.contentW = rectW;
+        g_rasterSel.contentH = rectH;
+        g_rasterSel.liftedTiles = std::move(liftedTiles);
+    }
+    return true;
+}
+
 // "Lift" a rectangular region of the active raster layer into a floating
 // selection: copy its pixels into a content texture and clear them from
 // the source tiles. Returns true if a selection was created. On success
@@ -3701,8 +4091,11 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
         g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
         g_rasterSel.bboxMaxX = static_cast<float>(rectIX1);
         g_rasterSel.bboxMaxY = static_cast<float>(rectIY1);
-        g_rasterSel.panX = 0.0f;
-        g_rasterSel.panY = 0.0f;
+        g_rasterSel.centerX  = (rectIX0 + rectIX1) * 0.5f;
+        g_rasterSel.centerY  = (rectIY0 + rectIY1) * 0.5f;
+        g_rasterSel.halfW    = rectW * 0.5f;
+        g_rasterSel.halfH    = rectH * 0.5f;
+        g_rasterSel.rotation = 0.0f;
         g_rasterSel.contentTex = contentTex;
         g_rasterSel.contentW = rectW;
         g_rasterSel.contentH = rectH;
@@ -3737,22 +4130,37 @@ void commitRasterSelectionImpl() {
         return;
     }
 
-    // Drop position in doc-pixels.
-    int dropX0 = static_cast<int>(std::floor(sel.bboxMinX + sel.panX));
-    int dropY0 = static_cast<int>(std::floor(sel.bboxMinY + sel.panY));
-    int dropX1 = dropX0 + sel.contentW;
-    int dropY1 = dropY0 + sel.contentH;
+    // Compute placement corners in doc-coords from the floating
+    // selection's OBB. Layout matches kSelVS (uC0=top-left UV, etc.).
+    Obb selObb = obbForRasterSelection(sel);
+    float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
+    rotateLocalToWorld(selObb, -selObb.hw, -selObb.hh, c0x, c0y);
+    rotateLocalToWorld(selObb, +selObb.hw, -selObb.hh, c1x, c1y);
+    rotateLocalToWorld(selObb, +selObb.hw, +selObb.hh, c2x, c2y);
+    rotateLocalToWorld(selObb, -selObb.hw, +selObb.hh, c3x, c3y);
+    // Axis-aligned bounding box of the (possibly rotated) placement.
+    float aabbMinX = std::min(std::min(c0x, c1x), std::min(c2x, c3x));
+    float aabbMinY = std::min(std::min(c0y, c1y), std::min(c2y, c3y));
+    float aabbMaxX = std::max(std::max(c0x, c1x), std::max(c2x, c3x));
+    float aabbMaxY = std::max(std::max(c0y, c1y), std::max(c2y, c3y));
 
+    // Tile iteration covers the on-page portion of the AABB only, so we
+    // don't bake into tiles that would be entirely fragment-discarded.
+    // The corners themselves stay UNCLAMPED so aspect ratio (and any
+    // rotation) is preserved; the FS discards off-page fragments via
+    // uPageMin/uPageMax.
     PageClip page = readPageClip();
+    int iterX0 = static_cast<int>(std::floor(aabbMinX));
+    int iterY0 = static_cast<int>(std::floor(aabbMinY));
+    int iterX1 = static_cast<int>(std::ceil(aabbMaxX));
+    int iterY1 = static_cast<int>(std::ceil(aabbMaxY));
     if (page.active) {
-        dropX0 = std::max(dropX0, static_cast<int>(page.minX));
-        dropY0 = std::max(dropY0, static_cast<int>(page.minY));
-        dropX1 = std::min(dropX1, static_cast<int>(page.maxX));
-        dropY1 = std::min(dropY1, static_cast<int>(page.maxY));
+        iterX0 = std::max(iterX0, static_cast<int>(page.minX));
+        iterY0 = std::max(iterY0, static_cast<int>(page.minY));
+        iterX1 = std::min(iterX1, static_cast<int>(page.maxX));
+        iterY1 = std::min(iterY1, static_cast<int>(page.maxY));
     }
-    int dropW = dropX1 - dropX0;
-    int dropH = dropY1 - dropY0;
-    bool willDrop = (dropW > 0 && dropH > 0);
+    bool willDrop = (iterX1 > iterX0 && iterY1 > iterY0);
 
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
@@ -3773,10 +4181,10 @@ void commitRasterSelectionImpl() {
         touchedTiles[tileKeyForCoord(s.tx, s.ty)] = {s.tx, s.ty};
     }
     if (willDrop) {
-        int tx0 = dropX0 / kTileSize;
-        int ty0 = dropY0 / kTileSize;
-        int tx1 = (dropX1 - 1) / kTileSize;
-        int ty1 = (dropY1 - 1) / kTileSize;
+        int tx0 = iterX0 / kTileSize;
+        int ty0 = iterY0 / kTileSize;
+        int tx1 = (iterX1 - 1) / kTileSize;
+        int ty1 = (iterY1 - 1) / kTileSize;
         for (int ty = ty0; ty <= ty1; ++ty)
             for (int tx = tx0; tx <= tx1; ++tx)
                 touchedTiles[tileKey(tx, ty)] = {tx, ty};
@@ -3814,34 +4222,38 @@ void commitRasterSelectionImpl() {
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
-        // doc → tile-buffer transform per tile: identity-scale + translate
-        // so the tile renders content at its tile-local pixel offset from
-        // the drop rect's origin.
-        // The selection shader's uMin/uMax describe the doc-coord
-        // positions of the content rect. With the tile bake transform
-        // (uTransform = identity, uScreen = (kTileSize, kTileSize)),
-        // doc-positions need to be in tile-local units. We translate
-        // uMin/uMax by -tileOriginX / -tileOriginY for each tile.
+        // Per-tile bake. Each tile uses its own viewport and the four
+        // placement corners translated into the tile's local coordinate
+        // frame (uTransform=identity, uScreen=(kTileSize,kTileSize)).
+        // Geometry uses unclamped corners so rotation/scale is preserved;
+        // FS-level page-clip discards off-page fragments per tile.
         glUniformMatrix4fv(g_sel.uTransform, 1, GL_FALSE, kIdentity);
         glUniform2f(g_sel.uScreen, kTileSizeF, kTileSizeF);
 
-        int tx0 = dropX0 / kTileSize;
-        int ty0 = dropY0 / kTileSize;
-        int tx1 = (dropX1 - 1) / kTileSize;
-        int ty1 = (dropY1 - 1) / kTileSize;
+        int tx0 = iterX0 / kTileSize;
+        int ty0 = iterY0 / kTileSize;
+        int tx1 = (iterX1 - 1) / kTileSize;
+        int ty1 = (iterY1 - 1) / kTileSize;
         for (int ty = ty0; ty <= ty1; ++ty) {
             for (int tx = tx0; tx <= tx1; ++tx) {
                 Tile& tile = getOrCreateTile(layer, tx, ty);
                 glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
                 glViewport(0, 0, kTileSize, kTileSize);
-                int tileX0 = tx * kTileSize;
-                int tileY0 = ty * kTileSize;
-                glUniform2f(g_sel.uMin,
-                            static_cast<float>(dropX0 - tileX0),
-                            static_cast<float>(dropY0 - tileY0));
-                glUniform2f(g_sel.uMax,
-                            static_cast<float>(dropX1 - tileX0),
-                            static_cast<float>(dropY1 - tileY0));
+                float tileX0 = static_cast<float>(tx * kTileSize);
+                float tileY0 = static_cast<float>(ty * kTileSize);
+                glUniform2f(g_sel.uC0, c0x - tileX0, c0y - tileY0);
+                glUniform2f(g_sel.uC1, c1x - tileX0, c1y - tileY0);
+                glUniform2f(g_sel.uC2, c2x - tileX0, c2y - tileY0);
+                glUniform2f(g_sel.uC3, c3x - tileX0, c3y - tileY0);
+                PageClip tilePage = page;
+                if (tilePage.active) {
+                    tilePage.minX -= tileX0;
+                    tilePage.minY -= tileY0;
+                    tilePage.maxX -= tileX0;
+                    tilePage.maxY -= tileY0;
+                }
+                uploadPageClip(g_sel.uPageMin, g_sel.uPageMax,
+                               g_sel.uPageActive, tilePage);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
                 saveTileToDisk(sel.layerIdx, tileKey(tx, ty));
             }
@@ -3911,6 +4323,119 @@ void cancelRasterSelectionImpl() {
         }
     }
     if (contentTex) glDeleteTextures(1, &contentTex);
+}
+
+// Copy the active floating raster selection's pixels (and current OBB)
+// into the global clipboard. Selection state is left unchanged. No-op
+// if no selection is active. Runs on the GL thread (uses a temporary
+// FBO + glReadPixels to read the contentTex back to CPU).
+void copyRasterSelectionImpl() {
+    GLuint contentTex = 0;
+    int    w = 0, h = 0;
+    float  cx = 0, cy = 0, hw = 0, hh = 0, rot = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return;
+        contentTex = g_rasterSel.contentTex;
+        w  = g_rasterSel.contentW;
+        h  = g_rasterSel.contentH;
+        cx = g_rasterSel.centerX;
+        cy = g_rasterSel.centerY;
+        hw = g_rasterSel.halfW;
+        hh = g_rasterSel.halfH;
+        rot = g_rasterSel.rotation;
+    }
+    if (contentTex == 0 || w <= 0 || h <= 0) return;
+
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    GLuint tmpFbo = 0;
+    glGenFramebuffers(1, &tmpFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, tmpFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, contentTex, 0);
+    std::vector<uint8_t> bytes(static_cast<size_t>(w) * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, bytes.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    glDeleteFramebuffers(1, &tmpFbo);
+
+    std::lock_guard<std::mutex> lock(g_rasterClipboardMutex);
+    g_rasterClipboard.bytes    = std::move(bytes);
+    g_rasterClipboard.w        = w;
+    g_rasterClipboard.h        = h;
+    g_rasterClipboard.centerX  = cx;
+    g_rasterClipboard.centerY  = cy;
+    g_rasterClipboard.halfW    = hw;
+    g_rasterClipboard.halfH    = hh;
+    g_rasterClipboard.rotation = rot;
+    g_rasterClipboard.present  = true;
+}
+
+// Create a fresh floating raster selection from the global clipboard at
+// the same doc-coord OBB as the original copy (so Copy → Paste behaves
+// like duplicate-in-place; the user can drag the new floating sel off
+// to reveal the source). Auto-commits any existing floating selection
+// first. Returns false if the clipboard is empty or the active layer
+// isn't raster.
+bool pasteRasterSelectionImpl() {
+    RasterClipboard cb;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterClipboardMutex);
+        if (!g_rasterClipboard.present) return false;
+        cb = g_rasterClipboard;     // copies bytes — clipboard stays valid
+    }
+
+    // If a floating selection is already active, commit it so the paste
+    // becomes the new active one. (commit may push an undo entry; the
+    // paste's own commit later will push a separate entry, so undo
+    // lands on the paste first, then the prior commit.)
+    bool active = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        active = g_rasterSel.active;
+    }
+    if (active) commitRasterSelectionImpl();
+
+    ensureAtLeastOneLayer();
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) {
+        return false;
+    }
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Raster) return false;
+
+    GLuint contentTex = 0;
+    glGenTextures(1, &contentTex);
+    glBindTexture(GL_TEXTURE_2D, contentTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cb.w, cb.h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, cb.bytes.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    // bbox fields aren't actually consumed after the lift step; set
+    // them to the implicit identity bbox at the paste OBB's center so
+    // they describe a sensible source rect for any future reader.
+    g_rasterSel.bboxMinX = cb.centerX - cb.w * 0.5f;
+    g_rasterSel.bboxMinY = cb.centerY - cb.h * 0.5f;
+    g_rasterSel.bboxMaxX = cb.centerX + cb.w * 0.5f;
+    g_rasterSel.bboxMaxY = cb.centerY + cb.h * 0.5f;
+    g_rasterSel.centerX  = cb.centerX;
+    g_rasterSel.centerY  = cb.centerY;
+    g_rasterSel.halfW    = cb.halfW;
+    g_rasterSel.halfH    = cb.halfH;
+    g_rasterSel.rotation = cb.rotation;
+    g_rasterSel.contentTex = contentTex;
+    g_rasterSel.contentW   = cb.w;
+    g_rasterSel.contentH   = cb.h;
+    // Paste has no source tiles to restore on cancel — cancel just
+    // drops the floating selection.
+    g_rasterSel.liftedTiles.clear();
+    g_rasterSel.layerIdx = activeLayer();
+    g_rasterSel.active   = true;
+    return true;
 }
 
 void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
@@ -4383,13 +4908,36 @@ Java_com_bk_drawing_NativeRenderer_beginRasterSelection(
     return liftRasterSelectionRect(x0, y0, x1, y1) ? JNI_TRUE : JNI_FALSE;
 }
 
+// Lasso (freeform polygon) lift. `points` is a flat [x0,y0,x1,y1,...]
+// FloatArray of the doc-coord polyline; the closing edge is implicit
+// from the last point to the first. Same lifecycle as
+// beginRasterSelection — Kotlin queues this into the multi-buffer pass
+// since the lift needs a current GL context.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_beginLassoSelection(
+        JNIEnv* env, jobject, jfloatArray jpoints) {
+    ensureInited();
+    ensureLoaded();
+    applyPendingLayerActions();
+    applyPendingShapes();
+    ensureAtLeastOneLayer();
+    if (!jpoints) return JNI_FALSE;
+    jsize len = env->GetArrayLength(jpoints);
+    if (len < 6 || (len & 1) != 0) return JNI_FALSE;     // need ≥3 (x,y) pairs
+    std::vector<float> pts(static_cast<size_t>(len));
+    env->GetFloatArrayRegion(jpoints, 0, len, pts.data());
+    bool ok = liftRasterSelectionPolygon(pts.data(),
+                                         static_cast<size_t>(len) / 2);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_translateRasterSelection(
         JNIEnv*, jobject, jfloat dx, jfloat dy) {
     std::lock_guard<std::mutex> lock(g_rasterSelMutex);
     if (!g_rasterSel.active) return;
-    g_rasterSel.panX += dx;
-    g_rasterSel.panY += dy;
+    g_rasterSel.centerX += dx;
+    g_rasterSel.centerY += dy;
 }
 
 JNIEXPORT void JNICALL
@@ -4403,6 +4951,28 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_cancelRasterSelection(JNIEnv*, jobject) {
     ensureInited();
     cancelRasterSelectionImpl();
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_copySelection(JNIEnv*, jobject) {
+    ensureInited();
+    copyRasterSelectionImpl();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_pasteSelection(JNIEnv*, jobject) {
+    ensureInited();
+    ensureLoaded();
+    applyPendingLayerActions();
+    applyPendingShapes();
+    ensureAtLeastOneLayer();
+    return pasteRasterSelectionImpl() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_hasClipboardContent(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_rasterClipboardMutex);
+    return g_rasterClipboard.present ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -4419,11 +4989,13 @@ Java_com_bk_drawing_NativeRenderer_rasterSelectionContains(
         JNIEnv*, jobject, jfloat x, jfloat y) {
     std::lock_guard<std::mutex> lock(g_rasterSelMutex);
     if (!g_rasterSel.active) return JNI_FALSE;
-    float minX = g_rasterSel.bboxMinX + g_rasterSel.panX;
-    float minY = g_rasterSel.bboxMinY + g_rasterSel.panY;
-    float maxX = g_rasterSel.bboxMaxX + g_rasterSel.panX;
-    float maxY = g_rasterSel.bboxMaxY + g_rasterSel.panY;
-    return (x >= minX && x < maxX && y >= minY && y < maxY)
+    // Inlined OBB local-frame test (isPointInsideObb is defined further
+    // down in the file; pulling that helper above the forward-decl block
+    // would require also moving the Obb struct, which is invasive).
+    Obb o = obbForRasterSelection(g_rasterSel);
+    float lx, ly;
+    rotateWorldToLocal(o, x, y, lx, ly);
+    return (std::fabs(lx) <= o.hw && std::fabs(ly) <= o.hh)
            ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -4601,6 +5173,132 @@ bool isPointInsideObb(const Obb& o, float x, float y) {
     float lx, ly;
     rotateWorldToLocal(o, x, y, lx, ly);
     return std::fabs(lx) <= o.hw && std::fabs(ly) <= o.hh;
+}
+
+// Hit-test the floating raster selection's handles. Returns -2 for the
+// rotate handle, 0..3 for a corner, -1 for no hit / no active selection.
+int hitTestRasterSelectionHandle(float x, float y) {
+    Obb obb;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return -1;
+        obb = obbForRasterSelection(g_rasterSel);
+    }
+    float r2 = vpxToDoc(kHandleHitRadiusViewPx)
+             * vpxToDoc(kHandleHitRadiusViewPx);
+
+    // Rotate handle.
+    float rhX, rhY;
+    rotateHandlePosition(obb, rhX, rhY);
+    {
+        float dx = x - rhX, dy = y - rhY;
+        if (dx*dx + dy*dy <= r2) return -2;
+    }
+    // 4 corner scale handles.
+    for (int i = 0; i < 4; ++i) {
+        float hx, hy;
+        scaleHandlePosition(obb, ShapeKind::Rect, i, hx, hy);
+        float dx = x - hx, dy = y - hy;
+        if (dx*dx + dy*dy <= r2) return i;
+    }
+    return -1;
+}
+
+// Drag state for the floating raster selection. Independent of g_drag
+// (which is used by the vector selection tool); the two are dispatched
+// via separate JNIs so they never clash.
+DragState g_rasterDrag;
+
+// Snapshot the OBB's rotation and the drag-corner's anchor at the start
+// of a scale drag, so subsequent moves recompute against the initial
+// state instead of accumulating float drift.
+void applyRasterScaleTo(float x, float y) {
+    DragState d;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        d = g_rasterDrag;
+    }
+    if (d.mode != DragMode::Scale) return;
+
+    SnapHit snap = findSnap(x, y, /*exclude*/ nullptr);
+    if (snap.found) { x = snap.x; y = snap.y; }
+
+    // New center = midpoint of fixed anchor and dragged pen.
+    float newCx = (d.anchorX + x) * 0.5f;
+    float newCy = (d.anchorY + y) * 0.5f;
+    // Diagonal vector rotated into the OBB-local frame to recover
+    // independent half-extents along the OBB's axes.
+    float c = std::cos(-d.initialRotation), s = std::sin(-d.initialRotation);
+    float wdx = x - d.anchorX;
+    float wdy = y - d.anchorY;
+    float ldx = wdx * c - wdy * s;
+    float ldy = wdx * s + wdy * c;
+    float newHw = std::fabs(ldx) * 0.5f;
+    float newHh = std::fabs(ldy) * 0.5f;
+    if (newHw < 0.5f) newHw = 0.5f;
+    if (newHh < 0.5f) newHh = 0.5f;
+
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    if (!g_rasterSel.active) return;
+    g_rasterSel.centerX  = newCx;
+    g_rasterSel.centerY  = newCy;
+    g_rasterSel.halfW    = newHw;
+    g_rasterSel.halfH    = newHh;
+    g_rasterSel.rotation = d.initialRotation;
+    g_rasterDrag.snapActive = snap.found;
+    g_rasterDrag.snapX = snap.x;
+    g_rasterDrag.snapY = snap.y;
+}
+
+void applyRasterRotateTo(float x, float y) {
+    DragState d;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        d = g_rasterDrag;
+    }
+    if (d.mode != DragMode::Rotate) return;
+
+    float curAngle = std::atan2(y - d.centerY, x - d.centerX);
+    float delta = curAngle - d.initialPenAngle;
+    float newRotation = d.initialRotation + delta;
+
+    if (g_snapEnabled.load() != 0) {
+        constexpr float kStep = 3.14159265358979323846f / 12.0f;  // 15 deg
+        constexpr float kTol  = 5.0f * 3.14159265358979323846f / 180.0f;
+        float k = std::round(newRotation / kStep);
+        float snapped = k * kStep;
+        if (std::fabs(newRotation - snapped) <= kTol) {
+            newRotation = snapped;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    if (!g_rasterSel.active) return;
+    g_rasterSel.rotation = newRotation;
+    g_rasterDrag.snapActive = false;
+}
+
+void applyRasterMoveTo(float x, float y) {
+    DragState d;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        d = g_rasterDrag;
+    }
+    if (d.mode != DragMode::Move) return;
+
+    float targetCx = x - d.moveOffsetX;
+    float targetCy = y - d.moveOffsetY;
+
+    SnapHit snap = findSnap(targetCx, targetCy, /*exclude*/ nullptr);
+    if (snap.found) { targetCx = snap.x; targetCy = snap.y; }
+
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    if (!g_rasterSel.active) return;
+    g_rasterSel.centerX = targetCx;
+    g_rasterSel.centerY = targetCy;
+    g_rasterDrag.snapActive = snap.found;
+    g_rasterDrag.snapX = snap.x;
+    g_rasterDrag.snapY = snap.y;
 }
 
 // Begin an interaction at (x, y). Tries handles first, then shape body
@@ -4998,6 +5696,81 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
     pushUndoEntry(std::move(entry));
 }
 
+// Raster floating selection: handle hit-test → mode dispatch. Returns:
+//   0 = no hit (caller commits + starts a new define gesture)
+//   1 = move      (drag inside body)
+//   2 = scale     (corner handle)
+//   3 = rotate    (rotate handle)
+// All transform state is recorded into g_rasterDrag for the subsequent
+// updateRasterInteractionAt calls. No undo entry is recorded here or
+// in endRasterInteraction — the eventual commitRasterSelection bakes
+// one combined RasterStroke entry covering lift + final placement.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_beginRasterInteractionAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    int hit = hitTestRasterSelectionHandle(x, y);
+    if (hit == -2) {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return 0;
+        Obb obb = obbForRasterSelection(g_rasterSel);
+        g_rasterDrag.mode = DragMode::Rotate;
+        g_rasterDrag.centerX = obb.cx;
+        g_rasterDrag.centerY = obb.cy;
+        g_rasterDrag.initialPenAngle = std::atan2(y - obb.cy, x - obb.cx);
+        g_rasterDrag.initialRotation = obb.rotation;
+        return 3;
+    }
+    if (hit >= 0) {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return 0;
+        Obb obb = obbForRasterSelection(g_rasterSel);
+        // Anchor = diagonally opposite corner.
+        int anchorIdx = (hit + 2) % 4;
+        float ax, ay;
+        scaleHandlePosition(obb, ShapeKind::Rect, anchorIdx, ax, ay);
+        g_rasterDrag.mode = DragMode::Scale;
+        g_rasterDrag.handleIdx = hit;
+        g_rasterDrag.anchorX = ax;
+        g_rasterDrag.anchorY = ay;
+        g_rasterDrag.initialRotation = obb.rotation;
+        return 2;
+    }
+    // Body hit → move.
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return 0;
+        Obb obb = obbForRasterSelection(g_rasterSel);
+        if (!isPointInsideObb(obb, x, y)) {
+            g_rasterDrag.mode = DragMode::None;
+            return 0;
+        }
+        g_rasterDrag.mode = DragMode::Move;
+        g_rasterDrag.moveOffsetX = x - obb.cx;
+        g_rasterDrag.moveOffsetY = y - obb.cy;
+        return 1;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_updateRasterInteractionAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    DragMode mode;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        mode = g_rasterDrag.mode;
+    }
+    if (mode == DragMode::Scale)       applyRasterScaleTo(x, y);
+    else if (mode == DragMode::Rotate) applyRasterRotateTo(x, y);
+    else if (mode == DragMode::Move)   applyRasterMoveTo(x, y);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_endRasterInteraction(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+    g_rasterDrag.mode = DragMode::None;
+    g_rasterDrag.snapActive = false;
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_clearSelection(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(g_selectionMutex);
@@ -5126,6 +5899,34 @@ Java_com_bk_drawing_NativeRenderer_renderShapePreview(
                               shapeType, x0, y0, x1, y1,
                               rgb, currentVectorLineWidth(), /*alpha=*/0.7f,
                               snapped == JNI_TRUE);
+}
+
+// Live preview for the lasso (freeform) selection during drag. Renders
+// the in-progress polyline into the bound (front) framebuffer.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_renderLassoPathPreview(
+        JNIEnv* env, jobject,
+        jint width, jint height,
+        jfloatArray transform,
+        jfloatArray jpoints,
+        jboolean closed) {
+    ensureInited();
+    if (!jpoints) return;
+    jsize len = env->GetArrayLength(jpoints);
+    if (len < 2 || (len & 1) != 0) {
+        // Still clear the front buffer so a stale preview doesn't linger.
+        glViewport(0, 0, width, height);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        return;
+    }
+    std::vector<float> pts(static_cast<size_t>(len));
+    env->GetFloatArrayRegion(jpoints, 0, len, pts.data());
+    uint32_t rgb = g_currentBrushColor.load();
+    renderLassoPathToFront(env, width, height, transform,
+                           pts.data(), static_cast<size_t>(len) / 2,
+                           rgb, currentVectorLineWidth(), /*alpha=*/0.7f,
+                           closed == JNI_TRUE);
 }
 
 // Find nearest snap target for (x, y); fills output[0..2] with

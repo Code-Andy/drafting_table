@@ -240,11 +240,85 @@ object NativeRenderer {
     external fun beginRasterSelection(
         x0: Float, y0: Float, x1: Float, y1: Float
     ): Boolean
+
+    /**
+     * Lasso (freeform polygon) lift. `points` is a flat
+     * [x0,y0,x1,y1,...] FloatArray of doc-coord vertices; the polygon
+     * closing edge from points[n-1] → points[0] is implicit. Returns
+     * false if the active layer isn't raster, the polygon has fewer
+     * than 3 vertices, or a selection is already active.
+     *
+     * Same lifecycle as beginRasterSelection — needs a current GL
+     * context, so callers should queue this onto a multi-buffer pass.
+     */
+    external fun beginLassoSelection(points: FloatArray): Boolean
+
+    /**
+     * Live preview for the lasso tool during drag. Renders the
+     * in-progress polyline into the bound (front-buffered) framebuffer,
+     * clearing first so successive previews replace rather than
+     * accumulate. `closed` controls whether the implicit closing edge
+     * is drawn (typically false during drag, true on release).
+     */
+    external fun renderLassoPathPreview(
+        width: Int, height: Int,
+        transform: FloatArray,
+        points: FloatArray,
+        closed: Boolean
+    )
+
     external fun translateRasterSelection(dx: Float, dy: Float)
     external fun commitRasterSelection()
     external fun cancelRasterSelection()
     external fun hasRasterSelection(): Boolean
     external fun rasterSelectionContains(x: Float, y: Float): Boolean
+
+    /**
+     * Copy / paste for the floating raster selection.
+     *
+     *  copySelection: snapshot the active selection's pixels and OBB
+     *     into a process-global native clipboard. Selection is left
+     *     unchanged. No-op if no selection is active. Needs a current
+     *     GL context (uses a temp FBO + glReadPixels).
+     *  pasteSelection: create a fresh floating selection from the
+     *     clipboard, placed at the same doc-coord OBB as the original
+     *     copy (so Copy → Paste is duplicate-in-place; the user can
+     *     drag the new floating sel to reveal the source). Auto-commits
+     *     any existing floating selection first. Returns false if the
+     *     clipboard is empty or the active layer isn't raster. Needs a
+     *     current GL context.
+     *  hasClipboardContent: true if the clipboard holds something.
+     *     Cheap; safe to call from any thread for UI button enabling.
+     */
+    external fun copySelection()
+    external fun pasteSelection(): Boolean
+    external fun hasClipboardContent(): Boolean
+
+    /**
+     * Raster floating-selection transforms (Phase 3). Mirror the vector
+     * selection JNIs but operate on the active floating raster
+     * selection's OBB (centerX/Y + halfW/H + rotation).
+     *
+     *  beginRasterInteractionAt: hit-test the selection's handles +
+     *     body. Returns drag mode:
+     *       0 = none   (no active selection, or tap missed all handles
+     *                   AND fell outside the selection body)
+     *       1 = move   (tap inside body)
+     *       2 = scale  (corner handle)
+     *       3 = rotate (rotate handle)
+     *     Snapshots whatever drag-anchor / pen-offset state subsequent
+     *     updateRasterInteractionAt calls need.
+     *  updateRasterInteractionAt: drive the in-progress drag with the
+     *     pen's current doc-coord position. No-op if mode is None.
+     *  endRasterInteraction: clear the drag mode. Does NOT push an
+     *     undo entry — the eventual commitRasterSelection bakes a
+     *     single RasterStroke entry covering lift + final placement.
+     *
+     * Safe to call from any thread; no GL access.
+     */
+    external fun beginRasterInteractionAt(x: Float, y: Float): Int
+    external fun updateRasterInteractionAt(x: Float, y: Float)
+    external fun endRasterInteraction()
 
     /**
      * Bucket fill at (x, y) in doc-pixels using the current brush color.

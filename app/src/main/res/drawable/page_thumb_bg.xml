@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Page sidebar thumbnail frame. Active page gets a 2dp sienna border
+    so it pops at a glance; inactive pages get a 1dp rule outline that
+    matches the surrounding paper aesthetic.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_selected="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/paper" />
+            <stroke android:width="2dp" android:color="@color/hot" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/paper" />
+            <stroke android:width="1dp" android:color="@color/rule" />
+        </shape>
+    </item>
+</selector>
