@@ -351,11 +351,14 @@ class MainActivity : AppCompatActivity() {
         rail.addView(makeRailToolTile(Tool.BUCKET,  R.drawable.ic_bucket, "bucket"))
 
         rail.addView(railRule())
-        rail.addView(railSectionLabel("BUILD"))
+        rail.addView(railSectionLabel("VECTOR"))
         rail.addView(makeRailToolTile(Tool.LINE,        R.drawable.ic_line,          "line"))
         rail.addView(makeRailToolTile(Tool.RECTANGLE,   R.drawable.ic_rect,          "rectangle"))
         rail.addView(makeRailToolTile(Tool.CIRCLE,      R.drawable.ic_circle,        "circle"))
         rail.addView(makeRailToolTile(Tool.ELLIPSE,     R.drawable.ic_ellipse,       "ellipse"))
+
+        rail.addView(railRule())
+        rail.addView(railSectionLabel("SELECT"))
         rail.addView(makeRailToolTile(Tool.SELECT,      R.drawable.ic_vector_select, "vector select"))
         rail.addView(makeRailToolTile(Tool.SELECT_RECT, R.drawable.ic_select,        "marquee"))
         rail.addView(makeRailToolTile(Tool.SELECT_LASSO,R.drawable.ic_lasso,         "lasso"))
@@ -940,12 +943,12 @@ class MainActivity : AppCompatActivity() {
         val label = TextView(this).apply {
             text = "α"
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.inkSoft))
         }
         layerOpacityValue = TextView(this).apply {
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.ink))
             gravity = Gravity.END
             text = "100"
@@ -1005,13 +1008,13 @@ class MainActivity : AppCompatActivity() {
         // Active "size" slider routes to brush vs vector width based on tool.
         sizeSliderLabel = TextView(this).apply {
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.inkSoft))
             text = "size"
         }
         sizeValueLabel = TextView(this).apply {
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.ink))
             gravity = Gravity.END
         }
@@ -1069,12 +1072,12 @@ class MainActivity : AppCompatActivity() {
         val label = TextView(this).apply {
             text = "α"
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.inkSoft))
         }
         val valueLabel = TextView(this).apply {
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.ink))
             gravity = Gravity.END
             // Initial display matches the initial slider position
@@ -1107,12 +1110,12 @@ class MainActivity : AppCompatActivity() {
         val label = TextView(this).apply {
             text = "hard"
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.inkSoft))
         }
         val valueLabel = TextView(this).apply {
             typeface = fontMono ?: Typeface.MONOSPACE
-            textSize = 9f
+            textSize = 11f
             setTextColor(getColor(R.color.ink))
             gravity = Gravity.END
             text = (brushHardness * 100).toInt().toString()
@@ -1154,7 +1157,7 @@ class MainActivity : AppCompatActivity() {
     private fun makeStubSliderLabel(text: String): TextView = TextView(this).apply {
         this.text = text
         typeface = fontMono ?: Typeface.MONOSPACE
-        textSize = 9f
+        textSize = 11f
         setTextColor(getColor(R.color.inkDisabled))
     }
 
@@ -1168,7 +1171,7 @@ class MainActivity : AppCompatActivity() {
     private fun makeStubValueLabel(text: String): TextView = TextView(this).apply {
         this.text = text
         typeface = fontMono ?: Typeface.MONOSPACE
-        textSize = 9f
+        textSize = 11f
         setTextColor(getColor(R.color.inkDisabled))
         gravity = Gravity.END
     }

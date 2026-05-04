@@ -2273,14 +2273,45 @@ void freeLayerGLResources(Layer& layer) {
     layer.tiles.clear();
 }
 
+// Index-permutation helpers used to rewrite indices in undo entries and
+// the selection after a structural change. Keeping these as small free
+// functions makes the remap logic in delete/move impls a one-liner per
+// reference site.
+//
+// After a move (from -> to):
+//   - the moved layer ends up at `to`;
+//   - every other index in (from, to] (or [to, from) for upward moves)
+//     shifts by one in the opposite direction.
+size_t mapLayerIdxAfterMove(size_t i, size_t from, size_t to) {
+    if (i == from) return to;
+    if (from < to) {
+        if (i > from && i <= to) return i - 1;
+    } else {
+        if (i >= to && i < from) return i + 1;
+    }
+    return i;
+}
+
+// After a delete: returns SIZE_MAX for "this index is the deleted layer
+// itself" (caller should drop the entry). Indices above the deleted slot
+// shift down by one.
+constexpr size_t kInvalidLayerIdx = SIZE_MAX;
+size_t mapLayerIdxAfterDelete(size_t i, size_t deletedIdx) {
+    if (i == deletedIdx) return kInvalidLayerIdx;
+    if (i > deletedIdx) return i - 1;
+    return i;
+}
+
 // Delete the layer at `idx` on the active page. No-op if there's only one
 // layer left (the document needs at least one). Frees GL resources, wipes
 // the on-disk dir, renumbers the trailing layer dirs to keep them
-// 0..N-1 contiguous, and adjusts the active-layer index. Selection is
-// canceled because its layer index is about to shift.
+// 0..N-1 contiguous, and adjusts the active-layer index.
 //
-// Undo stack is cleared: every UndoEntry references a layer by index, and
-// shifting indices would silently corrupt them. Same policy as page ops.
+// Undo / redo entries that reference the deleted layer are dropped (their
+// data is gone, so they can't apply); entries with a higher layerIdx are
+// decremented. The vector selection is remapped or cleared the same way.
+// The floating raster selection is cancel-restored — preserving it across
+// a structural change isn't worth the complexity.
 void deleteLayerImpl(size_t idx) {
     if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
     auto& ls = g_pages[g_activePageIdx]->layers;
@@ -2291,14 +2322,43 @@ void deleteLayerImpl(size_t idx) {
     }
 
     cancelRasterSelectionImpl();
-    {
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        g_selection = Selection{};
-    }
+
+    // Remap undo / redo: drop entries pinned to the deleted layer, shift
+    // the rest. Note: `bytes` is per-entry and totals must be kept in
+    // sync as we erase.
     {
         std::lock_guard<std::mutex> lock(g_undoMutex);
-        g_undoStack.clear(); g_undoTotalBytes = 0;
-        g_redoStack.clear(); g_redoTotalBytes = 0;
+        auto remap = [&](std::deque<UndoEntry>& stack, size_t& totalBytes) {
+            for (auto it = stack.begin(); it != stack.end(); ) {
+                size_t newIdx = mapLayerIdxAfterDelete(it->layerIdx, idx);
+                if (newIdx == kInvalidLayerIdx) {
+                    totalBytes -= it->bytes;
+                    it = stack.erase(it);
+                    continue;
+                }
+                it->layerIdx = newIdx;
+                if (it->op == UndoOp::LayerAdd) {
+                    // prevActiveLayer being the deleted layer means the
+                    // pre-add active slot is gone. Falling back to 0 is
+                    // safe because layers().size() >= 1 is invariant.
+                    size_t prev = mapLayerIdxAfterDelete(it->prevActiveLayer, idx);
+                    it->prevActiveLayer = (prev == kInvalidLayerIdx) ? 0 : prev;
+                }
+                ++it;
+            }
+        };
+        remap(g_undoStack, g_undoTotalBytes);
+        remap(g_redoStack, g_redoTotalBytes);
+    }
+
+    // Vector selection: remap or drop.
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        if (g_selection.kind != ShapeKind::None) {
+            size_t newSel = mapLayerIdxAfterDelete(g_selection.layerIdx, idx);
+            if (newSel == kInvalidLayerIdx) g_selection = Selection{};
+            else                            g_selection.layerIdx = newSel;
+        }
     }
 
     freeLayerGLResources(*ls[idx]);
@@ -2336,8 +2396,14 @@ void deleteLayerImpl(size_t idx) {
 
 // Move the layer at `from` to position `to` on the active page. Both the
 // in-memory vector and on-disk layer_<n> dirs are reordered; the layer's
-// content (tiles / shapes) is preserved unchanged. Selection is canceled
-// and the undo stack is cleared because both reference layers by index.
+// content (tiles / shapes) is preserved unchanged.
+//
+// Undo / redo entries are kept — their layerIdx (and prevActiveLayer for
+// LayerAdd entries) is rewritten through mapLayerIdxAfterMove, so a
+// post-reorder undo still hits the correct (now-relocated) layer. Same
+// remap is applied to the vector selection. The floating raster
+// selection is cancel-restored before the move (its lifted pixels go
+// back to the source layer object, which is what the user intends).
 void moveLayerImpl(size_t from, size_t to) {
     if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
     auto& ls = g_pages[g_activePageIdx]->layers;
@@ -2345,14 +2411,28 @@ void moveLayerImpl(size_t from, size_t to) {
     if (!ls[from]) return;
 
     cancelRasterSelectionImpl();
-    {
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        g_selection = Selection{};
-    }
+
+    // Remap undo / redo entries' layer indices to the post-move slots.
     {
         std::lock_guard<std::mutex> lock(g_undoMutex);
-        g_undoStack.clear(); g_undoTotalBytes = 0;
-        g_redoStack.clear(); g_redoTotalBytes = 0;
+        auto remap = [&](std::deque<UndoEntry>& stack) {
+            for (auto& e : stack) {
+                e.layerIdx = mapLayerIdxAfterMove(e.layerIdx, from, to);
+                if (e.op == UndoOp::LayerAdd) {
+                    e.prevActiveLayer =
+                        mapLayerIdxAfterMove(e.prevActiveLayer, from, to);
+                }
+            }
+        };
+        remap(g_undoStack);
+        remap(g_redoStack);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        if (g_selection.kind != ShapeKind::None) {
+            g_selection.layerIdx =
+                mapLayerIdxAfterMove(g_selection.layerIdx, from, to);
+        }
     }
 
     // Reorder in-memory: erase + insert keeps the unique_ptrs intact so
@@ -2458,8 +2538,13 @@ void freePageGLResources(Page& page) {
 // Delete the page at `idx`. No-op if there's only one page left (the
 // document needs at least one). Frees GL resources, wipes the on-disk
 // dir, renumbers trailing page dirs to keep them 0..N-1 contiguous, and
-// adjusts g_activePageIdx. Selection and undo are wiped because both
-// reference indices that are about to shift.
+// adjusts g_activePageIdx.
+//
+// Undo entries are scoped to the active page (no pageIdx field). If the
+// deleted page IS the active page, the entries reference layers on a
+// page that's about to be freed — they have to go. If the deleted page
+// is some other page, the active page's layer indices are unchanged
+// and the entries stay valid.
 void deletePageImpl(size_t idx) {
     if (idx >= g_pages.size() || !g_pages[idx]) return;
     if (g_pages.size() <= 1) {
@@ -2468,14 +2553,16 @@ void deletePageImpl(size_t idx) {
     }
 
     cancelRasterSelectionImpl();
-    {
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        g_selection = Selection{};
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_undoMutex);
-        g_undoStack.clear(); g_undoTotalBytes = 0;
-        g_redoStack.clear(); g_redoTotalBytes = 0;
+    if (idx == g_activePageIdx) {
+        {
+            std::lock_guard<std::mutex> lock(g_selectionMutex);
+            g_selection = Selection{};
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_undoMutex);
+            g_undoStack.clear(); g_undoTotalBytes = 0;
+            g_redoStack.clear(); g_redoTotalBytes = 0;
+        }
     }
 
     freePageGLResources(*g_pages[idx]);
@@ -2507,21 +2594,18 @@ void deletePageImpl(size_t idx) {
 
 // Move the page at `from` to position `to`. Both the in-memory Page
 // vector and on-disk page_<n>/ dirs are reordered; per-page contents
-// are preserved. Selection and undo are cleared.
+// are preserved.
+//
+// Undo / redo and the vector selection are kept untouched. They're
+// implicitly scoped to the active page (no page index in UndoEntry),
+// and g_activePageIdx is adjusted below to track the same Page object
+// across the move — so existing entries still apply to the right
+// layers after the reorder.
 void movePageImpl(size_t from, size_t to) {
     if (from >= g_pages.size() || to >= g_pages.size() || from == to) return;
     if (!g_pages[from]) return;
 
     cancelRasterSelectionImpl();
-    {
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        g_selection = Selection{};
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_undoMutex);
-        g_undoStack.clear(); g_undoTotalBytes = 0;
-        g_redoStack.clear(); g_redoTotalBytes = 0;
-    }
 
     auto holder = std::move(g_pages[from]);
     g_pages.erase(g_pages.begin() + static_cast<ptrdiff_t>(from));
