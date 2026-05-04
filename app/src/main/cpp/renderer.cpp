@@ -84,35 +84,29 @@ constexpr int    kTileSize  = 256;
 constexpr float  kTileSizeF = 256.0f;
 constexpr float  kTileHalfF = 128.0f;
 constexpr size_t kTileBytes = static_cast<size_t>(kTileSize) * kTileSize * 4;
+// Apron padding around each tile texture. Storing a 1-pixel border
+// of the neighbor's edge content lets the composite shader's LINEAR
+// filter blend across tile boundaries without producing a seam (the
+// alternative — sampling at the edge with CLAMP_TO_EDGE — repeats the
+// edge texel and misses the neighboring tile's content entirely).
+constexpr int   kApron       = 1;
+constexpr int   kTileTexSize = kTileSize + 2 * kApron;
 
 constexpr float kSpacing   = 0.18f;
 constexpr float kMinRadius = 2.0f;
 constexpr float kMaxRadius = 18.0f;
 
-// Brush dabs render with a runtime-settable color. The dab's per-fragment
-// alpha (kBrushAlpha * radial falloff) controls stroke buildup as
-// overlapping dabs accumulate; the *color* is g_strokeBrushColor, which
-// is captured from g_currentBrushColor at beginStroke.
-constexpr float kBrushAlpha = 0.85f;
+// Brush dabs render with a runtime-settable color and alpha. The
+// dab's per-fragment alpha (g_strokeBrushAlpha * radial falloff)
+// controls stroke buildup as overlapping dabs accumulate; the *color*
+// is g_strokeBrushColor (captured from g_currentBrushColor +
+// g_brushAlphaBits at beginStroke).
 
 // During an erase stroke, the front-buffered live preview shows a pink
 // indicator (blended additively, like a brush) so the user can see where
 // they're about to erase. The actual erase happens at commit, in the
 // tile bake path, with a different blend mode.
 constexpr float kEraserPreviewColor[4] = { 1.00f, 0.40f, 0.45f, 0.55f };
-
-// When baking an erase stroke into a tile we use glBlendFunc(GL_ZERO,
-// GL_ONE_MINUS_SRC_ALPHA), so src.rgb is multiplied by zero — only src.a
-// matters. The 0.85 here mirrors brush coverage so erase strength feels
-// symmetric with how the brush deposits ink.
-constexpr float kEraserBakeColor[4] = { 0.00f, 0.00f, 0.00f, 0.85f };
-
-// During eraser live preview we accumulate erase coverage into a separate
-// FBO with additive premultiplied blend. The dab fragment shader outputs
-// (rgb*alpha, alpha); rgb=0 here so only alpha lands in the coverage map,
-// and alpha=0.85 matches the bake-time strength so live preview equals
-// the post-commit appearance.
-constexpr float kCoverageColor[4] = { 0.00f, 0.00f, 0.00f, 0.85f };
 
 constexpr float kIdentity[16] = {
     1, 0, 0, 0,
@@ -145,7 +139,15 @@ void main() {
 )";
 
 const char* kDabFS = R"(#version 300 es
-precision mediump float;
+// highp here, not mediump: the dab is rendered separately into each
+// tile it touches, and a stroke that crosses a tile boundary expects
+// the same alpha at fragments on either side of the seam. With
+// mediump (10-bit mantissa) the smoothstep evaluation differs by ~1
+// ULP between adjacent tiles' rasterizations, and LINEAR composite
+// sampling surfaces that as a faint visible seam at the boundary.
+// highp gives us enough precision for the two sides to round to the
+// same alpha value.
+precision highp float;
 in vec2 vUv;
 in vec2 vDocPos;
 out vec4 outColor;
@@ -153,6 +155,11 @@ uniform vec4 uColor;
 uniform vec2 uPageMin;
 uniform vec2 uPageMax;
 uniform int  uPageActive;     // 0 = no page clip
+// Hardness in [0, 1]: the radial fraction at which the dab becomes
+// fully opaque. The dab is opaque for r ≤ uHardness and falls off via
+// smoothstep(uHardness, 1.0, r) outside that. uHardness=1 → solid
+// disc (hard); uHardness=0 → full gradient (smooth).
+uniform float uHardness;
 void main() {
     if (uPageActive != 0 && (
         vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
@@ -160,8 +167,23 @@ void main() {
         discard;
     }
     float r = length(vUv);
-    if (r > 1.0) discard;
-    float a = 1.0 - smoothstep(0.55, 1.0, r);
+    if (r >= 1.0) discard;
+    float a;
+    if (uHardness >= 1.0 || r <= uHardness) {
+        // Inside the opaque core (and the whole disc when fully hard).
+        a = 1.0;
+    } else {
+        // Outer falloff: rescale (uHardness..1) to (0..1) and apply a
+        // 4th-power curve. Steeper than smoothstep — necessary because
+        // dabs overlap ~6× at the spine; with smoothstep, accumulation
+        // saturates to opaque almost everywhere and only a thin rim
+        // looks "soft" no matter how low the user sets the slider. The
+        // quartic drops fast enough that cumulative alpha tapers
+        // through a wide visible gradient when stacked.
+        float t = (1.0 - r) / (1.0 - uHardness);
+        float t2 = t * t;
+        a = t2 * t2;
+    }
     float alpha = uColor.a * a;
     // Premultiplied output, blended with GL_ONE / GL_ONE_MINUS_SRC_ALPHA.
     outColor = vec4(uColor.rgb * alpha, alpha);
@@ -189,9 +211,20 @@ precision mediump float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uTileTex;
+// Per-layer opacity (1.0 = fully opaque). Multiplying a premultiplied
+// RGBA by a scalar yields a correctly-premultiplied RGBA at the
+// scaled alpha — that's why we don't need separate rgb / a math.
+uniform float uOpacity;
+// Apron-aware UV remap. The tile texture is 258x258 with the visible
+// 256x256 content at texels [1..256]; the outer 1-pixel ring is filled
+// from neighbors so LINEAR sampling near the edge can blend across
+// tile boundaries cleanly (no seams). We map the visible quad UV
+// [0..1] to texture UV [1/258, 257/258].
+const float kApronTex = 1.0 / 258.0;
+const float kInner    = 256.0 / 258.0;
 void main() {
-    // Tile texture is premultiplied; preserve alpha for correct compositing.
-    outColor = texture(uTileTex, vUv);
+    vec2 uv = vUv * kInner + kApronTex;
+    outColor = texture(uTileTex, uv) * uOpacity;
 }
 )";
 
@@ -293,6 +326,11 @@ uniform vec4  uColor;        // straight RGBA (premultiplied at output)
 uniform vec2  uPageMin;
 uniform vec2  uPageMax;
 uniform int   uPageActive;
+// Per-layer opacity for vector lines. Defaulted to 1.0 by every
+// non-layer caller (handles, snap markers, page outline, shape
+// preview); only the layer compositor (drawLineSegment etc. inside
+// compositeVectorLayer) sets it to a layer-specific value.
+uniform float uOpacity;
 out vec4 outColor;
 void main() {
     if (uPageActive != 0 && (
@@ -305,7 +343,7 @@ void main() {
     float dist    = sqrt(dAlong * dAlong + vLineSpace.y * vLineSpace.y);
     float alpha   = 1.0 - smoothstep(uHalfWidth - 0.5, uHalfWidth + 0.5, dist);
     if (alpha <= 0.0) discard;
-    float a = uColor.a * alpha;
+    float a = uColor.a * alpha * uOpacity;
     outColor = vec4(uColor.rgb * a, a);
 }
 )";
@@ -457,6 +495,10 @@ uniform sampler2D uContent;     // premultiplied selection content
 uniform vec2 uPageMin;
 uniform vec2 uPageMax;
 uniform int  uPageActive;
+// Source-layer opacity at overlay time. Bake (commit drop) uses 1.0
+// so pixels go into the tile at full opacity; the layer's opacity is
+// applied later at composite time.
+uniform float uOpacity;
 out vec4 outColor;
 void main() {
     if (uPageActive != 0 && (
@@ -464,7 +506,7 @@ void main() {
         vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
         discard;
     }
-    outColor = texture(uContent, vUv);
+    outColor = texture(uContent, vUv) * uOpacity;
 }
 )";
 
@@ -476,6 +518,10 @@ struct Stroke { std::vector<Sample> samples; };
 struct Tile {
     GLuint texture = 0;
     GLuint fbo     = 0;
+    // Set whenever this tile's content (or any of its 8 neighbors')
+    // changes. The composite path lazy-syncs the apron from neighbors
+    // on the next composite pass when this is true.
+    bool   apronStale = true;
 };
 
 // Vector-layer primitives. All coordinates are in document pixels. Each
@@ -523,6 +569,22 @@ struct Layer {
     std::vector<Rect>    rects;
     std::vector<Ellipse> ellipses;
     std::vector<Circle>  circles;
+    // User-set display name. Empty = caller renders a default like
+    // "layer N" / "vector N". Persisted at <layerDir>/name.txt; reads/
+    // writes are guarded by g_layerNameMutex (see below).
+    std::string name;
+    // User-toggleable visibility. The compositor (GL thread) reads it
+    // every frame; the UI thread writes it from the eye-icon tap, so we
+    // use atomic to avoid a mutex on the per-layer hot path.
+    // Persisted as the *presence* of <layerDir>/hidden.flag — absence
+    // means visible, which is the unambiguous default for layers
+    // created before this feature existed.
+    std::atomic_bool visible{true};
+    // Per-layer opacity in [0, 1]. The composite shaders multiply their
+    // premultiplied output by this scalar. Same atomic access pattern
+    // as `visible`. Persisted at <layerDir>/opacity.txt; absence means
+    // 1.0 (the default for layers created before this feature existed).
+    std::atomic<float> opacity{1.0f};
 };
 
 // A document Page wraps a layer stack plus an active-layer index. All
@@ -544,6 +606,7 @@ struct DabProg {
     GLint  uPageMin    = -1;
     GLint  uPageMax    = -1;
     GLint  uPageActive = -1;
+    GLint  uHardness   = -1;
 };
 
 struct CompProg {
@@ -553,6 +616,7 @@ struct CompProg {
     GLint  uTileCenter = -1;
     GLint  uTileHalf   = -1;
     GLint  uTileTex    = -1;
+    GLint  uOpacity    = -1;
 };
 
 struct PreviewProg {
@@ -590,6 +654,7 @@ struct LineProg {
     GLint  uPageMin    = -1;
     GLint  uPageMax    = -1;
     GLint  uPageActive = -1;
+    GLint  uOpacity    = -1;
 };
 
 struct FillProg {
@@ -610,6 +675,7 @@ struct SelProg {
     GLint  uC2        = -1;
     GLint  uC3        = -1;
     GLint  uContent   = -1;
+    GLint  uOpacity   = -1;
     GLint  uPageMin    = -1;
     GLint  uPageMax    = -1;
     GLint  uPageActive = -1;
@@ -724,6 +790,12 @@ std::vector<std::unique_ptr<Page>> g_pages;
 size_t g_activePageIdx = 0;
 size_t g_strokeTarget  = 0;          // captured at beginStroke
 
+// Per-layer user-set names live in Layer.name. Reads from the UI thread
+// (for the layer panel) and writes (rename dialogs) cross threads with
+// the GL thread (which mutates layers via the pending-action queue).
+// We guard string access here rather than holding a wider lock.
+std::mutex g_layerNameMutex;
+
 // Accessors for the active page's layer state. Reseat as g_activePageIdx
 // changes — most existing code uses these as if they were the original
 // `layers()` / `activeLayer()` globals. Both return non-const references
@@ -745,9 +817,38 @@ int g_strokeTool = 0;
 
 // Brush color: RGB packed into low 24 bits (0xRRGGBB). Settable from any
 // thread; the GL thread snapshots into g_strokeBrushColor at beginStroke.
-// Alpha component of the snapshot is kBrushAlpha.
+// The alpha component of the snapshot comes from g_brushAlphaBits
+// (user-controlled via the brush opacity slider).
 std::atomic<uint32_t> g_currentBrushColor{0x14171Fu};
-float g_strokeBrushColor[4] = { 0.08f, 0.09f, 0.12f, kBrushAlpha };
+float g_strokeBrushColor[4] = { 0.08f, 0.09f, 0.12f, 1.0f };
+
+// Brush opacity in [0, 1]. Same atomic-bits-of-float pattern as
+// g_brushSizeScaleBits. Snapshotted at beginStroke so mid-stroke
+// slider changes don't split a stroke; the snapshot is what the bake
+// uses for g_strokeBrushColor[3] AND what the live coverage pass
+// uses (so live preview matches the post-commit appearance).
+std::atomic<uint32_t> g_brushAlphaBits{0x3F800000u};       // 1.0f
+float g_strokeBrushAlpha = 1.0f;
+inline float currentBrushAlpha() {
+    uint32_t bits = g_brushAlphaBits.load();
+    float v;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+// Brush "hardness" in [0, 1]: the radial fraction at which a single
+// dab is fully opaque (everything outside falls off via smoothstep to
+// r=1). 1.0 = solid disc, 0.0 = full gradient. Snapshotted into
+// g_strokeBrushHardness at beginStroke so the live coverage pass and
+// the bake see the same value.
+std::atomic<uint32_t> g_brushHardnessBits{0x3F800000u};    // 1.0f
+float g_strokeBrushHardness = 1.0f;
+inline float currentBrushHardness() {
+    uint32_t bits = g_brushHardnessBits.load();
+    float v;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
 
 // Brush size scale: a multiplier applied to the per-pressure dab radius.
 // Snapshotted into g_strokeBrushSizeScale at beginStroke so mid-stroke
@@ -810,6 +911,10 @@ constexpr int kActionRedo           = 6;
 constexpr int kActionAddPage        = 7;
 constexpr int kActionSwitchPage     = 8;
 constexpr int kActionLoadDocument   = 9;
+constexpr int kActionDeleteLayer    = 10;
+constexpr int kActionMoveLayer      = 11;
+constexpr int kActionDeletePage     = 12;
+constexpr int kActionMovePage       = 13;
 // Target index for the next kActionSwitchPage drained. Stored separately
 // because the action queue is just `vector<int>`. Last-write-wins on
 // rapid taps: exchange(-1) at drain time picks up whichever target was
@@ -819,6 +924,18 @@ std::atomic<int>     g_pendingSwitchPage{-1};
 // shape as g_pendingSwitchPage but for an arbitrary string.
 std::mutex   g_pendingDocPathMutex;
 std::string  g_pendingDocPath;
+// Side channels for parameterized layer ops (same last-write-wins
+// pattern as g_pendingSwitchPage). The action code in the queue
+// triggers the drain to read these.
+std::atomic<int> g_pendingDeleteLayerIdx{-1};
+std::mutex       g_pendingMoveLayerMutex;
+int              g_pendingMoveLayerFrom = -1;
+int              g_pendingMoveLayerTo   = -1;
+// Same shape for page-level ops.
+std::atomic<int> g_pendingDeletePageIdx{-1};
+std::mutex       g_pendingMovePageMutex;
+int              g_pendingMovePageFrom  = -1;
+int              g_pendingMovePageTo    = -1;
 
 // Shapes added from the UI thread are queued separately because they
 // carry per-shape data that doesn't fit in the int-tagged action queue.
@@ -1210,6 +1327,10 @@ void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
 void deleteTileIfExists(size_t layerIdx, int tx, int ty);
 void applyTileSnap(size_t layerIdx, const TileSnap& snap);
 void deleteLayerDirIfExists(size_t layerIdx);
+void deleteLayerImpl(size_t idx);
+void moveLayerImpl(size_t from, size_t to);
+void deletePageImpl(size_t idx);
+void movePageImpl(size_t from, size_t to);
 void applyUndo();
 void applyRedo();
 void applyPendingShapes();
@@ -1224,7 +1345,7 @@ void copyRasterSelectionImpl();
 bool pasteRasterSelectionImpl();
 void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
                                  jfloatArray transform);
-void compositeRasterLayer(const Layer& layer);
+void compositeRasterLayer(const Layer& layer, float opacityOverride = -1.0f);
 void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
                           jint width, jint height, jfloatArray transform);
 
@@ -1380,6 +1501,46 @@ void applyPendingLayerActions() {
             // dereferences an empty g_pages and we crash.
             ensureLoaded();
             LOGI("loaded document: %s", g_docDir.c_str());
+        } else if (a == kActionDeleteLayer) {
+            int idx = g_pendingDeleteLayerIdx.exchange(-1);
+            if (idx >= 0) {
+                applyPendingShapes();
+                deleteLayerImpl(static_cast<size_t>(idx));
+            }
+        } else if (a == kActionMoveLayer) {
+            int from = -1, to = -1;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingMoveLayerMutex);
+                from = g_pendingMoveLayerFrom;
+                to   = g_pendingMoveLayerTo;
+                g_pendingMoveLayerFrom = -1;
+                g_pendingMoveLayerTo   = -1;
+            }
+            if (from >= 0 && to >= 0) {
+                applyPendingShapes();
+                moveLayerImpl(static_cast<size_t>(from),
+                              static_cast<size_t>(to));
+            }
+        } else if (a == kActionDeletePage) {
+            int idx = g_pendingDeletePageIdx.exchange(-1);
+            if (idx >= 0) {
+                applyPendingShapes();
+                deletePageImpl(static_cast<size_t>(idx));
+            }
+        } else if (a == kActionMovePage) {
+            int from = -1, to = -1;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingMovePageMutex);
+                from = g_pendingMovePageFrom;
+                to   = g_pendingMovePageTo;
+                g_pendingMovePageFrom = -1;
+                g_pendingMovePageTo   = -1;
+            }
+            if (from >= 0 && to >= 0) {
+                applyPendingShapes();
+                movePageImpl(static_cast<size_t>(from),
+                             static_cast<size_t>(to));
+            }
         } else if (a == kActionSwitchPage) {
             int target = g_pendingSwitchPage.exchange(-1);
             if (target >= 0
@@ -1520,6 +1681,7 @@ void ensureInited() {
     g_dab.uCenter    = glGetUniformLocation(g_dab.program, "uCenter");
     g_dab.uRadius    = glGetUniformLocation(g_dab.program, "uRadius");
     g_dab.uColor     = glGetUniformLocation(g_dab.program, "uColor");
+    g_dab.uHardness  = glGetUniformLocation(g_dab.program, "uHardness");
     g_dab.uPageMin    = glGetUniformLocation(g_dab.program, "uPageMin");
     g_dab.uPageMax    = glGetUniformLocation(g_dab.program, "uPageMax");
     g_dab.uPageActive = glGetUniformLocation(g_dab.program, "uPageActive");
@@ -1530,6 +1692,7 @@ void ensureInited() {
     g_comp.uTileCenter = glGetUniformLocation(g_comp.program, "uTileCenter");
     g_comp.uTileHalf   = glGetUniformLocation(g_comp.program, "uTileHalf");
     g_comp.uTileTex    = glGetUniformLocation(g_comp.program, "uTileTex");
+    g_comp.uOpacity    = glGetUniformLocation(g_comp.program, "uOpacity");
 
     g_preview.program   = linkProgram(kPreviewVS, kPreviewFS);
     g_preview.uBelow    = glGetUniformLocation(g_preview.program, "uBelow");
@@ -1561,6 +1724,19 @@ void ensureInited() {
     g_lineProg.uPageMin    = glGetUniformLocation(g_lineProg.program, "uPageMin");
     g_lineProg.uPageMax    = glGetUniformLocation(g_lineProg.program, "uPageMax");
     g_lineProg.uPageActive = glGetUniformLocation(g_lineProg.program, "uPageActive");
+    g_lineProg.uOpacity    = glGetUniformLocation(g_lineProg.program, "uOpacity");
+    // GLES uniforms default to 0 at link time, but compositeVectorLayer
+    // is the only place that sets uOpacity to a non-1 value (and it
+    // resets to 1.0 on the way out). Without this initial set, a frame
+    // that draws line-program content BEFORE any vector layer
+    // composites — e.g. the raster selection's dashed marquee + handles
+    // when there's no vector layer in the doc at all — would render
+    // with uOpacity = 0 and disappear. Same defensiveness for g_comp.
+    glUseProgram(g_lineProg.program);
+    glUniform1f(g_lineProg.uOpacity, 1.0f);
+    glUseProgram(g_comp.program);
+    glUniform1f(g_comp.uOpacity, 1.0f);
+    glUseProgram(0);
 
     g_fill.program    = linkProgram(kFillVS, kFillFS);
     g_fill.uTransform = glGetUniformLocation(g_fill.program, "uTransform");
@@ -1577,9 +1753,15 @@ void ensureInited() {
     g_sel.uC2        = glGetUniformLocation(g_sel.program, "uC2");
     g_sel.uC3        = glGetUniformLocation(g_sel.program, "uC3");
     g_sel.uContent   = glGetUniformLocation(g_sel.program, "uContent");
+    g_sel.uOpacity   = glGetUniformLocation(g_sel.program, "uOpacity");
     g_sel.uPageMin    = glGetUniformLocation(g_sel.program, "uPageMin");
     g_sel.uPageMax    = glGetUniformLocation(g_sel.program, "uPageMax");
     g_sel.uPageActive = glGetUniformLocation(g_sel.program, "uPageActive");
+    // Default to opaque; the overlay path overrides with the source
+    // layer's opacity, the bake path explicitly sets 1.0.
+    glUseProgram(g_sel.program);
+    glUniform1f(g_sel.uOpacity, 1.0f);
+    glUseProgram(0);
 
     const float verts[] = {
         -1.0f, -1.0f,
@@ -1720,14 +1902,30 @@ void renderLayerRangeIntoFbo(JNIEnv* env, ViewFbo& target,
     }
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (startIdx >= endExclusive) return;
-
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    // The "below" snapshot represents the page background + everything
+    // below the active layer, mirroring what compositeAllLayers paints
+    // before the active-layer pass. The grid belongs in that background
+    // — without this, the eraser preview formula (display = lerp(multi,
+    // above + below*(1-above.a), c)) hides the grid in erased regions
+    // until commit, since `multi` has the grid but `below` didn't.
+    if (clearWhite) {
+        PageClip pageClip = readPageClip();
+        glUseProgram(g_grid.program);
+        uploadPageClip(g_grid.uPageMin, g_grid.uPageMax,
+                       g_grid.uPageActive, pageClip);
+        renderGridOverlay(env, width, height, transform);
+    }
+
+    if (startIdx >= endExclusive) return;
+
     bindRasterCompositePipeline(env, width, height, transform);
 
     for (size_t i = startIdx; i < endExclusive && i < layers().size(); ++i) {
         if (!layers()[i]) continue;
+        if (!layers()[i]->visible.load(std::memory_order_relaxed)) continue;
         if (layers()[i]->type == LayerType::Raster) {
             compositeRasterLayer(*layers()[i]);
         } else { // Vector
@@ -1777,8 +1975,10 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
     Tile t;
     glGenTextures(1, &t.texture);
     glBindTexture(GL_TEXTURE_2D, t.texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, initial);
+    // 258×258 storage; interior 256×256 sits at texels [kApron..kApron+255]
+    // and the outer ring is the apron filled lazily from neighbors.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileTexSize, kTileTexSize, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1793,14 +1993,110 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
         LOGE("tile (%d, %d) FBO incomplete: 0x%x", tx, ty, status);
     }
 
-    if (!initial) {
-        glViewport(0, 0, kTileSize, kTileSize);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // transparent — premultiplied
-        glClear(GL_COLOR_BUFFER_BIT);
+    // Always clear the full 258×258 to transparent first (covers both
+    // the interior on the no-initial path AND the apron in either case).
+    glViewport(0, 0, kTileTexSize, kTileTexSize);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);   // transparent — premultiplied
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (initial) {
+        // Upload the 256×256 of interior bytes into texels [kApron..kApron+255].
+        glBindTexture(GL_TEXTURE_2D, t.texture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, kApron, kApron,
+                        kTileSize, kTileSize,
+                        GL_RGBA, GL_UNSIGNED_BYTE, initial);
     }
 
     layer.tiles[k] = t;
     return layer.tiles[k];
+}
+
+// Mark this tile's apron stale, plus all 8 surrounding tiles' aprons
+// (neighbors' aprons hold copies of this tile's edge data, so a change
+// here invalidates them too). Cheap — flag flips, no GL work.
+void markApronStaleAround(Layer& layer, int tx, int ty) {
+    static const int dx[9] = { -1, 0, 1, -1, 0, 1, -1, 0, 1 };
+    static const int dy[9] = { -1, -1, -1, 0, 0, 0, 1, 1, 1 };
+    for (int i = 0; i < 9; ++i) {
+        auto it = layer.tiles.find(tileKey(tx + dx[i], ty + dy[i]));
+        if (it != layer.tiles.end()) it->second.apronStale = true;
+    }
+}
+
+// Pull edge data from existing neighbors into this tile's apron. No-op
+// for sides where there is no neighbor — the apron stays zeroed
+// (transparent), which is the right behavior at the canvas edge: LINEAR
+// composite samples blend the interior edge texel with transparent,
+// fading the stroke out smoothly rather than producing a hard step.
+void syncTileApron(Layer& layer, int tx, int ty) {
+    auto it = layer.tiles.find(tileKey(tx, ty));
+    if (it == layer.tiles.end()) return;
+    Tile& t = it->second;
+    if (!t.apronStale) return;
+
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    glBindTexture(GL_TEXTURE_2D, t.texture);
+
+    // Static zero buffer big enough for one tile-edge worth of pixels —
+    // used to clear an apron strip when there's no neighbor on that
+    // side. (Small allocation, kept static.)
+    static const std::vector<uint8_t> zeros(
+        static_cast<size_t>(kTileSize) * 4, 0);
+
+    auto copyFromNeighbor = [&](int nx, int ny,
+                                int srcX, int srcY,
+                                int dstX, int dstY,
+                                int w,    int h) {
+        auto nIt = layer.tiles.find(tileKey(nx, ny));
+        if (nIt != layer.tiles.end()) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, nIt->second.fbo);
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dstX, dstY, srcX, srcY, w, h);
+        } else {
+            // No neighbor — clear that apron strip to transparent so a
+            // recently-deleted neighbor's stale data doesn't linger
+            // (and so freshly-rendered canvas-edge tiles fade out
+            // smoothly under LINEAR sampling instead of stepping).
+            glTexSubImage2D(GL_TEXTURE_2D, 0, dstX, dstY, w, h,
+                            GL_RGBA, GL_UNSIGNED_BYTE, zeros.data());
+        }
+    };
+
+    // Sides — `kApron` is the offset of "interior origin", and
+    // `kApron+kTileSize-1` (== kTileSize) is the rightmost / bottom
+    // interior texel. Neighbors copy their opposite-side edge column
+    // (or row) into our matching apron strip.
+    const int last = kApron + kTileSize - 1;            // rightmost / bottom interior texel
+    const int aprL = 0;                                 // left apron column
+    const int aprR = kTileTexSize - 1;                  // right apron column
+    const int aprT = 0;                                 // top apron row
+    const int aprB = kTileTexSize - 1;                  // bottom apron row
+
+    // Left neighbor: its rightmost interior column → our left apron column.
+    copyFromNeighbor(tx - 1, ty, /*src*/ last, kApron,
+                     /*dst*/ aprL, kApron,
+                     /*w*/ 1, /*h*/ kTileSize);
+    // Right neighbor: its leftmost interior column → our right apron column.
+    copyFromNeighbor(tx + 1, ty, /*src*/ kApron, kApron,
+                     /*dst*/ aprR, kApron,
+                     /*w*/ 1, /*h*/ kTileSize);
+    // Top neighbor: its bottom interior row → our top apron row.
+    copyFromNeighbor(tx, ty - 1, /*src*/ kApron, last,
+                     /*dst*/ kApron, aprT,
+                     /*w*/ kTileSize, /*h*/ 1);
+    // Bottom neighbor: its top interior row → our bottom apron row.
+    copyFromNeighbor(tx, ty + 1, /*src*/ kApron, kApron,
+                     /*dst*/ kApron, aprB,
+                     /*w*/ kTileSize, /*h*/ 1);
+
+    // Diagonal corners: each is a single 1×1 pixel from the
+    // diagonally-adjacent tile's far interior corner.
+    copyFromNeighbor(tx - 1, ty - 1, last,   last,   aprL, aprT, 1, 1);
+    copyFromNeighbor(tx + 1, ty - 1, kApron, last,   aprR, aprT, 1, 1);
+    copyFromNeighbor(tx - 1, ty + 1, last,   kApron, aprL, aprB, 1, 1);
+    copyFromNeighbor(tx + 1, ty + 1, kApron, kApron, aprR, aprB, 1, 1);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    t.apronStale = false;
 }
 
 // Snapshot every tile in the inclusive bbox (tx0..tx1, ty0..ty1) of the
@@ -1825,7 +2121,7 @@ void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
                 snap.existed = true;
                 snap.bytes.resize(kTileBytes);
                 glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-                glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+                glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
                              snap.bytes.data());
             }
             out.push_back(std::move(snap));
@@ -1849,7 +2145,7 @@ void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out) {
         snap.existed = true;
         snap.bytes.resize(kTileBytes);
         glBindFramebuffer(GL_FRAMEBUFFER, kv.second.fbo);
-        glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+        glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
                      snap.bytes.data());
         out.push_back(std::move(snap));
     }
@@ -1872,10 +2168,14 @@ void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     Tile& tile = getOrCreateTile(layer, tx, ty);
     glBindTexture(GL_TEXTURE_2D, tile.texture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kTileSize, kTileSize,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, kApron, kApron, kTileSize, kTileSize,
                     GL_RGBA, GL_UNSIGNED_BYTE, bytes);
     glBindTexture(GL_TEXTURE_2D, 0);
     saveTileToDisk(layerIdx, tileKey(tx, ty));
+    // Tile content changed — its 8 neighbors hold copies of its old
+    // edge data in their aprons, so flag them (and self) for resync
+    // before next composite.
+    markApronStaleAround(layer, tx, ty);
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 }
 
@@ -1900,6 +2200,10 @@ void deleteTileIfExists(size_t layerIdx, int tx, int ty) {
     if (it->second.fbo)     glDeleteFramebuffers(1, &it->second.fbo);
     if (it->second.texture) glDeleteTextures(1, &it->second.texture);
     layer.tiles.erase(it);
+    // Neighbors' aprons hold copies of this tile's edge data. Mark
+    // them stale so the next composite pulls in zero (no-neighbor)
+    // for those sides instead of leaving the deleted content behind.
+    markApronStaleAround(layer, tx, ty);
     if (!g_docDir.empty()) {
         std::string p = activeLayerDir(layerIdx)
                       + "/tile_" + std::to_string(tx)
@@ -1956,6 +2260,313 @@ void deleteLayerDirIfExists(size_t layerIdx) {
     }
     closedir(d);
     rmdir(layerDir.c_str());
+}
+
+// Free GL resources owned by a layer's raster tiles. Vector layers have
+// no GPU state, so this is a no-op for them. Caller is responsible for
+// removing the Layer from the page's vector afterward.
+void freeLayerGLResources(Layer& layer) {
+    for (auto& kv : layer.tiles) {
+        if (kv.second.fbo)     glDeleteFramebuffers(1, &kv.second.fbo);
+        if (kv.second.texture) glDeleteTextures(1, &kv.second.texture);
+    }
+    layer.tiles.clear();
+}
+
+// Delete the layer at `idx` on the active page. No-op if there's only one
+// layer left (the document needs at least one). Frees GL resources, wipes
+// the on-disk dir, renumbers the trailing layer dirs to keep them
+// 0..N-1 contiguous, and adjusts the active-layer index. Selection is
+// canceled because its layer index is about to shift.
+//
+// Undo stack is cleared: every UndoEntry references a layer by index, and
+// shifting indices would silently corrupt them. Same policy as page ops.
+void deleteLayerImpl(size_t idx) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx >= ls.size() || !ls[idx]) return;
+    if (ls.size() <= 1) {
+        LOGI("delete layer %zu refused — last layer", idx);
+        return;
+    }
+
+    cancelRasterSelectionImpl();
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+
+    freeLayerGLResources(*ls[idx]);
+    deleteLayerDirIfExists(idx);
+
+    ls.erase(ls.begin() + static_cast<ptrdiff_t>(idx));
+
+    // Renumber trailing layer dirs so they stay 0..N-1. Each rename moves
+    // every file under that dir, so the cost is O(remaining-layers * dir
+    // contents) — fine for the layer counts we care about (<20).
+    if (!g_docDir.empty()) {
+        std::string pageDir = pageDirOf(g_activePageIdx);
+        for (size_t j = idx; j < ls.size(); ++j) {
+            std::string oldDir = pageDir + "/layer_" + std::to_string(j + 1);
+            std::string newDir = pageDir + "/layer_" + std::to_string(j);
+            struct stat st;
+            if (stat(oldDir.c_str(), &st) == 0) {
+                rename(oldDir.c_str(), newDir.c_str());
+            }
+        }
+    }
+
+    size_t& active = g_pages[g_activePageIdx]->activeLayer;
+    if (active == idx) {
+        // Prefer the layer that took the deleted index's spot; fall back
+        // to the new last layer if we deleted the top.
+        active = std::min(idx, ls.size() - 1);
+    } else if (active > idx) {
+        --active;
+    }
+
+    LOGI("layer %zu deleted (count=%zu, active=%zu)",
+         idx, ls.size(), active);
+}
+
+// Move the layer at `from` to position `to` on the active page. Both the
+// in-memory vector and on-disk layer_<n> dirs are reordered; the layer's
+// content (tiles / shapes) is preserved unchanged. Selection is canceled
+// and the undo stack is cleared because both reference layers by index.
+void moveLayerImpl(size_t from, size_t to) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (from >= ls.size() || to >= ls.size() || from == to) return;
+    if (!ls[from]) return;
+
+    cancelRasterSelectionImpl();
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+
+    // Reorder in-memory: erase + insert keeps the unique_ptrs intact so
+    // GL textures and tile maps move with their layer.
+    auto holder = std::move(ls[from]);
+    ls.erase(ls.begin() + static_cast<ptrdiff_t>(from));
+    ls.insert(ls.begin() + static_cast<ptrdiff_t>(to), std::move(holder));
+
+    // Reorder on disk via temp staging. Rename the moving layer aside,
+    // shift the in-between dirs into the slot it just vacated, then
+    // rename the staged dir into its final position. Same approach as
+    // moving an array element in place but at the filesystem level.
+    if (!g_docDir.empty()) {
+        std::string pageDir = pageDirOf(g_activePageIdx);
+        std::string staged = pageDir + "/layer_tmp_move";
+        std::string fromDir = pageDir + "/layer_" + std::to_string(from);
+        struct stat st;
+        if (stat(fromDir.c_str(), &st) == 0) {
+            rename(fromDir.c_str(), staged.c_str());
+        }
+        if (from < to) {
+            // Shift layer_{from+1..to} down by one.
+            for (size_t j = from; j < to; ++j) {
+                std::string oldDir = pageDir + "/layer_" + std::to_string(j + 1);
+                std::string newDir = pageDir + "/layer_" + std::to_string(j);
+                if (stat(oldDir.c_str(), &st) == 0) {
+                    rename(oldDir.c_str(), newDir.c_str());
+                }
+            }
+        } else {
+            // Shift layer_{to..from-1} up by one. Iterate top-down so we
+            // don't clobber a target slot that's still occupied.
+            for (size_t j = from; j > to; --j) {
+                std::string oldDir = pageDir + "/layer_" + std::to_string(j - 1);
+                std::string newDir = pageDir + "/layer_" + std::to_string(j);
+                if (stat(oldDir.c_str(), &st) == 0) {
+                    rename(oldDir.c_str(), newDir.c_str());
+                }
+            }
+        }
+        std::string toDir = pageDir + "/layer_" + std::to_string(to);
+        if (stat(staged.c_str(), &st) == 0) {
+            rename(staged.c_str(), toDir.c_str());
+        }
+    }
+
+    size_t& active = g_pages[g_activePageIdx]->activeLayer;
+    if (active == from) {
+        active = to;
+    } else if (from < to && active > from && active <= to) {
+        --active;
+    } else if (to < from && active >= to && active < from) {
+        ++active;
+    }
+
+    LOGI("layer moved %zu->%zu (count=%zu, active=%zu)",
+         from, to, ls.size(), active);
+}
+
+// Recursively wipe a page dir (`<docDir>/page_<idx>/`). Walks two levels
+// because the layout is shallow: page_<idx>/layer_<m>/<files>. No-op if
+// the dir doesn't exist.
+void deletePageDirIfExists(size_t pageIdx) {
+    if (g_docDir.empty()) return;
+    std::string pageDir = pageDirOf(pageIdx);
+    DIR* d = opendir(pageDir.c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        const char* n = e->d_name;
+        if (n[0] == '.') continue;
+        std::string sub = pageDir + "/" + n;
+        // page_*/ contents are layer_*/ dirs (plus possibly stray files).
+        DIR* d2 = opendir(sub.c_str());
+        if (d2) {
+            struct dirent* e2;
+            while ((e2 = readdir(d2)) != nullptr) {
+                const char* n2 = e2->d_name;
+                if (n2[0] == '.') continue;
+                std::string p = sub + "/" + n2;
+                unlink(p.c_str());
+            }
+            closedir(d2);
+            rmdir(sub.c_str());
+        } else {
+            unlink(sub.c_str());
+        }
+    }
+    closedir(d);
+    rmdir(pageDir.c_str());
+}
+
+// Free GL resources owned by every layer on a page. Called before the
+// Page is removed from g_pages (delete) or never — moves preserve
+// resources by transferring the unique_ptr.
+void freePageGLResources(Page& page) {
+    for (auto& layer : page.layers) {
+        if (!layer) continue;
+        freeLayerGLResources(*layer);
+    }
+}
+
+// Delete the page at `idx`. No-op if there's only one page left (the
+// document needs at least one). Frees GL resources, wipes the on-disk
+// dir, renumbers trailing page dirs to keep them 0..N-1 contiguous, and
+// adjusts g_activePageIdx. Selection and undo are wiped because both
+// reference indices that are about to shift.
+void deletePageImpl(size_t idx) {
+    if (idx >= g_pages.size() || !g_pages[idx]) return;
+    if (g_pages.size() <= 1) {
+        LOGI("delete page %zu refused — last page", idx);
+        return;
+    }
+
+    cancelRasterSelectionImpl();
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+
+    freePageGLResources(*g_pages[idx]);
+    deletePageDirIfExists(idx);
+
+    g_pages.erase(g_pages.begin() + static_cast<ptrdiff_t>(idx));
+
+    // Renumber trailing page dirs.
+    if (!g_docDir.empty()) {
+        for (size_t j = idx; j < g_pages.size(); ++j) {
+            std::string oldDir = g_docDir + "/page_" + std::to_string(j + 1);
+            std::string newDir = g_docDir + "/page_" + std::to_string(j);
+            struct stat st;
+            if (stat(oldDir.c_str(), &st) == 0) {
+                rename(oldDir.c_str(), newDir.c_str());
+            }
+        }
+    }
+
+    if (g_activePageIdx == idx) {
+        g_activePageIdx = std::min(idx, g_pages.size() - 1);
+    } else if (g_activePageIdx > idx) {
+        --g_activePageIdx;
+    }
+
+    LOGI("page %zu deleted (count=%zu, active=%zu)",
+         idx, g_pages.size(), g_activePageIdx);
+}
+
+// Move the page at `from` to position `to`. Both the in-memory Page
+// vector and on-disk page_<n>/ dirs are reordered; per-page contents
+// are preserved. Selection and undo are cleared.
+void movePageImpl(size_t from, size_t to) {
+    if (from >= g_pages.size() || to >= g_pages.size() || from == to) return;
+    if (!g_pages[from]) return;
+
+    cancelRasterSelectionImpl();
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+
+    auto holder = std::move(g_pages[from]);
+    g_pages.erase(g_pages.begin() + static_cast<ptrdiff_t>(from));
+    g_pages.insert(g_pages.begin() + static_cast<ptrdiff_t>(to), std::move(holder));
+
+    if (!g_docDir.empty()) {
+        std::string staged = g_docDir + "/page_tmp_move";
+        std::string fromDir = g_docDir + "/page_" + std::to_string(from);
+        struct stat st;
+        if (stat(fromDir.c_str(), &st) == 0) {
+            rename(fromDir.c_str(), staged.c_str());
+        }
+        if (from < to) {
+            for (size_t j = from; j < to; ++j) {
+                std::string oldDir = g_docDir + "/page_" + std::to_string(j + 1);
+                std::string newDir = g_docDir + "/page_" + std::to_string(j);
+                if (stat(oldDir.c_str(), &st) == 0) {
+                    rename(oldDir.c_str(), newDir.c_str());
+                }
+            }
+        } else {
+            for (size_t j = from; j > to; --j) {
+                std::string oldDir = g_docDir + "/page_" + std::to_string(j - 1);
+                std::string newDir = g_docDir + "/page_" + std::to_string(j);
+                if (stat(oldDir.c_str(), &st) == 0) {
+                    rename(oldDir.c_str(), newDir.c_str());
+                }
+            }
+        }
+        std::string toDir = g_docDir + "/page_" + std::to_string(to);
+        if (stat(staged.c_str(), &st) == 0) {
+            rename(staged.c_str(), toDir.c_str());
+        }
+    }
+
+    if (g_activePageIdx == from) {
+        g_activePageIdx = to;
+    } else if (from < to && g_activePageIdx > from && g_activePageIdx <= to) {
+        --g_activePageIdx;
+    } else if (to < from && g_activePageIdx >= to && g_activePageIdx < from) {
+        ++g_activePageIdx;
+    }
+
+    LOGI("page moved %zu->%zu (count=%zu, active=%zu)",
+         from, to, g_pages.size(), g_activePageIdx);
 }
 
 // ---- Persistence ---------------------------------------------------------
@@ -2109,6 +2720,50 @@ void loadPageLayersFromDisk(size_t pageIdx, Page& page) {
         } else {
             layer.type = LayerType::Raster;
             loadTilesIntoLayer(layer, dirPath);
+        }
+        // Optional layer-hidden flag. Presence = layer is hidden in
+        // the composite. Absence (the default) = visible. Atomic
+        // because the compositor reads it on the GL thread while the
+        // UI thread can flip it from setLayerVisible.
+        std::string hiddenPath = dirPath + "/hidden.flag";
+        struct stat hst;
+        layer.visible.store(stat(hiddenPath.c_str(), &hst) != 0,
+                            std::memory_order_relaxed);
+
+        // Optional opacity. Plain text "0.0".."1.0"; absence = 1.0.
+        std::string opacityPath = dirPath + "/opacity.txt";
+        if (FILE* f = std::fopen(opacityPath.c_str(), "rb")) {
+            char buf[32] = {};
+            size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+            std::fclose(f);
+            if (n > 0) {
+                float o = std::strtof(buf, nullptr);
+                if (o >= 0.0f && o <= 1.0f) {
+                    layer.opacity.store(o, std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // Optional user-set name. Absence = no custom name (UI shows
+        // a default like "layer N" / "vector N").
+        std::string namePath = dirPath + "/name.txt";
+        if (FILE* f = std::fopen(namePath.c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            long sz = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (sz > 0 && sz < 1024) {
+                std::string buf(static_cast<size_t>(sz), '\0');
+                if (std::fread(buf.data(), 1, sz, f) == static_cast<size_t>(sz)) {
+                    // Trim trailing whitespace (newlines from manual edits).
+                    while (!buf.empty() && (buf.back() == '\n' || buf.back() == '\r'
+                                         || buf.back() == ' '  || buf.back() == '\t')) {
+                        buf.pop_back();
+                    }
+                    std::lock_guard<std::mutex> lock(g_layerNameMutex);
+                    layer.name = std::move(buf);
+                }
+            }
+            std::fclose(f);
         }
     }
 }
@@ -2419,7 +3074,7 @@ void saveTileToDisk(size_t layerIdx, int64_t tileK) {
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
     std::vector<uint8_t> buf(kTileBytes);
-    glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+    glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
                  buf.data());
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 
@@ -2465,6 +3120,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     glBindVertexArray(g_quadVao);
     glUniformMatrix4fv(g_dab.uTransform, 1, GL_FALSE, kIdentity);
     glUniform2f(g_dab.uScreen, kTileSizeF, kTileSizeF);
+    glUniform1f(g_dab.uHardness, g_strokeBrushHardness);
 
     if (g_strokeTool == 0) {
         // Brush: additive premultiplied.
@@ -2474,8 +3130,13 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
         // Eraser: subtract coverage. Tile alpha (and rgb) get scaled by
         // (1 - srcAlpha), so painted pixels go transparent and the
         // multi-buffer's paper-white shows through during composite.
+        // Reuse g_strokeBrushAlpha for the per-dab strength so the
+        // opacity slider drives "how much to erase" the same way it
+        // drives brush opacity (the dab-accumulation curve is the
+        // same shape for building up paint and tearing it down).
         glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
-        glUniform4fv(g_dab.uColor, 1, kEraserBakeColor);
+        float eraserColor[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
+        glUniform4fv(g_dab.uColor, 1, eraserColor);
     }
 
     // Page bounds (doc-px) treat the canvas as a fixed-size sheet:
@@ -2522,7 +3183,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
 
             Tile& tile = getOrCreateTile(layer, tx, ty);
             glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
-            glViewport(0, 0, kTileSize, kTileSize);
+            glViewport(kApron, kApron, kTileSize, kTileSize);
 
             float ox = tx * kTileSizeF;
             float oy = ty * kTileSizeF;
@@ -2557,6 +3218,9 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
             }
 
             if (dirtyOut) dirtyOut->push_back(tileKey(tx, ty));
+            // Tile content changed; flag this tile + its 8 neighbors
+            // for apron resync before the next composite.
+            markApronStaleAround(layer, tx, ty);
         }
     }
 
@@ -2582,10 +3246,42 @@ void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
     glUniform1f(g_comp.uTileHalf, kTileHalfF);
     glUniform1i(g_comp.uTileTex, 0);
     glActiveTexture(GL_TEXTURE0);
+    // Default to fully opaque; per-layer compositors override before
+    // their draw calls and we don't bother resetting on the way out
+    // because the composite program isn't used by any non-layer pass.
+    glUniform1f(g_comp.uOpacity, 1.0f);
 }
 
-void compositeRasterLayer(const Layer& layer) {
-    // Caller must have bound the raster pipeline first.
+void compositeRasterLayer(const Layer& layer, float opacityOverride) {
+    // Caller must have bound the raster pipeline first. opacityOverride
+    // < 0 (the default) means "use the layer's own opacity"; passing
+    // 1.0 forces opaque compositing (used by bucket fill so a partly-
+    // transparent active layer still produces a clean boundary image).
+    float effective = (opacityOverride >= 0.0f)
+        ? opacityOverride
+        : layer.opacity.load(std::memory_order_relaxed);
+    glUniform1f(g_comp.uOpacity, effective);
+
+    // Lazily refresh any tile aprons that have been flagged stale since
+    // the last composite. This guarantees LINEAR sampling at the tile
+    // edges blends into up-to-date neighbor data instead of leaving a
+    // visible seam. Apron sync mutates tile state (apronStale flag and
+    // texture sub-image), so we cast away const; conceptually the
+    // composite is read-only and the apron is just a derived cache.
+    Layer& mut = const_cast<Layer&>(layer);
+    GLint prevReadFbo = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+    for (auto& kv : mut.tiles) {
+        if (!kv.second.apronStale) continue;
+        int tx, ty;
+        unpackTileKey(kv.first, tx, ty);
+        syncTileApron(mut, tx, ty);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+    // syncTileApron leaves GL_TEXTURE_2D bound to whichever tile was
+    // last touched; rebind defensively before the composite loop.
+    glActiveTexture(GL_TEXTURE0);
+
     for (const auto& kv : layer.tiles) {
         int tx, ty;
         unpackTileKey(kv.first, tx, ty);
@@ -3110,6 +3806,8 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     PageClip pageClip = readPageClip();
     uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
                    g_lineProg.uPageActive, pageClip);
+    glUniform1f(g_lineProg.uOpacity,
+                layer.opacity.load(std::memory_order_relaxed));
 
     for (size_t i = 0; i < layer.lines.size(); ++i) {
         const auto& l = layer.lines[i];
@@ -3147,6 +3845,11 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
         }
         drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f, c.color, c.width, 1.0f);
     }
+
+    // Reset opacity so the next non-layer use of the line program
+    // (handles, snap markers, page outline, shape preview) doesn't
+    // inherit this layer's value.
+    glUniform1f(g_lineProg.uOpacity, 1.0f);
 }
 
 void compositeAllLayers(JNIEnv* env, jint width, jint height,
@@ -3228,6 +3931,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
     for (size_t i = 0; i < layers().size(); ++i) {
         const auto& layer = layers()[i];
         if (!layer) continue;
+        if (!layer->visible.load(std::memory_order_relaxed)) continue;
         if (layer->type == LayerType::Raster) {
             compositeRasterLayer(*layer);
         } else { // Vector
@@ -3243,17 +3947,29 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
     // selection was lifted, so this overlay completes the visible image.
     {
         bool   selActive = false;
+        size_t selLayerIdx = 0;
         Obb    selObb{};
         GLuint contentTex = 0;
         {
             std::lock_guard<std::mutex> lock(g_rasterSelMutex);
             if (g_rasterSel.active) {
                 selActive   = true;
+                selLayerIdx = g_rasterSel.layerIdx;
                 selObb      = obbForRasterSelection(g_rasterSel);
                 contentTex  = g_rasterSel.contentTex;
             }
         }
         if (selActive && contentTex != 0) {
+            // Inherit the source layer's opacity so the floating
+            // selection visually matches the rest of its layer (the
+            // tiles around the lift-hole composite at the layer's
+            // opacity, so a 100%-opacity overlay would pop). Bake
+            // (commit drop) sets uOpacity = 1.0 explicitly below.
+            float layerOpacity = 1.0f;
+            if (selLayerIdx < layers().size() && layers()[selLayerIdx]) {
+                layerOpacity = layers()[selLayerIdx]->opacity
+                    .load(std::memory_order_relaxed);
+            }
             // Compute the four placement corners in doc-coords.
             float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
             rotateLocalToWorld(selObb, -selObb.hw, -selObb.hh, c0x, c0y);
@@ -3268,6 +3984,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
             glUniform2f(g_sel.uC1, c1x, c1y);
             glUniform2f(g_sel.uC2, c2x, c2y);
             glUniform2f(g_sel.uC3, c3x, c3y);
+            glUniform1f(g_sel.uOpacity, layerOpacity);
             // Page-clip in doc-coords: matches the dab/line/grid pattern,
             // so the off-page portion is fragment-discarded rather than
             // squashing the geometry.
@@ -3709,14 +4426,16 @@ void applyRedo() {
 
 // ---- Bucket fill ----------------------------------------------------------
 //
-// Composite-source / active-layer-target flood fill bounded by the page
-// rect. Vector shapes on other layers act as boundaries because they
-// appear in the page composite even though they're not on the active
-// layer. Run on the GL thread inside the bucketFillAt JNI.
+// Active-layer-source / active-layer-target flood fill bounded by the
+// page rect. ONLY the active raster layer's content acts as a boundary
+// — vector shapes on sibling layers, strokes on other raster layers,
+// and the page grid are ignored. Run on the GL thread inside the
+// bucketFillAt JNI.
 //
-// Cost is dominated by (1) rendering the full-page composite, (2) reading
-// it back to CPU, (3) the iterative flood. For typical page sizes this is
-// a few hundred ms — the user perceives a brief freeze. Acceptable for v1.
+// Cost is dominated by (1) rendering the active layer at page
+// resolution, (2) reading it back to CPU, (3) the iterative flood. For
+// typical page sizes this is a few hundred ms — the user perceives a
+// brief freeze. Acceptable for v1.
 
 // ---- Raster selection (Phase 1: rectangular, translate-only) -----------
 
@@ -3876,7 +4595,7 @@ bool liftRasterSelectionPolygon(const float* points, size_t nPoints) {
             // Read the entire tile; cheap (one glReadPixels per tile)
             // and avoids partial-row/column glReadPixels arithmetic.
             glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(0, 0, kTileSize, kTileSize,
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
                          GL_RGBA, GL_UNSIGNED_BYTE, tileBytes.data());
 
             // Pre-lift snapshot for undo + cancel restoration.
@@ -4053,24 +4772,28 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
             snap.existed = true;
             snap.bytes.resize(kTileBytes);
             glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(0, 0, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
+            glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
                          snap.bytes.data());
             liftedTiles.push_back(std::move(snap));
 
             // (b) Copy the tile's intersection into the content texture.
+            // Source coords are in tile-local doc-coord space; the
+            // apron offset translates them to FBO coords.
             int srcX = ix0 - tileX0;
             int srcY = iy0 - tileY0;
             int dstX = ix0 - rectIX0;
             int dstY = iy0 - rectIY0;
             glBindTexture(GL_TEXTURE_2D, contentTex);
             glCopyTexSubImage2D(GL_TEXTURE_2D, 0,
-                                dstX, dstY, srcX, srcY, iw, ih);
+                                dstX, dstY,
+                                srcX + kApron, srcY + kApron, iw, ih);
 
-            // (c) Clear the lifted pixels in the source tile.
+            // (c) Clear the lifted pixels in the source tile. Scissor
+            // is in FBO coords, so the apron offset has to be applied.
             glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-            glViewport(0, 0, kTileSize, kTileSize);
+            glViewport(kApron, kApron, kTileSize, kTileSize);
             glEnable(GL_SCISSOR_TEST);
-            glScissor(srcX, srcY, iw, ih);
+            glScissor(srcX + kApron, srcY + kApron, iw, ih);
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT);
             glDisable(GL_SCISSOR_TEST);
@@ -4079,6 +4802,9 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
             // selection doesn't leave the tile and the on-disk file out
             // of sync. The disk save is required by saveTileToDisk's API.
             saveTileToDisk(activeLayer(), tileKey(tx, ty));
+            // Tile content changed (lift cleared the lifted region);
+            // its 8 neighbors' aprons need resync.
+            markApronStaleAround(layer, tx, ty);
         }
     }
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
@@ -4205,7 +4931,7 @@ void commitRasterSelectionImpl() {
                 snap.existed = true;
                 snap.bytes.resize(kTileBytes);
                 glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-                glReadPixels(0, 0, kTileSize, kTileSize,
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
                              GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
             }
             entry.beforeTiles.push_back(std::move(snap));
@@ -4217,8 +4943,10 @@ void commitRasterSelectionImpl() {
         glUseProgram(g_sel.program);
         glBindVertexArray(g_quadVao);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, sel.contentTex);
         glUniform1i(g_sel.uContent, 0);
+        // Bake at full opacity — the layer's opacity is applied at
+        // composite time, so scaling here would double up.
+        glUniform1f(g_sel.uOpacity, 1.0f);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -4237,8 +4965,17 @@ void commitRasterSelectionImpl() {
         for (int ty = ty0; ty <= ty1; ++ty) {
             for (int tx = tx0; tx <= tx1; ++tx) {
                 Tile& tile = getOrCreateTile(layer, tx, ty);
+                // getOrCreateTile silently rebinds GL_TEXTURE_2D to the
+                // new tile's texture when it has to create one (no-op
+                // for existing tiles). Re-bind the source contentTex
+                // inside the loop so the draw samples from the
+                // selection content — not from the destination tile,
+                // which would be a same-texture-as-FBO read whose
+                // result is undefined per spec (and was producing
+                // intermittent all-white tiles on this device).
+                glBindTexture(GL_TEXTURE_2D, sel.contentTex);
                 glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
-                glViewport(0, 0, kTileSize, kTileSize);
+                glViewport(kApron, kApron, kTileSize, kTileSize);
                 float tileX0 = static_cast<float>(tx * kTileSize);
                 float tileY0 = static_cast<float>(ty * kTileSize);
                 glUniform2f(g_sel.uC0, c0x - tileX0, c0y - tileY0);
@@ -4256,6 +4993,9 @@ void commitRasterSelectionImpl() {
                                g_sel.uPageActive, tilePage);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
                 saveTileToDisk(sel.layerIdx, tileKey(tx, ty));
+                // Drop changed this tile's content; mark it + 8
+                // neighbors' aprons stale for resync at next composite.
+                markApronStaleAround(layer, tx, ty);
             }
         }
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -4272,7 +5012,7 @@ void commitRasterSelectionImpl() {
             snap.existed = true;
             snap.bytes.resize(kTileBytes);
             glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(0, 0, kTileSize, kTileSize,
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
                          GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
         }
         entry.afterTiles.push_back(std::move(snap));
@@ -4552,7 +5292,19 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
     jfloatArray jtransform = env->NewFloatArray(16);
     env->SetFloatArrayRegion(jtransform, 0, 16, t);
     auto tCompositeStart = Clock::now();
-    compositeAllLayers(env, pageW, pageH, jtransform);
+    // Bucket fill source = paper-white background + the active raster
+    // layer's tiles ONLY. Vector lines on other layers, raster strokes
+    // on hidden/visible siblings, and the page-grid don't act as fill
+    // boundaries — the user expects the bucket to follow the active
+    // layer's content. Force opacity = 1.0 so a partly-transparent
+    // active layer still produces a clean boundary image.
+    glViewport(0, 0, pageW, pageH);
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    bindRasterCompositePipeline(env, pageW, pageH, jtransform);
+    compositeRasterLayer(layer, /*opacityOverride=*/ 1.0f);
     glFinish();   // ensure render is done before timing the readback
     auto tComposite = Clock::now();
     env->DeleteLocalRef(jtransform);
@@ -4721,6 +5473,17 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
     uint8_t fg = (fillRgb >>  8) & 0xFF;
     uint8_t fb =  fillRgb        & 0xFF;
 
+    // The opacity slider's user-facing value is "target stroke opacity"
+    // — the native side stores the per-dab α derived via the curve
+    // α = 1 - (1 - target)^(1/N). Bucket fill is a single one-shot
+    // application (not a stack of overlapping dabs), so we want the
+    // user's target opacity directly. Invert the curve to recover it.
+    constexpr int kAlphaDabsPerOverlap = 6;
+    float perDabAlpha = currentBrushAlpha();
+    float fillAlpha = 1.0f - std::pow(1.0f - perDabAlpha, kAlphaDabsPerOverlap);
+    if (fillAlpha < 0.0f) fillAlpha = 0.0f;
+    if (fillAlpha > 1.0f) fillAlpha = 1.0f;
+
     GLint prevFbo2 = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo2);
     std::vector<uint8_t> tilePixels(kTileBytes);
@@ -4737,7 +5500,7 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
             before.existed = true;
             before.bytes.resize(kTileBytes);
             glBindFramebuffer(GL_FRAMEBUFFER, existing->second.fbo);
-            glReadPixels(0, 0, kTileSize, kTileSize,
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
                          GL_RGBA, GL_UNSIGNED_BYTE, before.bytes.data());
             std::memcpy(tilePixels.data(), before.bytes.data(), kTileBytes);
         } else {
@@ -4756,12 +5519,27 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
                  || doc_x >= static_cast<int>(page.maxX)) continue;
                 if (!mask[maskRow + (doc_x - static_cast<int>(page.minX))]) continue;
                 size_t off = (static_cast<size_t>(ly) * kTileSize + lx) * 4;
-                // Opaque fill: replace pixel (premultiplied: src.a = 1 means
-                // the destination contribution drops to zero anyway).
-                tilePixels[off + 0] = fr;
-                tilePixels[off + 1] = fg;
-                tilePixels[off + 2] = fb;
-                tilePixels[off + 3] = 255;
+                // Premultiplied "src over dst" using the user's chosen
+                // fill opacity. With α=1 this collapses to a pure
+                // replace (matching the original full-opacity behavior),
+                // and at α<1 the pre-existing tile pixel shows through.
+                float invA = 1.0f - fillAlpha;
+                float sr = fr * fillAlpha;
+                float sg = fg * fillAlpha;
+                float sb = fb * fillAlpha;
+                float sa = 255.0f * fillAlpha;
+                float dr = static_cast<float>(tilePixels[off + 0]);
+                float dg = static_cast<float>(tilePixels[off + 1]);
+                float db = static_cast<float>(tilePixels[off + 2]);
+                float da = static_cast<float>(tilePixels[off + 3]);
+                tilePixels[off + 0] =
+                    static_cast<uint8_t>(std::lround(sr + dr * invA));
+                tilePixels[off + 1] =
+                    static_cast<uint8_t>(std::lround(sg + dg * invA));
+                tilePixels[off + 2] =
+                    static_cast<uint8_t>(std::lround(sb + db * invA));
+                tilePixels[off + 3] =
+                    static_cast<uint8_t>(std::lround(sa + da * invA));
             }
         }
 
@@ -4769,9 +5547,11 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
         // tile state, so it doubles as the after-snapshot bytes.
         Tile& tile = getOrCreateTile(layer, tx, ty);
         glBindTexture(GL_TEXTURE_2D, tile.texture);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kTileSize, kTileSize,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, kApron, kApron, kTileSize, kTileSize,
                         GL_RGBA, GL_UNSIGNED_BYTE, tilePixels.data());
         writeTileBytesToDisk(activeLayer(), tx, ty, tilePixels.data());
+        // Bucket fill changed this tile; flag for apron resync.
+        markApronStaleAround(layer, tx, ty);
 
         TileSnap after;
         after.tx = tx; after.ty = ty;
@@ -4864,6 +5644,30 @@ Java_com_bk_drawing_NativeRenderer_setBrushSize(JNIEnv*, jobject, jfloat scale) 
     uint32_t bits;
     std::memcpy(&bits, &scale, sizeof(bits));
     g_brushSizeScaleBits.store(bits);
+}
+
+// Brush opacity in [0, 1]. Snapshotted at the next beginStroke so a
+// mid-stroke slider change doesn't visibly split a stroke. Affects
+// brush only; the eraser keeps its historical 0.85 strength.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setBrushAlpha(JNIEnv*, jobject, jfloat alpha) {
+    if (!std::isfinite(alpha)) return;
+    float clamped = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+    uint32_t bits;
+    std::memcpy(&bits, &clamped, sizeof(bits));
+    g_brushAlphaBits.store(bits);
+}
+
+// Brush "hardness" in [0, 1]. 0 = full radial gradient (soft), 1 =
+// solid disc (hard). Snapshotted at beginStroke so mid-stroke changes
+// don't split a stroke; affects both brush and eraser dabs.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setBrushHardness(JNIEnv*, jobject, jfloat h) {
+    if (!std::isfinite(h)) return;
+    float clamped = h < 0.0f ? 0.0f : (h > 1.0f ? 1.0f : h);
+    uint32_t bits;
+    std::memcpy(&bits, &clamped, sizeof(bits));
+    g_brushHardnessBits.store(bits);
 }
 
 // Vector tool line width (doc-px). Read at addLine/addRectangle/etc time;
@@ -5029,6 +5833,31 @@ Java_com_bk_drawing_NativeRenderer_clearActiveLayer(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_addVectorLayer(JNIEnv*, jobject) {
     enqueuePendingAction(kActionAddVectorLayer);
+}
+
+// Delete the layer at `idx` on the active page. Queued through the
+// pending-action drain so the GL-resource frees and disk I/O run on the
+// GL thread. The drain refuses if only one layer remains.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_deleteLayer(JNIEnv*, jobject, jint idx) {
+    if (idx < 0) return;
+    g_pendingDeleteLayerIdx.store(idx);
+    enqueuePendingAction(kActionDeleteLayer);
+}
+
+// Move the layer at `fromIdx` to position `toIdx` on the active page.
+// Same queueing rationale as deleteLayer. Last-write-wins on the side
+// channel — caller should serialize moves on its end if it cares.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_moveLayer(JNIEnv*, jobject,
+                                             jint fromIdx, jint toIdx) {
+    if (fromIdx < 0 || toIdx < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingMoveLayerMutex);
+        g_pendingMoveLayerFrom = fromIdx;
+        g_pendingMoveLayerTo   = toIdx;
+    }
+    enqueuePendingAction(kActionMoveLayer);
 }
 
 // Undo / redo are queued through the same pending-action path so the
@@ -5922,10 +6751,17 @@ Java_com_bk_drawing_NativeRenderer_renderLassoPathPreview(
     }
     std::vector<float> pts(static_cast<size_t>(len));
     env->GetFloatArrayRegion(jpoints, 0, len, pts.data());
-    uint32_t rgb = g_currentBrushColor.load();
+    // Marquee/lasso preview is selection chrome, not user content —
+    // render as a thin black hairline regardless of brush color or
+    // vector line-width. Width is taken in view-pixels (then converted
+    // back to doc-px) so the outline stays the same visual thickness
+    // across pan/zoom.
+    constexpr uint32_t kMarqueeColor = 0x000000u;
+    constexpr float    kMarqueeWidthVpx = 1.5f;
+    float widthDoc = kMarqueeWidthVpx / currentViewScale();
     renderLassoPathToFront(env, width, height, transform,
                            pts.data(), static_cast<size_t>(len) / 2,
-                           rgb, currentVectorLineWidth(), /*alpha=*/0.7f,
+                           kMarqueeColor, widthDoc, /*alpha=*/0.85f,
                            closed == JNI_TRUE);
 }
 
@@ -6000,6 +6836,135 @@ Java_com_bk_drawing_NativeRenderer_getActiveLayer(JNIEnv*, jobject) {
     return static_cast<jint>(g_pages[g_activePageIdx]->activeLayer);
 }
 
+// Layer type at the given index on the active page. 0 = raster, 1 =
+// vector. Returns 0 if the index is out of range.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getLayerType(JNIEnv*, jobject, jint idx) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return 0;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return 0;
+    return ls[idx]->type == LayerType::Vector ? 1 : 0;
+}
+
+// User-set display name for the layer. Empty string = no custom name
+// (caller renders a default). Read-only; writes go through setLayerName.
+JNIEXPORT jstring JNICALL
+Java_com_bk_drawing_NativeRenderer_getLayerName(JNIEnv* env, jobject, jint idx) {
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(g_layerNameMutex);
+        if (!g_pages.empty() && g_activePageIdx < g_pages.size()) {
+            auto& ls = g_pages[g_activePageIdx]->layers;
+            if (idx >= 0 && static_cast<size_t>(idx) < ls.size() && ls[idx]) {
+                name = ls[idx]->name;
+            }
+        }
+    }
+    return env->NewStringUTF(name.c_str());
+}
+
+// Set the user-defined name for the layer at the given index on the
+// active page. Persists immediately to <layerDir>/name.txt; absence of
+// the file means "no custom name". Pass an empty string to clear.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setLayerName(JNIEnv* env, jobject,
+                                                jint idx, jstring jname) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return;
+
+    const char* utf = env->GetStringUTFChars(jname, nullptr);
+    std::string name = utf ? utf : "";
+    if (utf) env->ReleaseStringUTFChars(jname, utf);
+
+    {
+        std::lock_guard<std::mutex> lock(g_layerNameMutex);
+        ls[idx]->name = name;
+    }
+
+    // Persist. Empty name removes the file so absence is canonical.
+    std::string path = activeLayerDir(static_cast<size_t>(idx)) + "/name.txt";
+    if (name.empty()) {
+        std::remove(path.c_str());
+        return;
+    }
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(name.data(), 1, name.size(), f);
+        std::fclose(f);
+    }
+}
+
+// Per-layer visibility. Returns true if visible (default), false if
+// hidden. The compositor reads this every frame so the change takes
+// effect on the next forceRedraw.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_getLayerVisible(JNIEnv*, jobject, jint idx) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return JNI_TRUE;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return JNI_TRUE;
+    return ls[idx]->visible.load(std::memory_order_relaxed) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Toggle the visibility flag and persist it. Hidden state is encoded
+// as the *presence* of <layerDir>/hidden.flag (an empty file). Visible
+// removes the file. Caller should forceRedraw after.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setLayerVisible(JNIEnv*, jobject,
+                                                   jint idx, jboolean visible) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return;
+    bool vis = (visible == JNI_TRUE);
+    ls[idx]->visible.store(vis, std::memory_order_relaxed);
+
+    std::string dir = activeLayerDir(static_cast<size_t>(idx));
+    std::string flagPath = dir + "/hidden.flag";
+    if (vis) {
+        std::remove(flagPath.c_str());
+    } else {
+        // Make sure the layer dir exists — a freshly-added empty
+        // raster layer has no on-disk presence until something gets
+        // baked into it.
+        mkdir(dir.c_str(), 0755);
+        if (FILE* f = std::fopen(flagPath.c_str(), "wb")) std::fclose(f);
+    }
+}
+
+// Per-layer opacity in [0, 1]. 1.0 is the default for layers without
+// a saved override. Caller should forceRedraw after a setLayerOpacity.
+JNIEXPORT jfloat JNICALL
+Java_com_bk_drawing_NativeRenderer_getLayerOpacity(JNIEnv*, jobject, jint idx) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return 1.0f;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return 1.0f;
+    return ls[idx]->opacity.load(std::memory_order_relaxed);
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setLayerOpacity(JNIEnv*, jobject,
+                                                   jint idx, jfloat opacity) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return;
+    float clamped = opacity < 0.0f ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
+    ls[idx]->opacity.store(clamped, std::memory_order_relaxed);
+
+    std::string dir = activeLayerDir(static_cast<size_t>(idx));
+    std::string path = dir + "/opacity.txt";
+    if (clamped >= 0.999f) {
+        // Default — drop the file so the layer dir stays clean.
+        std::remove(path.c_str());
+        return;
+    }
+    mkdir(dir.c_str(), 0755);
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        char buf[16];
+        int n = std::snprintf(buf, sizeof(buf), "%.4f", clamped);
+        if (n > 0) std::fwrite(buf, 1, static_cast<size_t>(n), f);
+        std::fclose(f);
+    }
+}
+
 JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_getPageCount(JNIEnv*, jobject) {
     return static_cast<jint>(g_pages.size());
@@ -6016,6 +6981,30 @@ Java_com_bk_drawing_NativeRenderer_getActivePage(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_addPage(JNIEnv*, jobject) {
     enqueuePendingAction(kActionAddPage);
+}
+
+// Delete the page at `idx`. Queued through the pending-action drain so
+// the GL-resource frees and disk recursion run on the GL thread. Refused
+// by the drain if only one page remains.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_deletePage(JNIEnv*, jobject, jint idx) {
+    if (idx < 0) return;
+    g_pendingDeletePageIdx.store(idx);
+    enqueuePendingAction(kActionDeletePage);
+}
+
+// Move the page at `fromIdx` to `toIdx`. Same queueing rationale as
+// deletePage. Last-write-wins on the side channel.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_movePage(JNIEnv*, jobject,
+                                            jint fromIdx, jint toIdx) {
+    if (fromIdx < 0 || toIdx < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingMovePageMutex);
+        g_pendingMovePageFrom = fromIdx;
+        g_pendingMovePageTo   = toIdx;
+    }
+    enqueuePendingAction(kActionMovePage);
 }
 
 JNIEXPORT void JNICALL
@@ -6153,16 +7142,20 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
 
     g_strokeTarget = activeLayer();
     g_strokeTool   = g_currentTool.load();
-    // Snapshot brush RGB so mid-stroke color changes don't split a stroke.
+    // Snapshot brush RGB + alpha so mid-stroke color/opacity changes
+    // don't split a stroke.
     {
         uint32_t rgb = g_currentBrushColor.load();
         g_strokeBrushColor[0] = ((rgb >> 16) & 0xFFu) / 255.0f;
         g_strokeBrushColor[1] = ((rgb >>  8) & 0xFFu) / 255.0f;
         g_strokeBrushColor[2] = ( rgb        & 0xFFu) / 255.0f;
-        g_strokeBrushColor[3] = kBrushAlpha;
+        g_strokeBrushAlpha    = currentBrushAlpha();
+        g_strokeBrushColor[3] = g_strokeBrushAlpha;
     }
-    // Same idea for the brush size — fix it for the duration of the stroke.
+    // Same idea for the brush size + hardness — fixed for the duration
+    // of the stroke so a mid-stroke slider drag doesn't split it.
     g_strokeBrushSizeScale = currentBrushSizeScale();
+    g_strokeBrushHardness  = currentBrushHardness();
     // Both brush and eraser strokes use the WYSIWYG preview path so that
     // strokes appear under layers-above-active correctly. Defer the
     // setup to first extendStroke (we don't have width/height/transform
@@ -6200,8 +7193,13 @@ static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
     }
 
     // Step 1: accumulate this dab's coverage into g_coverage. RGB is
-    // ignored (kCoverageColor has rgb=0, premultiplied output is (0,0,0,α));
-    // only the alpha is sampled by the preview shader.
+    // ignored (rgb=0; premultiplied output is (0,0,0,α)); only the
+    // alpha is sampled by the preview shader. Alpha must match the
+    // bake so live preview equals post-commit appearance — both
+    // brush and eraser use g_strokeBrushAlpha as the per-dab α (same
+    // dab-accumulation curve drives stroke opacity for paint and for
+    // erasure).
+    float coverageRgba[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
     glBindFramebuffer(GL_FRAMEBUFFER, g_coverage.fbo);
     glViewport(0, 0, width, height);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -6209,7 +7207,8 @@ static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_dab.uTransform, transform);
     glUniform2f(g_dab.uScreen, (float)width, (float)height);
-    glUniform4fv(g_dab.uColor, 1, kCoverageColor);
+    glUniform4fv(g_dab.uColor, 1, coverageRgba);
+    glUniform1f(g_dab.uHardness, g_strokeBrushHardness);
     // Page-clip in doc-pixels: the live preview uses uTransform = doc→buffer
     // and uCenter is in doc-pixels, so the shader's vDocPos is doc-pixels
     // and the page rect goes in unmodified.
@@ -6331,7 +7330,7 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
                     snap.existed = true;
                     snap.bytes.resize(kTileBytes);
                     glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-                    glReadPixels(0, 0, kTileSize, kTileSize,
+                    glReadPixels(kApron, kApron, kTileSize, kTileSize,
                                  GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
                     writeTileBytesToDisk(layerIdx, tx, ty, snap.bytes.data());
                 }

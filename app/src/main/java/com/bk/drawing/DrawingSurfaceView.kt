@@ -478,6 +478,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
     // discarded; checked in onDrawMultiBufferedLayer to skip the bake.
     private var cancelNextCommit = false
 
+    /** Palm-rejection gate. When true, single-pointer touches whose
+     *  tool type isn't STYLUS are swallowed before tool dispatch — i.e.
+     *  no finger/palm-driven strokes, taps, or marquee drags reach the
+     *  active tool. 2-finger gestures (pan/zoom/rotate) still work
+     *  because they have their own pre-dispatch branch. Set from
+     *  MainActivity (persisted in SharedPreferences). */
+    var stylusOnlyDrawing: Boolean = false
+
     private fun anyStylusPointer(event: MotionEvent): Boolean {
         for (i in 0 until event.pointerCount) {
             if (event.getToolType(i) == MotionEvent.TOOL_TYPE_STYLUS) return true
@@ -637,6 +645,11 @@ class DrawingSurfaceView @JvmOverloads constructor(
         if (tt != MotionEvent.TOOL_TYPE_STYLUS && tt != MotionEvent.TOOL_TYPE_FINGER) {
             return super.onTouchEvent(event)
         }
+        // Palm-rejection gate: in stylus-only mode, finger/palm contacts
+        // are consumed but not dispatched. Stylus events fall through.
+        if (stylusOnlyDrawing && tt != MotionEvent.TOOL_TYPE_STYLUS) {
+            return true
+        }
         return when (currentTool) {
             Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
             Tool.BUCKET             -> handleBucketEvent(event)
@@ -701,17 +714,21 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     SelRectMode.DEFINE -> {
                         selRectPreviewX1 = dx
                         selRectPreviewY1 = dy
-                        // Render a rectangle outline on the front buffer
-                        // so the user sees what they're selecting. Reuse
-                        // the existing ShapePreview code path with the
-                        // RECTANGLE shape type (1).
+                        // Render the marquee outline through the same
+                        // thin-black path the lasso uses, so the
+                        // selection chrome reads as system UI rather
+                        // than user content (it shouldn't pick up the
+                        // brush color or the vector-tool line width).
+                        // Construct a 4-point rectangle as a closed
+                        // polyline.
+                        val pts = floatArrayOf(
+                            selRectPreviewX0, selRectPreviewY0,
+                            selRectPreviewX1, selRectPreviewY0,
+                            selRectPreviewX1, selRectPreviewY1,
+                            selRectPreviewX0, selRectPreviewY1
+                        )
                         r.renderFrontBufferedLayer(
-                            StrokeAction.ShapePreview(
-                                shapeType = 1,
-                                x0 = selRectPreviewX0, y0 = selRectPreviewY0,
-                                x1 = selRectPreviewX1, y1 = selRectPreviewY1,
-                                snapped = false
-                            )
+                            StrokeAction.LassoPreview(pts, closed = true)
                         )
                     }
                     SelRectMode.INTERACT -> {

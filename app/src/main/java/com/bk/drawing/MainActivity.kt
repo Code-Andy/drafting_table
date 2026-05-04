@@ -9,6 +9,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -55,6 +56,28 @@ class MainActivity : AppCompatActivity() {
     // ---- Layer panel ----------------------------------------------------
     private lateinit var layerListContainer: LinearLayout
     private lateinit var layerActiveHeading: TextView
+    private lateinit var layerOpacitySlider: SeekBar
+    private lateinit var layerOpacityValue: TextView
+
+    // Layer drag-to-reorder state. dragSourceIdx is the native idx (not
+    // ui position); -1 means not dragging. Other rows are displaced via
+    // translationY as the dragged row passes over their centers.
+    private var dragSourceIdx: Int = -1
+    private var dragSourceView: View? = null
+    private var dragStartRawY: Float = 0f
+    private var dragStartTranslationY: Float = 0f
+    private var dragRowHeightPx: Int = 0
+    private var dragCurrentTargetUiPos: Int = -1
+
+    // Page drag-to-reorder state. Same shape as the layer fields. Page
+    // sidebar layout is top-down with idx 0 at top, so uiPos == pageIdx
+    // and no conversion is needed.
+    private var dragPageSourceIdx: Int = -1
+    private var dragPageSourceView: View? = null
+    private var dragPageStartRawY: Float = 0f
+    private var dragPageStartTranslationY: Float = 0f
+    private var dragPageSlotHeightPx: Int = 0
+    private var dragPageCurrentTargetIdx: Int = -1
     private lateinit var sizeSlider: SeekBar
     private lateinit var sizeSliderLabel: TextView
     private lateinit var sizeValueLabel: TextView
@@ -74,8 +97,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var docsButtonLabel: TextView
     private val pageItems = mutableListOf<PageSidebarItem>()
     private val kSidebarWidthDp   = 84
-    private val kThumbWidthDp     = 60       // matches design (60×78)
-    private val kThumbHeightDp    = 78
+    // Page-thumbnail bounding box. Actual thumbnail dimensions are
+    // derived from the canvas aspect ratio inside thumbDimensions() so
+    // the thumb is always the same shape as the page — no letterboxing.
+    // The design ships portrait (60×78); we honor whichever fit produces
+    // the canvas aspect within these bounds.
+    private val kThumbMaxWidthDp  = 60
+    private val kThumbMaxHeightDp = 78
     private var lastBuiltActivePage = -1
     private var lastBuiltPageCount  = -1
 
@@ -91,6 +119,7 @@ class MainActivity : AppCompatActivity() {
     // ---- App state mirrors ---------------------------------------------
     private var gridState = 0          // 0 = off, 1 = lines, 2 = dots
     private var snapEnabled = true
+    private var stylusOnly  = true
     private var layerCount = 1
     private var activeLayerIndex = 0
     private var currentToolMirror: Tool = Tool.BRUSH
@@ -102,12 +131,29 @@ class MainActivity : AppCompatActivity() {
     // ---- Brush + vector width (single slider routes to the right one) --
     private var brushSizeScale = 1.0f
     private var vectorLineWidth = 2.0f
+    private var brushAlpha = 1.0f
+    private var brushHardness = 1.0f
     private val kPrefBrushSize     = "brush_size_scale"
     private val kPrefVectorWidth   = "vector_line_width"
+    private val kPrefStylusOnly    = "stylus_only"
+    private val kPrefBrushAlpha    = "brush_alpha"
+    private val kPrefBrushHardness = "brush_hardness"
     private val kBrushSizeMin = 0.25f
     private val kBrushSizeMax = 4.0f
     private val kVectorWidthMin = 0.5f
     private val kVectorWidthMax = 16.0f
+    // Brush-alpha mapping: invert the dab-accumulation curve so the
+    // slider position equals target *stroke* opacity (not per-dab α).
+    // A stroke at position (x, y) is roughly N overlapping dabs deep
+    // (kSpacing = 0.18 × radius → ~1/0.18 ≈ 5.5 overlap at the
+    // stroke spine). With per-dab α and premultiplied-over compose,
+    // cumulative coverage = 1 - (1 - α)^N. Inverting:
+    //     α(target) = 1 - (1 - target)^(1/N)
+    // gives a per-dab α whose stroke result matches `target`. So
+    // slider=50 produces a 50%-opaque-looking stroke instead of one
+    // that's nearly identical to 100% (which is what the prior
+    // mappings gave because dab accumulation saturates quickly).
+    private val kAlphaDabsPerOverlap = 6.0
 
     // Preset brush palette — 0xRRGGBB. First entry is the default.
     private val palette = intArrayOf(
@@ -139,13 +185,22 @@ class MainActivity : AppCompatActivity() {
         val docDir = docDirFor(initialDoc).apply { mkdirs() }
         NativeRenderer.setDocumentDir(docDir.absolutePath)
 
-        // Restore brush size + vector width and push to native.
+        // Restore brush size + vector width + opacity and push to native.
         brushSizeScale = prefs().getFloat(kPrefBrushSize, 1.0f)
             .coerceIn(kBrushSizeMin, kBrushSizeMax)
         vectorLineWidth = prefs().getFloat(kPrefVectorWidth, 2.0f)
             .coerceIn(kVectorWidthMin, kVectorWidthMax)
+        brushAlpha = prefs().getFloat(kPrefBrushAlpha, 1.0f)
+            .coerceIn(0.0f, 1.0f)
+        brushHardness = prefs().getFloat(kPrefBrushHardness, 1.0f)
+            .coerceIn(0.0f, 1.0f)
         NativeRenderer.setBrushSize(brushSizeScale)
         NativeRenderer.setVectorLineWidth(vectorLineWidth)
+        NativeRenderer.setBrushAlpha(brushAlpha)
+        NativeRenderer.setBrushHardness(brushHardness)
+        // Palm-rejection mode persists across launches; defaults on so
+        // accidental finger touches don't draw out of the box.
+        stylusOnly = prefs().getBoolean(kPrefStylusOnly, true)
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
@@ -182,6 +237,7 @@ class MainActivity : AppCompatActivity() {
         val canvas = DrawingSurfaceView(this).also { v ->
             v.onToolChanged = { tool -> onToolChanged(tool) }
             v.onThumbnailsUpdated = { onThumbnailsUpdated() }
+            v.stylusOnlyDrawing = stylusOnly
             canvasFrame.addView(
                 v,
                 FrameLayout.LayoutParams(
@@ -324,6 +380,13 @@ class MainActivity : AppCompatActivity() {
         } as ImageView
         rail.addView(gridRailTile)
 
+        // View controls live below the panel toggles, separated by a
+        // rule so they read as their own group (not part of the panel
+        // selectors above).
+        rail.addView(railRule())
+        rail.addView(toolTile(R.drawable.ic_reset_view, "reset view",
+            isToggle = false) { drawingView?.resetView() })
+
         scroll.addView(rail, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -447,6 +510,13 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
 
+        // Active-layer opacity slider, sitting just under the layer list
+        // so it visually belongs to the LAYERS section rather than the
+        // BRUSH section below.
+        panel.addView(buildLayerOpacityRow(),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+
         panel.addView(panelDivider())
 
         // ---- BRUSH section ----
@@ -525,12 +595,10 @@ class MainActivity : AppCompatActivity() {
     /** Re-render the layer list. Called whenever layer state changes. */
     private fun rebuildLayerList() {
         layerListContainer.removeAllViews()
-        // We don't have per-layer name/visibility on the native side yet;
-        // present each layer as "layer N" / "vector N" with the active row
-        // highlighted. The list is in display order (top = highest index).
         // Rows have a fixed height: the active row's MATCH_PARENT sienna
         // left bar would otherwise fight WRAP_CONTENT and inflate the
-        // whole row to fill the panel.
+        // whole row to fill the panel. List is top-down: highest-index
+        // (visually-topmost) layer first.
         for (idx in (layerCount - 1) downTo 0) {
             layerListContainer.addView(buildLayerRow(idx),
                 LinearLayout.LayoutParams(
@@ -540,10 +608,18 @@ class MainActivity : AppCompatActivity() {
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 1.dp))
         }
+        // Sync the opacity slider to whatever the active layer is now.
+        refreshLayerOpacitySlider()
     }
 
     private fun buildLayerRow(idx: Int): View {
-        val isActive = (idx == activeLayerIndex)
+        val isActive  = (idx == activeLayerIndex)
+        val isVector  = NativeRenderer.getLayerType(idx) == 1
+        val isVisible = NativeRenderer.getLayerVisible(idx)
+        val customName = NativeRenderer.getLayerName(idx)
+        val displayName = if (customName.isNotEmpty()) customName
+                          else (if (isVector) "vector ${idx + 1}" else "layer ${idx + 1}")
+
         val row = FrameLayout(this).apply {
             setBackgroundColor(
                 if (isActive) getColor(R.color.paperDeep) else Color.TRANSPARENT)
@@ -560,6 +636,9 @@ class MainActivity : AppCompatActivity() {
                 // a time, so we cycle until we land on idx.
                 while (activeLayerIndex != idx) userCycleLayer()
             }
+            setOnLongClickListener {
+                showRenameLayerDialog(idx); true
+            }
         }
         val rowContent = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -567,18 +646,26 @@ class MainActivity : AppCompatActivity() {
             setPadding(10.dp, 0, 10.dp, 0)
             minimumHeight = 28.dp
         }
-        // Eye icon — visual only for now (no per-layer visibility natively).
+        // Eye icon — toggles layer visibility. Has its own click handler
+        // so taps here don't bubble up to the row's set-active listener.
+        // Hidden layers get a faint tint to read as inactive at a glance.
         val eye = ImageView(this).apply {
-            setImageResource(R.drawable.ic_eye)
-            imageTintList = ColorStateList.valueOf(getColor(R.color.ink))
+            setImageResource(if (isVisible) R.drawable.ic_eye else R.drawable.ic_eye_off)
+            imageTintList = ColorStateList.valueOf(
+                getColor(if (isVisible) R.color.ink else R.color.inkFaint))
             scaleType = ImageView.ScaleType.CENTER_INSIDE
+            isClickable = true; isFocusable = true
+            setOnClickListener {
+                NativeRenderer.setLayerVisible(idx, !isVisible)
+                drawingView?.forceRedraw()
+                rebuildLayerList()
+            }
         }
         rowContent.addView(eye, LinearLayout.LayoutParams(20.dp, 20.dp).apply {
             rightMargin = 8.dp
         })
-        // Name (placeholder labels until layer naming exists natively).
         val name = TextView(this).apply {
-            text = "layer ${idx + 1}"
+            text = displayName
             typeface = if (isActive) fontMonoSemibold ?: Typeface.MONOSPACE
                        else fontMono ?: Typeface.MONOSPACE
             textSize = 11f
@@ -588,10 +675,8 @@ class MainActivity : AppCompatActivity() {
         }
         rowContent.addView(name, LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
-        // Type tag (R / V) — we don't have layer-type on the layer count
-        // mirror, so always show R for Phase 1.
         val tag = TextView(this).apply {
-            text = "R"
+            text = if (isVector) "V" else "R"
             typeface = fontMono ?: Typeface.MONOSPACE
             textSize = 8f
             setTextColor(getColor(R.color.inkFaint))
@@ -601,11 +686,296 @@ class MainActivity : AppCompatActivity() {
         }
         rowContent.addView(tag)
 
+        // Per-row ⋯ overflow → rename / delete (move is via drag handle).
+        // Has its own click handler so taps here don't bubble to the
+        // row's "set active" listener.
+        val rowMore = ImageView(this).apply {
+            setImageResource(R.drawable.ic_more)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            isClickable = true; isFocusable = true
+            setOnClickListener { showLayerRowOverflow(it, idx) }
+        }
+        rowContent.addView(rowMore, LinearLayout.LayoutParams(20.dp, 20.dp).apply {
+            leftMargin = 6.dp
+        })
+
+        // Drag handle for reorder. Captures touch on DOWN and grabs the
+        // row's parent (FrameLayout) so we can translate the entire row
+        // as the user drags. Other rows shift aside in updateDragRowDisplacement.
+        val dragHandle = ImageView(this).apply {
+            setImageResource(R.drawable.ic_drag_handle)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = "drag to reorder"
+            isClickable = true; isFocusable = true
+        }
+        installDragHandleListener(dragHandle, idx, row)
+        rowContent.addView(dragHandle, LinearLayout.LayoutParams(20.dp, 28.dp).apply {
+            leftMargin = 4.dp
+        })
+
         row.addView(rowContent, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.CENTER_VERTICAL))
         return row
+    }
+
+    /** Per-row overflow menu: rename / delete. Reordering is done with the
+     *  drag handle; Delete is disabled when only one layer remains and
+     *  prompts for confirmation otherwise (no undo for layer deletes). */
+    private fun showLayerRowOverflow(anchor: View, idx: Int) {
+        val menu = PopupMenu(this, anchor, Gravity.END)
+        menu.menu.add(0, 0, 0, "Rename…")
+        val delete = menu.menu.add(0, 1, 1, "Delete")
+        delete.isEnabled = layerCount > 1
+        menu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                0 -> showRenameLayerDialog(idx)
+                1 -> confirmDeleteLayer(idx)
+            }
+            true
+        }
+        menu.show()
+    }
+
+    /** Confirm-then-delete a layer. There is no undo for layer ops, so
+     *  the dialog spells that out before the destructive call. */
+    private fun confirmDeleteLayer(idx: Int) {
+        val customName = NativeRenderer.getLayerName(idx)
+        val isVector = NativeRenderer.getLayerType(idx) == 1
+        val displayName = if (customName.isNotEmpty()) customName
+                          else (if (isVector) "vector ${idx + 1}" else "layer ${idx + 1}")
+        AlertDialog.Builder(this)
+            .setTitle("Delete layer")
+            .setMessage("Delete “$displayName”? This can't be undone.")
+            .setPositiveButton("Delete") { _, _ -> userDeleteLayer(idx) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun userDeleteLayer(idx: Int) {
+        if (layerCount <= 1) return
+        NativeRenderer.deleteLayer(idx)
+        drawingView?.forceRedraw()
+        // Native applies the delete on the GL thread next op; sync after a
+        // beat so getLayerCount/getActiveLayer reflect the new state.
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
+    private fun userMoveLayer(from: Int, to: Int) {
+        if (from == to || from < 0 || to < 0
+            || from >= layerCount || to >= layerCount) return
+        NativeRenderer.moveLayer(from, to)
+        drawingView?.forceRedraw()
+        // Active layer index may shift; resync so the highlighted row is
+        // correct after the move lands on the GL thread.
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
+    /** Layer rows render top-to-bottom with the highest idx at the top, so
+     *  ui-position 0 corresponds to native idx (count-1). This pair maps
+     *  between the two so the drag math can stay in ui-position space. */
+    private fun uiPosToIdx(uiPos: Int): Int = (layerCount - 1) - uiPos
+    private fun idxToUiPos(idx: Int): Int   = (layerCount - 1) - idx
+
+    /** Layer rows are interleaved with 1dp dividers in layerListContainer.
+     *  Children at even indices (0, 2, 4, ...) are rows; odd indices are
+     *  dividers. */
+    private fun rowViewAtUiPos(uiPos: Int): View? {
+        if (!::layerListContainer.isInitialized) return null
+        val childIdx = uiPos * 2
+        if (childIdx < 0 || childIdx >= layerListContainer.childCount) return null
+        return layerListContainer.getChildAt(childIdx)
+    }
+
+    /** Bind the drag-to-reorder touch handler onto the handle ImageView for
+     *  the row at native index [idx]. Handles its own touch stream — no
+     *  click listener — so the row's "set active" tap can't fire when the
+     *  user is grabbing the handle. */
+    private fun installDragHandleListener(handle: View, idx: Int, rowView: View) {
+        handle.setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (layerCount <= 1) return@setOnTouchListener false
+                    dragSourceIdx = idx
+                    dragSourceView = rowView
+                    dragStartRawY = ev.rawY
+                    dragStartTranslationY = rowView.translationY
+                    // Row + 1dp divider = the per-slot height we use to
+                    // displace other rows by integer multiples.
+                    dragRowHeightPx = rowView.height + 1.dp
+                    dragCurrentTargetUiPos = idxToUiPos(idx)
+                    // Float the row above the others while dragging.
+                    rowView.elevation = 6.dp.toFloat()
+                    rowView.alpha = 0.95f
+                    // We need parent disallowInterceptTouchEvent so a
+                    // ScrollView ancestor doesn't steal the gesture.
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (dragSourceIdx != idx || dragSourceView !== rowView) {
+                        return@setOnTouchListener false
+                    }
+                    val dy = ev.rawY - dragStartRawY
+                    rowView.translationY = dragStartTranslationY + dy
+                    updateDragRowDisplacement(rowView)
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (dragSourceIdx != idx || dragSourceView !== rowView) {
+                        return@setOnTouchListener false
+                    }
+                    val targetUiPos = dragCurrentTargetUiPos
+                    val sourceIdx = dragSourceIdx
+                    // Reset visual state for every row before either
+                    // committing the move (which rebuilds the list) or
+                    // bouncing back.
+                    rowView.elevation = 0f
+                    rowView.alpha = 1.0f
+                    rowView.translationY = 0f
+                    resetAllRowDisplacements()
+                    dragSourceIdx = -1
+                    dragSourceView = null
+                    dragCurrentTargetUiPos = -1
+
+                    val sourceUiPos = idxToUiPos(sourceIdx)
+                    if (targetUiPos in 0 until layerCount && targetUiPos != sourceUiPos) {
+                        val targetIdx = uiPosToIdx(targetUiPos)
+                        userMoveLayer(sourceIdx, targetIdx)
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    /** While the user drags [draggedRow], shift the other rows so a visual
+     *  insertion gap follows the dragged row. Called on every MOVE event;
+     *  also recomputes [dragCurrentTargetUiPos] (used at UP to choose the
+     *  destination). */
+    private fun updateDragRowDisplacement(draggedRow: View) {
+        val sourceIdx = dragSourceIdx
+        if (sourceIdx < 0) return
+        val sourceUiPos = idxToUiPos(sourceIdx)
+        // Center of the dragged row in container-local coords.
+        val draggedCenter = draggedRow.top + draggedRow.translationY +
+                            draggedRow.height / 2f
+        // Target ui-position: the count of *other* rows whose original
+        // center lies above the dragged center. This is the stable
+        // formulation — independent of which way the user crossed.
+        var newUiPos = 0
+        for (uiPos in 0 until layerCount) {
+            if (uiPos == sourceUiPos) continue
+            val row = rowViewAtUiPos(uiPos) ?: continue
+            val originalCenter = row.top + row.height / 2f
+            if (originalCenter < draggedCenter) newUiPos++
+        }
+        if (newUiPos == dragCurrentTargetUiPos) return
+        dragCurrentTargetUiPos = newUiPos
+        // Displace other rows so a gap opens at newUiPos. A row's *display*
+        // ui-position after a hypothetical commit determines its translation.
+        for (uiPos in 0 until layerCount) {
+            if (uiPos == sourceUiPos) continue
+            val row = rowViewAtUiPos(uiPos) ?: continue
+            val displayedUiPos = when {
+                sourceUiPos < newUiPos ->
+                    if (uiPos in (sourceUiPos + 1)..newUiPos) uiPos - 1 else uiPos
+                sourceUiPos > newUiPos ->
+                    if (uiPos in newUiPos..(sourceUiPos - 1)) uiPos + 1 else uiPos
+                else -> uiPos
+            }
+            val target = ((displayedUiPos - uiPos) * dragRowHeightPx).toFloat()
+            // Animate so the shifts feel smooth instead of teleporting.
+            row.animate().translationY(target).setDuration(120L).start()
+        }
+    }
+
+    /** Clear translationY on every layer row. Called at the end of a drag
+     *  so the visible state matches the (possibly committed) data. */
+    private fun resetAllRowDisplacements() {
+        if (!::layerListContainer.isInitialized) return
+        for (i in 0 until layerListContainer.childCount) {
+            layerListContainer.getChildAt(i).translationY = 0f
+        }
+    }
+
+    /** AlertDialog with an EditText prepopulated with the current layer
+     *  name (or empty if none was set). Empty input clears the custom
+     *  name and reverts to the "layer N" / "vector N" default. */
+    private fun showRenameLayerDialog(idx: Int) {
+        val current = NativeRenderer.getLayerName(idx)
+        val input = android.widget.EditText(this).apply {
+            setText(current)
+            setSelection(current.length)
+            hint = "layer name"
+        }
+        val container = FrameLayout(this).apply {
+            val pad = 16.dp
+            setPadding(pad, 8.dp, pad, 0)
+            addView(input, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Rename layer")
+            .setView(container)
+            .setPositiveButton("OK") { _, _ ->
+                NativeRenderer.setLayerName(idx, input.text.toString().trim())
+                rebuildLayerList()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** "α" slider that always edits the active layer's opacity. The
+     *  slider's progress is in [0, 100]; the value is divided by 100
+     *  before it goes to native. We avoid pushing native writes for
+     *  programmatic progress changes (active-layer-changed sync) by
+     *  gating on the listener's `fromUser` flag. */
+    private fun buildLayerOpacityRow(): View {
+        val label = TextView(this).apply {
+            text = "α"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        layerOpacityValue = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.END
+            text = "100"
+        }
+        layerOpacitySlider = SeekBar(this).apply {
+            max = 100
+            progress = 100
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    layerOpacityValue.text = p.toString()
+                    if (!fromUser) return
+                    NativeRenderer.setLayerOpacity(activeLayerIndex, p / 100f)
+                    drawingView?.forceRedraw()
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        return buildSliderRow(label, layerOpacitySlider, layerOpacityValue)
+    }
+
+    /** Push the native opacity value for the currently-active layer
+     *  into the slider. Called whenever the active layer changes (or
+     *  rebuildLayerList runs) so the slider always reflects the right
+     *  layer. fromUser=false on this programmatic set, so the listener
+     *  won't echo it back to native. */
+    private fun refreshLayerOpacitySlider() {
+        if (!::layerOpacitySlider.isInitialized) return
+        val o = NativeRenderer.getLayerOpacity(activeLayerIndex)
+        layerOpacitySlider.progress = (o * 100f).toInt().coerceIn(0, 100)
     }
 
     private fun buildBrushSection(): View {
@@ -675,17 +1045,95 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(buildSliderRow(sizeSliderLabel, sizeSlider, sizeValueLabel))
 
-        // Disabled stubs — placeholders for future α / smoothing / pressure features.
-        for ((stubLabel, stubVal) in listOf("α" to "100", "smth" to "0.0", "press" to "—")) {
-            container.addView(buildSliderRow(
-                makeStubSliderLabel(stubLabel),
-                makeStubSlider(),
-                makeStubValueLabel(stubVal)
-            ))
-        }
+        // α slider — controls brush opacity. Active for any tool, but
+        // only affects brush strokes (eraser keeps a fixed strength).
+        container.addView(buildBrushAlphaRow())
+
+        // hard slider — radial dab hardness. Replaces the old "smth"
+        // stub. 0 = full radial gradient (smooth dab), 100 = solid
+        // disc (hard dab). Applies to brush + eraser.
+        container.addView(buildBrushHardnessRow())
+
+        // Disabled stub — placeholder for future pressure curve.
+        container.addView(buildSliderRow(
+            makeStubSliderLabel("press"),
+            makeStubSlider(),
+            makeStubValueLabel("—")
+        ))
         // Push the initial value display.
         updateSizeSliderForTool()
         return container
+    }
+
+    private fun buildBrushAlphaRow(): View {
+        val label = TextView(this).apply {
+            text = "α"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        val valueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.END
+            // Initial display matches the initial slider position
+            // (target stroke opacity %), not the per-dab α value.
+            text = brushAlphaToProgress(brushAlpha).toString()
+        }
+        val slider = SeekBar(this).apply {
+            max = 100
+            progress = brushAlphaToProgress(brushAlpha)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    // p is the target stroke opacity (0..100); display
+                    // matches slider position so the user sees what
+                    // they get.
+                    valueLabel.text = p.toString()
+                    if (!fromUser) return
+                    brushAlpha = progressToBrushAlpha(p)
+                    NativeRenderer.setBrushAlpha(brushAlpha)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    prefs().edit().putFloat(kPrefBrushAlpha, brushAlpha).apply()
+                }
+            })
+        }
+        return buildSliderRow(label, slider, valueLabel)
+    }
+
+    private fun buildBrushHardnessRow(): View {
+        val label = TextView(this).apply {
+            text = "hard"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        val valueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.END
+            text = (brushHardness * 100).toInt().toString()
+        }
+        val slider = SeekBar(this).apply {
+            max = 100
+            progress = (brushHardness * 100).toInt().coerceIn(0, 100)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    valueLabel.text = p.toString()
+                    if (!fromUser) return
+                    brushHardness = p / 100f
+                    NativeRenderer.setBrushHardness(brushHardness)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    prefs().edit().putFloat(kPrefBrushHardness, brushHardness).apply()
+                }
+            })
+        }
+        return buildSliderRow(label, slider, valueLabel)
     }
 
     private fun buildSliderRow(label: View, slider: View, valueLabel: View): View {
@@ -917,7 +1365,7 @@ class MainActivity : AppCompatActivity() {
         val box = View(this).apply {
             background = makeDashedFrame()
         }
-        frame.addView(box, FrameLayout.LayoutParams(kThumbWidthDp.dp, 36.dp,
+        frame.addView(box, FrameLayout.LayoutParams(kThumbMaxWidthDp.dp, 36.dp,
             Gravity.CENTER))
         frame.addView(plus, FrameLayout.LayoutParams(20.dp, 20.dp,
             Gravity.CENTER))
@@ -935,15 +1383,33 @@ class MainActivity : AppCompatActivity() {
         return s
     }
 
+    /** Pick the thumbnail bitmap dimensions that match the canvas aspect
+     *  ratio, fit inside the design's max box (60×78 dp). Without this
+     *  we'd letterbox a wide canvas into a portrait thumb and end up
+     *  with gray bars top + bottom. Falls back to the raw maximums when
+     *  the SurfaceView hasn't been laid out yet. */
+    private fun thumbDimensions(): Pair<Int, Int> {
+        val maxW = kThumbMaxWidthDp.dp
+        val maxH = kThumbMaxHeightDp.dp
+        val pageW = drawingView?.width ?: 0
+        val pageH = drawingView?.height ?: 0
+        if (pageW <= 0 || pageH <= 0) return Pair(maxW, maxH)
+        val aspect = pageH.toFloat() / pageW.toFloat()
+        return if (maxW * aspect <= maxH) {
+            Pair(maxW, (maxW * aspect).toInt().coerceAtLeast(1))
+        } else {
+            Pair((maxH / aspect).toInt().coerceAtLeast(1), maxH)
+        }
+    }
+
     private fun createPageSidebarItem(idx: Int, isActive: Boolean): PageSidebarItem {
-        val thumbW = kThumbWidthDp.dp
-        val thumbH = kThumbHeightDp.dp
+        val (thumbW, thumbH) = thumbDimensions()
         val bitmap = Bitmap.createBitmap(thumbW, thumbH, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(Color.WHITE)
 
         val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             isClickable = true; isFocusable = true
             setOnClickListener {
                 NativeRenderer.switchPage(idx)
@@ -977,6 +1443,41 @@ class MainActivity : AppCompatActivity() {
             Gravity.START or Gravity.TOP))
 
         container.addView(frame)
+
+        // Per-thumbnail icons stacked vertically in the dead space to the
+        // right of the thumbnail. Drag handle on top, overflow below;
+        // same idiom as layer rows so gesture vocabulary stays consistent.
+        val iconCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        val dragHandle = ImageView(this).apply {
+            setImageResource(R.drawable.ic_drag_handle)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = "drag to reorder"
+            isClickable = true; isFocusable = true
+        }
+        installPageDragHandleListener(dragHandle, idx, container)
+        iconCol.addView(dragHandle, LinearLayout.LayoutParams(18.dp, 18.dp))
+
+        val pageMore = ImageView(this).apply {
+            setImageResource(R.drawable.ic_more)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = "more"
+            isClickable = true; isFocusable = true
+            setOnClickListener { showPageOverflow(it, idx) }
+        }
+        iconCol.addView(pageMore, LinearLayout.LayoutParams(18.dp, 18.dp).apply {
+            topMargin = 2.dp
+        })
+        container.addView(iconCol, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            leftMargin = 4.dp
+        })
 
         return PageSidebarItem(container, frame, imageView, numberBadge, bitmap, idx)
     }
@@ -1100,18 +1601,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun showOverflowMenu(anchor: View) {
         val menu = PopupMenu(this, anchor, Gravity.END)
-        menu.menu.add("Reset view")
         menu.menu.add("Snap: ${if (snapEnabled) "on" else "off"}")
+        menu.menu.add("Stylus only: ${if (stylusOnly) "on" else "off"}")
         menu.menu.add("Delete selection")
         menu.menu.add("Copy")
         menu.menu.add("Paste")
         menu.setOnMenuItemClickListener { item ->
-            when (item.title.toString()) {
-                "Reset view"        -> drawingView?.resetView()
-                "Delete selection"  -> userDeleteSelection()
-                "Copy"              -> drawingView?.queueCopySelection()
-                "Paste"             -> drawingView?.queuePasteSelection()
-                else -> if (item.title.toString().startsWith("Snap:")) toggleSnap()
+            val title = item.title.toString()
+            when {
+                title == "Delete selection"       -> userDeleteSelection()
+                title == "Copy"                   -> drawingView?.queueCopySelection()
+                title == "Paste"                  -> drawingView?.queuePasteSelection()
+                title.startsWith("Snap:")         -> toggleSnap()
+                title.startsWith("Stylus only:")  -> toggleStylusOnly()
             }
             true
         }
@@ -1139,12 +1641,14 @@ class MainActivity : AppCompatActivity() {
             menu.menu.add(if (name == currentDocName) "• $name" else "  $name")
         }
         menu.menu.add("+ New document")
+        menu.menu.add("Rename current…")
         menu.menu.add("Delete current")
         menu.setOnMenuItemClickListener { item ->
             val title = item.title.toString()
             when {
-                title == "+ New document" -> userNewDocument()
-                title == "Delete current" -> userDeleteCurrentDocument()
+                title == "+ New document"   -> userNewDocument()
+                title == "Rename current…"  -> showRenameDocDialog()
+                title == "Delete current"   -> userDeleteCurrentDocument()
                 else -> {
                     val name = title.removePrefix("• ").removePrefix("  ").trim()
                     if (name != currentDocName) switchToDocument(name)
@@ -1153,6 +1657,62 @@ class MainActivity : AppCompatActivity() {
             true
         }
         menu.show()
+    }
+
+    /** Rename the currently-open document. Validates non-empty, no
+     *  collision with another doc, and that the underlying directory
+     *  rename succeeds. After rename, points native at the new path
+     *  (without going through loadDocument so undo state survives) and
+     *  refreshes the status bar / sidebar mirrors. */
+    private fun showRenameDocDialog() {
+        val current = currentDocName
+        val input = android.widget.EditText(this).apply {
+            setText(current)
+            setSelection(current.length)
+            hint = "document name"
+        }
+        val container = FrameLayout(this).apply {
+            val pad = 16.dp
+            setPadding(pad, 8.dp, pad, 0)
+            addView(input, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Rename document")
+            .setView(container)
+            .setPositiveButton("OK") { _, _ ->
+                val raw = input.text.toString().trim()
+                if (raw.isEmpty() || raw == current) return@setPositiveButton
+                if (raw in listDocumentNames()) {
+                    android.widget.Toast.makeText(this,
+                        "A document named “$raw” already exists",
+                        android.widget.Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                renameCurrentDocument(raw)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun renameCurrentDocument(newName: String) {
+        val oldDir = docDirFor(currentDocName)
+        val newDir = docDirFor(newName)
+        if (!oldDir.exists() || !oldDir.renameTo(newDir)) {
+            android.widget.Toast.makeText(this,
+                "Couldn't rename document",
+                android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        currentDocName = newName
+        rememberDocName(newName)
+        // Point native I/O at the new path. setDocumentDir is safe to call
+        // mid-session — it just stores the path; the in-memory layer
+        // state stays put, and future tile saves go to the new location.
+        // Avoids the undo-stack reset that loadDocument would trigger.
+        NativeRenderer.setDocumentDir(newDir.absolutePath)
+        if (::statusDocText.isInitialized) statusDocText.text = "doc · $newName"
     }
 
     // ====================================================================
@@ -1206,6 +1766,15 @@ class MainActivity : AppCompatActivity() {
         if (::statusSnapText.isInitialized) {
             statusSnapText.text = if (snapEnabled) "snap: on" else "snap: off"
         }
+    }
+
+    /** Flip palm-rejection mode. Persisted across launches; the view's
+     *  touch dispatcher reads stylusOnlyDrawing every event so the
+     *  change takes effect immediately. */
+    private fun toggleStylusOnly() {
+        stylusOnly = !stylusOnly
+        drawingView?.stylusOnlyDrawing = stylusOnly
+        prefs().edit().putBoolean(kPrefStylusOnly, stylusOnly).apply()
     }
 
     private fun userUndo() {
@@ -1262,6 +1831,22 @@ class MainActivity : AppCompatActivity() {
         (Math.log((w / kVectorWidthMin).toDouble())
             / Math.log((kVectorWidthMax / kVectorWidthMin).toDouble())
             * 100).toInt().coerceIn(0, 100)
+
+    /** Slider position (0..100, target stroke opacity %) → per-dab α. */
+    private fun progressToBrushAlpha(p: Int): Float {
+        if (p >= 100) return 1.0f
+        if (p <= 0)   return 0.0f
+        val target = p / 100.0
+        return (1.0 - Math.pow(1.0 - target, 1.0 / kAlphaDabsPerOverlap)).toFloat()
+    }
+
+    /** Per-dab α → slider position (target stroke opacity %). */
+    private fun brushAlphaToProgress(a: Float): Int {
+        if (a >= 1.0f) return 100
+        if (a <= 0.0f) return 0
+        val target = 1.0 - Math.pow(1.0 - a.toDouble(), kAlphaDabsPerOverlap)
+        return (target * 100).toInt().coerceIn(0, 100)
+    }
 
     // ---- Document I/O ---------------------------------------------------
 
@@ -1340,6 +1925,149 @@ class MainActivity : AppCompatActivity() {
     private fun userAddPage() {
         NativeRenderer.addPage()
         drawingView?.forceRedraw()
+    }
+
+    /** Per-thumbnail overflow menu: just Delete for now. Disabled when
+     *  there's only one page (the document needs at least one). */
+    private fun showPageOverflow(anchor: View, idx: Int) {
+        val menu = PopupMenu(this, anchor, Gravity.END)
+        val delete = menu.menu.add(0, 0, 0, "Delete page")
+        delete.isEnabled = NativeRenderer.getPageCount() > 1
+        menu.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                0 -> confirmDeletePage(idx)
+            }
+            true
+        }
+        menu.show()
+    }
+
+    private fun confirmDeletePage(idx: Int) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete page")
+            .setMessage("Delete page ${idx + 1}? This can't be undone.")
+            .setPositiveButton("Delete") { _, _ -> userDeletePage(idx) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun userDeletePage(idx: Int) {
+        if (NativeRenderer.getPageCount() <= 1) return
+        NativeRenderer.deletePage(idx)
+        drawingView?.forceRedraw()
+        // Native applies the delete on the GL thread next op. Rebuild the
+        // sidebar after a beat so getPageCount/getActivePage reflect the
+        // post-drain state. syncLayerStateFromNative covers the layer
+        // mirror because the active page's layers may differ.
+        drawingView?.postDelayed({
+            rebuildSidebar()
+            syncLayerStateFromNative()
+        }, 60L)
+    }
+
+    private fun userMovePage(from: Int, to: Int) {
+        val count = NativeRenderer.getPageCount()
+        if (from == to || from < 0 || to < 0 || from >= count || to >= count) return
+        NativeRenderer.movePage(from, to)
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({
+            rebuildSidebar()
+            syncLayerStateFromNative()
+        }, 60L)
+    }
+
+    /** Bind the drag-to-reorder touch handler onto the handle ImageView for
+     *  the page item at native [idx]. Same gesture vocabulary as the
+     *  layer panel's handle, but operates on pageItems / sidebarLayout
+     *  for displacement. */
+    private fun installPageDragHandleListener(handle: View, idx: Int, container: View) {
+        handle.setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (NativeRenderer.getPageCount() <= 1) return@setOnTouchListener false
+                    dragPageSourceIdx = idx
+                    dragPageSourceView = container
+                    dragPageStartRawY = ev.rawY
+                    dragPageStartTranslationY = container.translationY
+                    // Slot height = container + topMargin (sidebarItemParams).
+                    dragPageSlotHeightPx = container.height + 6.dp
+                    dragPageCurrentTargetIdx = idx
+                    container.elevation = 6.dp.toFloat()
+                    container.alpha = 0.95f
+                    // Stop the ScrollView ancestor from intercepting the
+                    // gesture mid-drag (it would otherwise grab on
+                    // vertical movement).
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (dragPageSourceIdx != idx || dragPageSourceView !== container) {
+                        return@setOnTouchListener false
+                    }
+                    val dy = ev.rawY - dragPageStartRawY
+                    container.translationY = dragPageStartTranslationY + dy
+                    updatePageDragDisplacement(container)
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (dragPageSourceIdx != idx || dragPageSourceView !== container) {
+                        return@setOnTouchListener false
+                    }
+                    val targetIdx = dragPageCurrentTargetIdx
+                    val sourceIdx = dragPageSourceIdx
+                    container.elevation = 0f
+                    container.alpha = 1.0f
+                    container.translationY = 0f
+                    resetAllPageDisplacements()
+                    dragPageSourceIdx = -1
+                    dragPageSourceView = null
+                    dragPageCurrentTargetIdx = -1
+
+                    val count = NativeRenderer.getPageCount()
+                    if (targetIdx in 0 until count && targetIdx != sourceIdx) {
+                        userMovePage(sourceIdx, targetIdx)
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    /** While a page item is being dragged, shift the other items so a
+     *  visual gap follows the dragged thumb. Called on every MOVE event;
+     *  also updates [dragPageCurrentTargetIdx] (used at UP). Mirrors the
+     *  layer-row version but operates on pageItems where uiPos == idx. */
+    private fun updatePageDragDisplacement(draggedContainer: View) {
+        val sourceIdx = dragPageSourceIdx
+        if (sourceIdx < 0) return
+        val draggedCenter = draggedContainer.top + draggedContainer.translationY +
+                            draggedContainer.height / 2f
+        var newIdx = 0
+        for (item in pageItems) {
+            if (item.pageIdx == sourceIdx) continue
+            val originalCenter = item.container.top + item.container.height / 2f
+            if (originalCenter < draggedCenter) newIdx++
+        }
+        if (newIdx == dragPageCurrentTargetIdx) return
+        dragPageCurrentTargetIdx = newIdx
+        for (item in pageItems) {
+            if (item.pageIdx == sourceIdx) continue
+            val origIdx = item.pageIdx
+            val displayedIdx = when {
+                sourceIdx < newIdx ->
+                    if (origIdx in (sourceIdx + 1)..newIdx) origIdx - 1 else origIdx
+                sourceIdx > newIdx ->
+                    if (origIdx in newIdx..(sourceIdx - 1)) origIdx + 1 else origIdx
+                else -> origIdx
+            }
+            val target = ((displayedIdx - origIdx) * dragPageSlotHeightPx).toFloat()
+            item.container.animate().translationY(target).setDuration(120L).start()
+        }
+    }
+
+    private fun resetAllPageDisplacements() {
+        for (item in pageItems) item.container.translationY = 0f
     }
 
     private fun onThumbnailsUpdated() {

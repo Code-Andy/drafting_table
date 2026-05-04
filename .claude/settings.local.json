@@ -12,7 +12,12 @@
       "Bash(adb logcat *)",
       "Bash(adb devices *)",
       "Bash(adb shell *)",
-      "PowerShell(adb *)"
+      "PowerShell(adb *)",
+      "Bash(adb pull *)",
+      "Bash(zcat /c/Users/ben/.claude/projects/C--Users-ben-Documents-drawing-app/f3fea3b6-9d16-47ba-b629-0ff2947980dc/tool-results/webfetch-1777849768342-bn69yg.bin)",
+      "Bash(/c/Users/ben/.gradle/wrapper/dists/gradle-8.7-bin/bhs2wmbdwecv87pi65oeuq5iu/gradle-8.7/bin/gradle -p /c/Users/ben/Documents/drawing_app installDebug)",
+      "Bash(sed -n '2058,2068p' renderer.cpp)",
+      "Bash(sed -n '5085,5095p' renderer.cpp)"
     ]
   }
 }

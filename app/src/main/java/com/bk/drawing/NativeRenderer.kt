@@ -89,6 +89,20 @@ object NativeRenderer {
     external fun addVectorLayer()
 
     /**
+     * Delete the layer at [idx] on the active page. No-op if only one layer
+     * remains. The undo stack is cleared because indices shift. Safe to
+     * call from any thread; runs on the GL thread on the next operation.
+     */
+    external fun deleteLayer(idx: Int)
+
+    /**
+     * Move the layer at [fromIdx] to position [toIdx] on the active page.
+     * Both indices must be in range. Reorders both the in-memory stack
+     * and the on-disk layer_<n>/ dirs. Clears the undo stack.
+     */
+    external fun moveLayer(fromIdx: Int, toIdx: Int)
+
+    /**
      * Append shapes to the active layer (only effective if the active
      * layer is a vector layer). Color and width follow the current brush
      * color and a fixed line width. Each gesture's (x0, y0, x1, y1)
@@ -215,6 +229,24 @@ object NativeRenderer {
      * so a slider change mid-stroke doesn't visibly split a stroke.
      */
     external fun setBrushSize(scale: Float)
+
+    /**
+     * Brush opacity in [0, 1]. Out-of-range values are clamped;
+     * non-finite values are ignored. Snapshotted at beginStroke so a
+     * mid-stroke change doesn't split a stroke. Affects brush only —
+     * the eraser uses its own historical strength.
+     */
+    external fun setBrushAlpha(alpha: Float)
+
+    /**
+     * Dab hardness in [0, 1] — the radial fraction at which a single
+     * dab becomes fully opaque. 1 = solid disc (hard edge); 0 = full
+     * gradient from opaque center to transparent rim (smooth edge).
+     * Snapshotted at beginStroke; applies to brush and eraser alike
+     * (the same accumulation curve drives both, so the same per-dab
+     * shape is appropriate).
+     */
+    external fun setBrushHardness(hardness: Float)
 
     /**
      * Vector-tool line width in doc-pixels. Captured at the time a shape
@@ -347,6 +379,43 @@ object NativeRenderer {
     external fun getActiveLayer(): Int
 
     /**
+     * Per-layer metadata accessors for the active page.
+     *
+     *  getLayerType: 0 = raster, 1 = vector. Returns 0 for out-of-range
+     *     indices so the UI can fail soft.
+     *  getLayerName: user-set display name, or "" if none. The UI
+     *     should fall back to a default like "layer N" / "vector N".
+     *  setLayerName: store + persist the name. Pass "" to clear.
+     *
+     * Names persist as plain UTF-8 in &lt;layerDir&gt;/name.txt; absence of
+     * the file means "no custom name". Safe to call from any thread.
+     */
+    external fun getLayerType(idx: Int): Int
+    external fun getLayerName(idx: Int): String
+    external fun setLayerName(idx: Int, name: String)
+
+    /**
+     * Per-layer visibility. Hidden layers are skipped by both the main
+     * compositor and the eraser preview's "below" snapshot. Visibility
+     * persists as the *presence* of &lt;layerDir&gt;/hidden.flag (absence
+     * = visible; that's the safe default for layers created before the
+     * feature existed). Caller should forceRedraw() after a setVisible
+     * to make the change appear immediately.
+     */
+    external fun getLayerVisible(idx: Int): Boolean
+    external fun setLayerVisible(idx: Int, visible: Boolean)
+
+    /**
+     * Per-layer opacity in [0, 1]. The composite shaders multiply
+     * their premultiplied output by this scalar. Persisted at
+     * &lt;layerDir&gt;/opacity.txt; absence = 1.0 (the safe default for
+     * layers created before this feature existed). Caller should
+     * forceRedraw() after setLayerOpacity.
+     */
+    external fun getLayerOpacity(idx: Int): Float
+    external fun setLayerOpacity(idx: Int, opacity: Float)
+
+    /**
      * Multi-page document support. Each page has its own independent
      * layer stack and on-disk subdirectory (`page_<idx>/`).
      *
@@ -364,6 +433,22 @@ object NativeRenderer {
     external fun getActivePage(): Int
     external fun addPage()
     external fun switchPage(idx: Int)
+
+    /**
+     * Delete the page at [idx]. No-op if only one page remains. Frees
+     * GL resources for every layer on that page, recursively wipes the
+     * on-disk page_<idx>/ dir, renumbers trailing dirs to keep them
+     * contiguous, and clears undo + selection. Queued through the
+     * pending-action drain.
+     */
+    external fun deletePage(idx: Int)
+
+    /**
+     * Move the page at [fromIdx] to position [toIdx]. Reorders both
+     * the in-memory page vector and the on-disk page_<n>/ dirs.
+     * Per-page contents are preserved. Queued.
+     */
+    external fun movePage(fromIdx: Int, toIdx: Int)
 
     /**
      * Render a thumbnail of the given page into the provided Bitmap
