@@ -850,6 +850,12 @@ inline float currentBrushHardness() {
     return v;
 }
 
+// Bucket-fill bleed: how many extra pixels the fill mask grows outward
+// after flood-fill, to bridge the boundary's anti-aliased gradient. 0
+// means no dilation (fill stops at exact tolerance match); larger
+// values produce a heavier "ink soak" into adjacent edges. UI-tunable.
+std::atomic<int> g_bucketBleedPx{2};
+
 // Brush size scale: a multiplier applied to the per-pressure dab radius.
 // Snapshotted into g_strokeBrushSizeScale at beginStroke so mid-stroke
 // slider changes don't split a stroke. Stored as raw bits in atomic<u32>
@@ -6049,7 +6055,8 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
     // (which we can't avoid: we need the initial outer ring of the
     // mask) and then per-iteration work is proportional to the mask
     // PERIMETER, not its area — typically a 50-100x speedup.
-    constexpr int kDilatePx = 2;
+    int kDilatePx = g_bucketBleedPx.load(std::memory_order_relaxed);
+    if (kDilatePx < 0) kDilatePx = 0;
     if (maskMaxX >= maskMinX) {     // skip when flood marked nothing
         // Restrict the initial-scan area to the mask's bbox plus the
         // dilation distance — any pixel outside that range can't be on
@@ -6370,6 +6377,15 @@ Java_com_bk_drawing_NativeRenderer_setBrushHardness(JNIEnv*, jobject, jfloat h) 
     uint32_t bits;
     std::memcpy(&bits, &clamped, sizeof(bits));
     g_brushHardnessBits.store(bits);
+}
+
+// Bucket-fill bleed in pixels — how much the filled region grows
+// outward past the flood-fill tolerance match. Read at fill time, so
+// the next bucket tap picks up changes immediately.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setBucketBleed(JNIEnv*, jobject, jint px) {
+    int clamped = px < 0 ? 0 : (px > 64 ? 64 : px);
+    g_bucketBleedPx.store(clamped);
 }
 
 // Vector tool line width (doc-px). Read at addLine/addRectangle/etc time;

@@ -90,6 +90,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sizeSlider: SeekBar
     private lateinit var sizeSliderLabel: TextView
     private lateinit var sizeValueLabel: TextView
+    private lateinit var brushSectionHeader: TextView
+    // Per-row refs so updateSizeSliderForTool can hide rows that don't
+    // apply to the active tool (e.g. for BUCKET only alpha is shown).
+    private lateinit var brushSizeRow: View
+    private lateinit var brushAlphaRow: View
+    private lateinit var brushHardRow: View
+    private lateinit var brushPressRow: View
+    private lateinit var bucketBleedRow: View
     private lateinit var colorChip: View
 
     // ---- Status bar -----------------------------------------------------
@@ -142,11 +150,14 @@ class MainActivity : AppCompatActivity() {
     private var vectorLineWidth = 2.0f
     private var brushAlpha = 1.0f
     private var brushHardness = 1.0f
+    private var bucketBleed = 2
+    private val kBucketBleedMax = 16
     private val kPrefBrushSize     = "brush_size_scale"
     private val kPrefVectorWidth   = "vector_line_width"
     private val kPrefStylusOnly    = "stylus_only"
     private val kPrefBrushAlpha    = "brush_alpha"
     private val kPrefBrushHardness = "brush_hardness"
+    private val kPrefBucketBleed   = "bucket_bleed"
     private val kBrushSizeMin = 0.25f
     private val kBrushSizeMax = 4.0f
     private val kVectorWidthMin = 0.5f
@@ -258,10 +269,13 @@ class MainActivity : AppCompatActivity() {
             .coerceIn(0.0f, 1.0f)
         brushHardness = prefs().getFloat(kPrefBrushHardness, 1.0f)
             .coerceIn(0.0f, 1.0f)
+        bucketBleed = prefs().getInt(kPrefBucketBleed, 2)
+            .coerceIn(0, kBucketBleedMax)
         NativeRenderer.setBrushSize(brushSizeScale)
         NativeRenderer.setVectorLineWidth(vectorLineWidth)
         NativeRenderer.setBrushAlpha(brushAlpha)
         NativeRenderer.setBrushHardness(brushHardness)
+        NativeRenderer.setBucketBleed(bucketBleed)
         // Palm-rejection mode persists across launches; defaults on so
         // accidental finger touches don't draw out of the box.
         stylusOnly = prefs().getBoolean(kPrefStylusOnly, true)
@@ -1177,6 +1191,7 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(10.dp, 0, 10.dp, 0)
         }
+        brushSectionHeader = headerLabel
         header.addView(headerLabel, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
             Gravity.START or Gravity.CENTER_VERTICAL))
@@ -1224,23 +1239,33 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
-        container.addView(buildSliderRow(sizeSliderLabel, sizeSlider, sizeValueLabel))
+        brushSizeRow = buildSliderRow(sizeSliderLabel, sizeSlider, sizeValueLabel)
+        container.addView(brushSizeRow)
 
         // α slider — controls brush opacity. Active for any tool, but
         // only affects brush strokes (eraser keeps a fixed strength).
-        container.addView(buildBrushAlphaRow())
+        brushAlphaRow = buildBrushAlphaRow()
+        container.addView(brushAlphaRow)
 
         // hard slider — radial dab hardness. Replaces the old "smth"
         // stub. 0 = full radial gradient (smooth dab), 100 = solid
         // disc (hard dab). Applies to brush + eraser.
-        container.addView(buildBrushHardnessRow())
+        brushHardRow = buildBrushHardnessRow()
+        container.addView(brushHardRow)
 
         // Disabled stub — placeholder for future pressure curve.
-        container.addView(buildSliderRow(
+        brushPressRow = buildSliderRow(
             makeStubSliderLabel("press"),
             makeStubSlider(),
             makeStubValueLabel("—")
-        ))
+        )
+        container.addView(brushPressRow)
+
+        // Bucket-only bleed slider. Hidden by default; shown when the
+        // active tool is BUCKET (see updateSizeSliderForTool).
+        bucketBleedRow = buildBucketBleedRow()
+        container.addView(bucketBleedRow)
+
         // Push the initial value display.
         updateSizeSliderForTool()
         return container
@@ -1278,6 +1303,42 @@ class MainActivity : AppCompatActivity() {
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     prefs().edit().putFloat(kPrefBrushAlpha, brushAlpha).apply()
+                }
+            })
+        }
+        return buildSliderRow(label, slider, valueLabel)
+    }
+
+    /** Bucket-only bleed slider — pixels to dilate the fill mask after
+     *  flood-fill, bridging the boundary's anti-aliased gradient. Only
+     *  shown while the BUCKET tool is active. Range 0..kBucketBleedMax. */
+    private fun buildBucketBleedRow(): View {
+        val label = TextView(this).apply {
+            text = "bleed"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        val valueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.END
+            text = bucketBleed.toString()
+        }
+        val slider = SeekBar(this).apply {
+            max = kBucketBleedMax
+            progress = bucketBleed.coerceIn(0, kBucketBleedMax)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    valueLabel.text = p.toString()
+                    if (!fromUser) return
+                    bucketBleed = p
+                    NativeRenderer.setBucketBleed(bucketBleed)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    prefs().edit().putInt(kPrefBucketBleed, bucketBleed).apply()
                 }
             })
         }
@@ -1370,6 +1431,39 @@ class MainActivity : AppCompatActivity() {
             sizeSliderLabel.text = "size"
             sizeSlider.progress = brushScaleToProgress(brushSizeScale)
             sizeValueLabel.text = "%.2fx".format(brushSizeScale)
+        }
+
+        // Match the section header to the tool family — same sliders
+        // drive each, but the wording shouldn't say "BRUSH" while the
+        // user is editing a vector line width or eraser settings.
+        if (::brushSectionHeader.isInitialized) {
+            brushSectionHeader.text = when (currentToolMirror) {
+                Tool.ERASER                                              -> "ERASER"
+                Tool.BUCKET                                              -> "BUCKET"
+                Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE     -> "VECTOR"
+                Tool.SELECT, Tool.SELECT_RECT, Tool.SELECT_LASSO         -> "SELECT"
+                else                                                     -> "BRUSH"
+            }
+        }
+
+        // Hide slider rows that don't apply to the active tool. Only
+        // alpha is shared across most tools; size is brush/eraser/
+        // vector; hardness is brush/eraser; press is a stub that only
+        // makes sense alongside size.
+        if (::brushSizeRow.isInitialized) {
+            val tool = currentToolMirror
+            val showSize  = tool == Tool.BRUSH || tool == Tool.ERASER
+                            || currentToolEditsVector()
+            val showAlpha = tool == Tool.BRUSH || tool == Tool.ERASER
+                            || tool == Tool.BUCKET
+            val showHard  = tool == Tool.BRUSH || tool == Tool.ERASER
+            val showPress = tool == Tool.BRUSH || tool == Tool.ERASER
+            val showBleed = tool == Tool.BUCKET
+            brushSizeRow.visibility   = if (showSize)  View.VISIBLE else View.GONE
+            brushAlphaRow.visibility  = if (showAlpha) View.VISIBLE else View.GONE
+            brushHardRow.visibility   = if (showHard)  View.VISIBLE else View.GONE
+            brushPressRow.visibility  = if (showPress) View.VISIBLE else View.GONE
+            bucketBleedRow.visibility = if (showBleed) View.VISIBLE else View.GONE
         }
     }
 

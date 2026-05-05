@@ -266,6 +266,15 @@ object NativeRenderer {
     external fun setBrushHardness(hardness: Float)
 
     /**
+     * Bucket-fill "bleed" in pixels — how far the filled region grows
+     * outward past the flood-fill tolerance match. 0 stops cleanly at
+     * the boundary; larger values bridge the anti-aliased edge so the
+     * fill bleeds under adjacent strokes. Read at fill time, so the
+     * next bucket tap picks up changes. Clamped to [0, 64] in native.
+     */
+    external fun setBucketBleed(px: Int)
+
+    /**
      * Vector-tool line width in doc-pixels. Captured at the time a shape
      * is added (addLine / addRectangle / etc.); subsequent changes don't
      * affect existing shapes.
