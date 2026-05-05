@@ -53,7 +53,6 @@ class MainActivity : AppCompatActivity() {
     // and tint. We keep references so onToolChanged can flip selection
     // without rebuilding the rail.
     private val railToolTiles  = mutableMapOf<Tool, ImageView>()
-    private lateinit var gridRailTile:   ImageView   // also used as panel toggle
     private lateinit var pagesRailTile:  ImageView
     private lateinit var layersRailTile: ImageView
     private lateinit var colorRailTile:  ImageView
@@ -502,11 +501,9 @@ class MainActivity : AppCompatActivity() {
         } as ImageView
         colorRailTile.isSelected = true
         rail.addView(colorRailTile)
-        gridRailTile = toolTile(R.drawable.ic_grid, "grid", isToggle = false) { tile ->
-            cycleGrid()
-            tile.isSelected = (gridState != 0)
-        } as ImageView
-        rail.addView(gridRailTile)
+        // Grid + snap have moved to the bottom status bar (their text
+        // labels there double as toggleable buttons), keeping the rail
+        // tight enough that no scrolling is needed for the tools.
 
         // View controls live below the panel toggles, separated by a
         // rule so they read as their own group (not part of the panel
@@ -883,16 +880,45 @@ class MainActivity : AppCompatActivity() {
     private fun showLayerRowOverflow(anchor: View, idx: Int) {
         val menu = PopupMenu(this, anchor, Gravity.END)
         menu.menu.add(0, 0, 0, "Rename…")
+        val isVector = NativeRenderer.getLayerType(idx) == 1
+        // Rasterize is only meaningful for vector layers; show it
+        // greyed-out for raster layers so the menu shape stays stable
+        // and the user knows the option exists.
+        val rasterize = menu.menu.add(0, 2, 2, "Rasterize layer")
+        rasterize.isEnabled = isVector
         val delete = menu.menu.add(0, 1, 1, "Delete")
         delete.isEnabled = layerCount > 1
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 0 -> showRenameLayerDialog(idx)
                 1 -> confirmDeleteLayer(idx)
+                2 -> userRasterizeLayer(idx)
             }
             true
         }
         menu.show()
+    }
+
+    /** Bake the vector shapes on layer [idx] into raster tiles in place.
+     *  This converts the layer's type and is destructive (the original
+     *  shape data is gone), so we confirm first. Undo is cleared by
+     *  the native impl since shape indices become stale. */
+    private fun userRasterizeLayer(idx: Int) {
+        val customName = NativeRenderer.getLayerName(idx)
+        val isVector = NativeRenderer.getLayerType(idx) == 1
+        val displayName = if (customName.isNotEmpty()) customName
+                          else (if (isVector) "vector ${idx + 1}" else "layer ${idx + 1}")
+        AlertDialog.Builder(this)
+            .setTitle("Rasterize layer")
+            .setMessage("Bake every shape on “$displayName” into raster tiles? " +
+                        "The original vector data can't be recovered.")
+            .setPositiveButton("Rasterize") { _, _ ->
+                NativeRenderer.rasterizeLayer(idx)
+                drawingView?.forceRedraw()
+                drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     /** Confirm-then-delete a layer. There is no undo for layer ops, so
@@ -2075,8 +2101,23 @@ class MainActivity : AppCompatActivity() {
 
         statusDocText  = makeStatusText("doc · $currentDocName")
         statusToolText = makeStatusText("◇ ${currentToolMirror.displayName.lowercase()}")
-        statusGridText = makeStatusText("grid: off")
-        statusSnapText = makeStatusText("snap: on")
+        // grid/snap texts double as toggles. Tap to flip; the active
+        // state colors them with the same hot accent the rail's active
+        // tile uses, so they read as enabled at a glance.
+        statusGridText = makeStatusText("grid: off").apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { cycleGrid() }
+            setTextColor(getColor(
+                if (gridState != 0) R.color.hot else R.color.inkSoft))
+        }
+        statusSnapText = makeStatusText(
+            if (snapEnabled) "snap: on" else "snap: off"
+        ).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { toggleSnap() }
+            setTextColor(getColor(
+                if (snapEnabled) R.color.hot else R.color.inkSoft))
+        }
         statusPageText = makeStatusText("page —")
 
         bar.addView(statusDocText,  statusItemLp())
@@ -2120,26 +2161,38 @@ class MainActivity : AppCompatActivity() {
         menu.menu.add("Import image…")
         menu.menu.add("Export canvas as PNG…")
         menu.menu.add("Export document as PDF…")
-        menu.menu.add("Snap: ${if (snapEnabled) "on" else "off"}")
         menu.menu.add("Stylus only: ${if (stylusOnly) "on" else "off"}")
         menu.menu.add("Delete selection")
+        menu.menu.add("Rasterize selection to layer below")
         menu.menu.add("Copy")
         menu.menu.add("Paste")
         menu.setOnMenuItemClickListener { item ->
             val title = item.title.toString()
             when {
-                title == "Import image…"            -> launchImageImport()
-                title == "Export canvas as PNG…"    -> launchCanvasPngExport()
-                title == "Export document as PDF…"  -> launchDocumentPdfExport()
-                title == "Delete selection"         -> userDeleteSelection()
-                title == "Copy"                     -> drawingView?.queueCopySelection()
-                title == "Paste"                    -> drawingView?.queuePasteSelection()
-                title.startsWith("Snap:")           -> toggleSnap()
-                title.startsWith("Stylus only:")    -> toggleStylusOnly()
+                title == "Import image…"                       -> launchImageImport()
+                title == "Export canvas as PNG…"               -> launchCanvasPngExport()
+                title == "Export document as PDF…"             -> launchDocumentPdfExport()
+                title == "Delete selection"                    -> userDeleteSelection()
+                title == "Rasterize selection to layer below"  -> userRasterizeSelectionBelow()
+                title == "Copy"                                -> drawingView?.queueCopySelection()
+                title == "Paste"                               -> drawingView?.queuePasteSelection()
+                title.startsWith("Stylus only:")               -> toggleStylusOnly()
             }
             true
         }
         menu.show()
+    }
+
+    private fun userRasterizeSelectionBelow() {
+        if (!NativeRenderer.hasSelection()) {
+            android.widget.Toast.makeText(this,
+                "No vector selection",
+                android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        NativeRenderer.rasterizeSelectionToLayerBelow()
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
     /** Default name for the active page's PNG export. Pages are 1-indexed
@@ -2477,6 +2530,8 @@ class MainActivity : AppCompatActivity() {
         NativeRenderer.setSnapEnabled(snapEnabled)
         if (::statusSnapText.isInitialized) {
             statusSnapText.text = if (snapEnabled) "snap: on" else "snap: off"
+            statusSnapText.setTextColor(getColor(
+                if (snapEnabled) R.color.hot else R.color.inkSoft))
         }
     }
 
@@ -2520,6 +2575,8 @@ class MainActivity : AppCompatActivity() {
             statusGridText.text = when (gridState) {
                 0 -> "grid: off"; 1 -> "grid: lines"; else -> "grid: dots"
             }
+            statusGridText.setTextColor(getColor(
+                if (gridState != 0) R.color.hot else R.color.inkSoft))
         }
         drawingView?.forceRedraw()
     }

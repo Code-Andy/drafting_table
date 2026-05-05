@@ -103,6 +103,23 @@ object NativeRenderer {
     external fun moveLayer(fromIdx: Int, toIdx: Int)
 
     /**
+     * Rasterize the vector layer at [idx]: bake every shape into raster
+     * tiles in place, drop the shape arrays, and flip the layer type
+     * from vector to raster. No-op if the layer is already raster, the
+     * idx is out of range, or no page bounds are set. Queued onto the
+     * GL thread; clears the undo stack since shape indices become stale.
+     */
+    external fun rasterizeLayer(idx: Int)
+
+    /**
+     * Rasterize the currently-selected vector shape onto the raster
+     * layer directly below the source. No-op if there's no selection,
+     * the source isn't a vector layer, the layer below doesn't exist or
+     * isn't raster, or page bounds are unset. Queued; clears undo.
+     */
+    external fun rasterizeSelectionToLayerBelow()
+
+    /**
      * Append shapes to the active layer (only effective if the active
      * layer is a vector layer). Color and width follow the current brush
      * color and a fixed line width. Each gesture's (x0, y0, x1, y1)

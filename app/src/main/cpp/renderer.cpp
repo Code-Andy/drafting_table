@@ -916,6 +916,8 @@ constexpr int kActionMoveLayer      = 11;
 constexpr int kActionDeletePage     = 12;
 constexpr int kActionMovePage       = 13;
 constexpr int kActionImportImage    = 14;
+constexpr int kActionRasterizeLayer       = 15;
+constexpr int kActionRasterizeShapeBelow  = 16;
 // Target index for the next kActionSwitchPage drained. Stored separately
 // because the action queue is just `vector<int>`. Last-write-wins on
 // rapid taps: exchange(-1) at drain time picks up whichever target was
@@ -937,6 +939,9 @@ std::atomic<int> g_pendingDeletePageIdx{-1};
 std::mutex       g_pendingMovePageMutex;
 int              g_pendingMovePageFrom  = -1;
 int              g_pendingMovePageTo    = -1;
+// Rasterize-layer side channel. The action queue carries the action
+// code; the layer index is stored here last-write-wins.
+std::atomic<int> g_pendingRasterizeLayerIdx{-1};
 
 // Eyedropper: UI thread queues a sample-this-pixel request in DOC-px
 // (floats; matches doc convention y-down). The GL thread drains it at
@@ -1367,6 +1372,23 @@ void deleteLayerImpl(size_t idx);
 void moveLayerImpl(size_t from, size_t to);
 void deletePageImpl(size_t idx);
 void movePageImpl(size_t from, size_t to);
+void rasterizeShapesIntoTiles(size_t targetLayerIdx,
+                              const std::vector<Line>&    lines,
+                              const std::vector<Rect>&    rects,
+                              const std::vector<Ellipse>& ellipses,
+                              const std::vector<Circle>&  circles);
+void rasterizeVectorLayerImpl(size_t layerIdx);
+void rasterizeShapeBelowImpl();
+// Shape draw primitives — defined down with the composite helpers but
+// called from rasterizeShapesIntoTiles up here.
+void drawLineSegment(float x0, float y0, float x1, float y1,
+                     uint32_t rgb, float width, float alpha);
+void drawRectangleAsLines(float x0, float y0, float x1, float y1,
+                          float rotation, uint32_t rgb, float width,
+                          float alpha);
+void drawEllipseAsLines(float cx, float cy, float rx, float ry,
+                        float rotation, uint32_t rgb, float width,
+                        float alpha);
 void applyUndo();
 void applyRedo();
 void applyPendingShapes();
@@ -1563,6 +1585,15 @@ void applyPendingLayerActions() {
                 applyPendingShapes();
                 deletePageImpl(static_cast<size_t>(idx));
             }
+        } else if (a == kActionRasterizeLayer) {
+            int idx = g_pendingRasterizeLayerIdx.exchange(-1);
+            if (idx >= 0) {
+                applyPendingShapes();
+                rasterizeVectorLayerImpl(static_cast<size_t>(idx));
+            }
+        } else if (a == kActionRasterizeShapeBelow) {
+            applyPendingShapes();
+            rasterizeShapeBelowImpl();
         } else if (a == kActionImportImage) {
             // Take ownership of the pending image bytes under the mutex
             // so the UI thread can post a fresh import without racing.
@@ -2618,6 +2649,346 @@ void moveLayerImpl(size_t from, size_t to) {
 
     LOGI("layer moved %zu->%zu (count=%zu, active=%zu)",
          from, to, ls.size(), active);
+}
+
+// ---- Rasterization ------------------------------------------------------
+
+// Render a list of vector shapes into a target raster layer's tiles. Used
+// by both "rasterize entire vector layer" and "rasterize selected shape
+// to layer below". Uses a page-sized off-screen FBO so shapes only need
+// to be drawn once; per-tile glReadPixels chunks the result and CPU
+// blends "src over dst" against existing tile bytes (premultiplied).
+//
+// Notes:
+//   - We disable page-clip in the line shader: the shapes were already
+//     authored within the page, and we want them to bake into whichever
+//     tile they touch without per-fragment clipping artifacts.
+//   - Tile/fbo orientation matches the bake: doc-y=0 lands at GL bottom,
+//     so glReadPixels rows from temp FBO can be uploaded directly to
+//     tiles via uploadTileBytesAndSave (same convention).
+void rasterizeShapesIntoTiles(size_t targetLayerIdx,
+                              const std::vector<Line>&    lines,
+                              const std::vector<Rect>&    rects,
+                              const std::vector<Ellipse>& ellipses,
+                              const std::vector<Circle>&  circles) {
+    if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty()) {
+        return;
+    }
+    if (targetLayerIdx >= layers().size() || !layers()[targetLayerIdx]) return;
+    Layer& target = *layers()[targetLayerIdx];
+    if (target.type != LayerType::Raster) return;
+
+    PageClip page = readPageClip();
+    if (!page.active) return;
+    int pageMinX = static_cast<int>(std::floor(page.minX));
+    int pageMinY = static_cast<int>(std::floor(page.minY));
+    int pageMaxX = static_cast<int>(std::ceil (page.maxX));
+    int pageMaxY = static_cast<int>(std::ceil (page.maxY));
+    int pageW = pageMaxX - pageMinX;
+    int pageH = pageMaxY - pageMinY;
+    if (pageW <= 0 || pageH <= 0) return;
+    constexpr int kMaxRasterizeDim = 4096;
+    if (pageW > kMaxRasterizeDim || pageH > kMaxRasterizeDim) {
+        LOGE("rasterize: page %dx%d exceeds cap %d", pageW, pageH, kMaxRasterizeDim);
+        return;
+    }
+
+    // Allocate a one-shot temp FBO at page size and draw the shapes.
+    GLint prevDrawFbo = 0, prevReadFbo = 0;
+    GLint prevViewport[4] = {0};
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+
+    GLuint tempTex = 0, tempFbo = 0;
+    glGenTextures(1, &tempTex);
+    glBindTexture(GL_TEXTURE_2D, tempTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pageW, pageH, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, &tempFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, tempFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tempTex, 0);
+
+    glViewport(0, 0, pageW, pageH);
+    glDisable(GL_BLEND);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    // doc → tempFbo transform: shift so doc(page.minX, page.minY) → (0,0).
+    float t[16] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        static_cast<float>(-pageMinX), static_cast<float>(-pageMinY), 0, 1
+    };
+
+    glUseProgram(g_lineProg.program);
+    glBindVertexArray(g_quadVao);
+    glUniformMatrix4fv(g_lineProg.uTransform, 1, GL_FALSE, t);
+    glUniform2f(g_lineProg.uScreen, static_cast<float>(pageW),
+                                    static_cast<float>(pageH));
+    uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                   g_lineProg.uPageActive, PageClip{false, 0, 0, 0, 0});
+    glUniform1f(g_lineProg.uOpacity, 1.0f);
+
+    for (const auto& l : lines) {
+        drawLineSegment(l.x0, l.y0, l.x1, l.y1, l.color, l.width, 1.0f);
+    }
+    for (const auto& r : rects) {
+        drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation,
+                             r.color, r.width, 1.0f);
+    }
+    for (const auto& e : ellipses) {
+        drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation,
+                           e.color, e.width, 1.0f);
+    }
+    for (const auto& c : circles) {
+        drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f,
+                           c.color, c.width, 1.0f);
+    }
+    glBindVertexArray(0);
+
+    // Iterate every tile in the page bbox; chunk pixels from tempFbo
+    // and CPU-blend into existing tile bytes ("src over dst" with
+    // premultiplied alpha).
+    auto floorDiv = [](int a, int b) {
+        // C++ integer division truncates toward zero; floor-divide is
+        // safer for negative tile coords (page anchored away from doc 0).
+        int q = a / b;
+        if ((a ^ b) < 0 && q * b != a) --q;
+        return q;
+    };
+    int tx0 = floorDiv(pageMinX,        kTileSize);
+    int tx1 = floorDiv(pageMaxX - 1,    kTileSize);
+    int ty0 = floorDiv(pageMinY,        kTileSize);
+    int ty1 = floorDiv(pageMaxY - 1,    kTileSize);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, tempFbo);
+    std::vector<uint8_t> tileBytes(kTileBytes);
+    std::vector<uint8_t> srcChunk; // sized per tile
+
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            int tileDocX = tx * kTileSize;
+            int tileDocY = ty * kTileSize;
+            // Source rect in tempFbo (doc origin at (pageMinX, pageMinY)).
+            int srcX = tileDocX - pageMinX;
+            int srcY = tileDocY - pageMinY;
+            int srcW = kTileSize, srcH = kTileSize;
+            int dstX = 0, dstY = 0;
+            if (srcX < 0)         { dstX = -srcX; srcW -= dstX; srcX = 0; }
+            if (srcY < 0)         { dstY = -srcY; srcH -= dstY; srcY = 0; }
+            if (srcX + srcW > pageW) srcW = pageW - srcX;
+            if (srcY + srcH > pageH) srcH = pageH - srcY;
+            if (srcW <= 0 || srcH <= 0) continue;
+
+            // Read tile-shaped chunk from tempFbo.
+            srcChunk.assign(static_cast<size_t>(srcW) * srcH * 4, 0);
+            glReadPixels(srcX, srcY, srcW, srcH,
+                         GL_RGBA, GL_UNSIGNED_BYTE, srcChunk.data());
+
+            // Skip fully-transparent tiles — saves an empty
+            // upload + neighbor apron invalidation chain.
+            bool anyOpaque = false;
+            for (size_t i = 3; i < srcChunk.size(); i += 4) {
+                if (srcChunk[i] != 0) { anyOpaque = true; break; }
+            }
+            if (!anyOpaque) continue;
+
+            // Read existing tile bytes (zeros if no tile yet).
+            auto it = target.tiles.find(tileKey(tx, ty));
+            if (it != target.tiles.end()) {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, tileBytes.data());
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, tempFbo);
+            } else {
+                std::fill(tileBytes.begin(), tileBytes.end(), 0);
+            }
+
+            // Premultiplied "src over dst" — same blend the GPU does
+            // during composite.
+            for (int row = 0; row < srcH; ++row) {
+                for (int col = 0; col < srcW; ++col) {
+                    int dstIdx = ((dstY + row) * kTileSize + (dstX + col)) * 4;
+                    int srcIdx = (row * srcW + col) * 4;
+                    uint8_t sr = srcChunk[srcIdx + 0];
+                    uint8_t sg = srcChunk[srcIdx + 1];
+                    uint8_t sb = srcChunk[srcIdx + 2];
+                    uint8_t sa = srcChunk[srcIdx + 3];
+                    if (sa == 0) continue;
+                    if (sa == 255) {
+                        tileBytes[dstIdx + 0] = sr;
+                        tileBytes[dstIdx + 1] = sg;
+                        tileBytes[dstIdx + 2] = sb;
+                        tileBytes[dstIdx + 3] = sa;
+                    } else {
+                        uint32_t inv = 255u - sa;
+                        uint8_t dr = tileBytes[dstIdx + 0];
+                        uint8_t dg = tileBytes[dstIdx + 1];
+                        uint8_t db = tileBytes[dstIdx + 2];
+                        uint8_t da = tileBytes[dstIdx + 3];
+                        tileBytes[dstIdx + 0] =
+                            static_cast<uint8_t>(sr + (dr * inv + 127u) / 255u);
+                        tileBytes[dstIdx + 1] =
+                            static_cast<uint8_t>(sg + (dg * inv + 127u) / 255u);
+                        tileBytes[dstIdx + 2] =
+                            static_cast<uint8_t>(sb + (db * inv + 127u) / 255u);
+                        tileBytes[dstIdx + 3] =
+                            static_cast<uint8_t>(sa + (da * inv + 127u) / 255u);
+                    }
+                }
+            }
+
+            uploadTileBytesAndSave(targetLayerIdx, tx, ty, tileBytes.data());
+        }
+    }
+
+    // Tear down the temp FBO + restore prior bindings.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFbo);
+    glDeleteFramebuffers(1, &tempFbo);
+    glDeleteTextures(1, &tempTex);
+    glViewport(prevViewport[0], prevViewport[1],
+               prevViewport[2], prevViewport[3]);
+}
+
+// Convert a vector layer to a raster layer in place. Renders all of its
+// shapes into freshly-baked tiles, drops the shape arrays, flips
+// layer.type, and removes the on-disk shapes.bin so the type is
+// canonical after restart.
+void rasterizeVectorLayerImpl(size_t layerIdx) {
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& src = *layers()[layerIdx];
+    if (src.type != LayerType::Vector) return;
+    if (src.lines.empty() && src.rects.empty()
+        && src.ellipses.empty() && src.circles.empty()) {
+        // Empty vector layer — just flip the type and drop shapes.bin.
+        src.type = LayerType::Raster;
+        if (!g_docDir.empty()) {
+            std::string p = activeLayerDir(layerIdx) + "/shapes.bin";
+            unlink(p.c_str());
+        }
+        return;
+    }
+
+    // Promote the layer type up front so rasterizeShapesIntoTiles
+    // accepts it as a raster target. If we promoted after the call,
+    // the early type-check would refuse and we'd silently no-op.
+    src.type = LayerType::Raster;
+
+    // Snapshot shape lists so they survive being cleared mid-call.
+    std::vector<Line>    ls = std::move(src.lines);    src.lines.clear();
+    std::vector<Rect>    rs = std::move(src.rects);    src.rects.clear();
+    std::vector<Ellipse> es = std::move(src.ellipses); src.ellipses.clear();
+    std::vector<Circle>  cs = std::move(src.circles);  src.circles.clear();
+
+    rasterizeShapesIntoTiles(layerIdx, ls, rs, es, cs);
+
+    // Disk side: shapes.bin is no longer the source of truth — a vector
+    // layer's presence-of-shapes.bin is how loadAllLayersFromDisk
+    // detects the type, so removing it commits the conversion.
+    if (!g_docDir.empty()) {
+        std::string p = activeLayerDir(layerIdx) + "/shapes.bin";
+        unlink(p.c_str());
+    }
+
+    // The vector layer's selection (if it pointed at one of these
+    // shapes) is now stale.
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        if (g_selection.kind != ShapeKind::None
+            && g_selection.layerIdx == layerIdx) {
+            g_selection = Selection{};
+        }
+    }
+    // Undo entries reference shape indices in the prior vector layer;
+    // the layer is now raster, those entries can't apply.
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+
+    LOGI("rasterized vector layer %zu (%zu lines, %zu rects, "
+         "%zu ellipses, %zu circles)",
+         layerIdx, ls.size(), rs.size(), es.size(), cs.size());
+}
+
+// Rasterize the currently-selected vector shape onto the raster layer
+// directly below the source vector layer. No-op if there's no
+// selection, the layer below is missing or non-raster, or the source
+// shape index is out of range.
+void rasterizeShapeBelowImpl() {
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+    }
+    if (sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx == 0) return;                   // no layer below
+    if (sel.layerIdx >= layers().size()) return;
+    if (!layers()[sel.layerIdx]) return;
+    Layer& src = *layers()[sel.layerIdx];
+    if (src.type != LayerType::Vector) return;
+    size_t targetIdx = sel.layerIdx - 1;
+    if (!layers()[targetIdx]) return;
+    if (layers()[targetIdx]->type != LayerType::Raster) return;
+
+    // Pluck the shape into its own one-element list, then erase from
+    // the source layer.
+    std::vector<Line>    ls;
+    std::vector<Rect>    rs;
+    std::vector<Ellipse> es;
+    std::vector<Circle>  cs;
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx >= src.lines.size())    return;
+            ls.push_back(src.lines[sel.shapeIdx]);
+            src.lines.erase(src.lines.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx >= src.rects.size())    return;
+            rs.push_back(src.rects[sel.shapeIdx]);
+            src.rects.erase(src.rects.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx >= src.ellipses.size()) return;
+            es.push_back(src.ellipses[sel.shapeIdx]);
+            src.ellipses.erase(src.ellipses.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx >= src.circles.size())  return;
+            cs.push_back(src.circles[sel.shapeIdx]);
+            src.circles.erase(src.circles.begin() + sel.shapeIdx);
+            break;
+        default: return;
+    }
+
+    rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs);
+
+    // Persist the source layer's new (one-shape-shorter) state.
+    saveVectorLayer(sel.layerIdx, src);
+
+    // The selected shape is gone — clear the selection.
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+    }
+    // Undo entries referencing the old shape index are stale.
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        g_undoStack.clear(); g_undoTotalBytes = 0;
+        g_redoStack.clear(); g_redoTotalBytes = 0;
+    }
+
+    LOGI("rasterized shape from layer %zu onto layer %zu",
+         sel.layerIdx, targetIdx);
 }
 
 // Recursively wipe a page dir (`<docDir>/page_<idx>/`). Walks two levels
@@ -7415,6 +7786,26 @@ Java_com_bk_drawing_NativeRenderer_importImageAsSelection(
     }
     enqueuePendingAction(kActionImportImage);
     return JNI_TRUE;
+}
+
+// Rasterize a vector layer in place — its shapes get baked into fresh
+// raster tiles and the layer's type flips to Raster. Queued through the
+// pending-action drain so the GL work runs on the GL thread. No-op if
+// the layer is already raster or out of range.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_rasterizeLayer(JNIEnv*, jobject, jint idx) {
+    if (idx < 0) return;
+    g_pendingRasterizeLayerIdx.store(idx);
+    enqueuePendingAction(kActionRasterizeLayer);
+}
+
+// Rasterize the currently-selected vector shape onto the raster layer
+// directly below the source. Reads g_selection on the GL thread, so the
+// caller doesn't need to pass parameters.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_rasterizeSelectionToLayerBelow(
+        JNIEnv*, jobject) {
+    enqueuePendingAction(kActionRasterizeShapeBelow);
 }
 
 // Move the page at `fromIdx` to `toIdx`. Same queueing rationale as
