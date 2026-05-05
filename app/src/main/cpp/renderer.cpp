@@ -915,6 +915,7 @@ constexpr int kActionDeleteLayer    = 10;
 constexpr int kActionMoveLayer      = 11;
 constexpr int kActionDeletePage     = 12;
 constexpr int kActionMovePage       = 13;
+constexpr int kActionImportImage    = 14;
 // Target index for the next kActionSwitchPage drained. Stored separately
 // because the action queue is just `vector<int>`. Last-write-wins on
 // rapid taps: exchange(-1) at drain time picks up whichever target was
@@ -936,6 +937,33 @@ std::atomic<int> g_pendingDeletePageIdx{-1};
 std::mutex       g_pendingMovePageMutex;
 int              g_pendingMovePageFrom  = -1;
 int              g_pendingMovePageTo    = -1;
+
+// Eyedropper: UI thread queues a sample-this-pixel request in DOC-px
+// (floats; matches doc convention y-down). The GL thread drains it at
+// the end of compositeAllLayers, walks the visible raster layers, reads
+// the relevant tile FBO directly, and composites Porter-Duff "over" to
+// produce the final color. Bypassing the multi-buffer is more reliable
+// than glReadPixels there — some framework configurations present a
+// different buffer than the one bound during the render callback. Tile
+// FBOs are the source of truth; we trust them.
+std::atomic<int>   g_pendingSampleHasReq{0};   // 0 = none, 1 = pending
+std::atomic<int>   g_pendingSampleDocXBits{0}; // float bits via memcpy
+std::atomic<int>   g_pendingSampleDocYBits{0};
+std::atomic<int>   g_lastSampledRgb{-1};
+
+// Image-import side channel. UI thread decodes the bitmap, premultiplies
+// the bytes, and stores them here under g_pendingImportMutex. The drain
+// in applyPendingLayerActions creates a fresh raster layer, uploads the
+// bytes into a content texture, and parks the result on g_rasterSel as
+// a floating selection so the user can position/scale/rotate it.
+struct PendingImageImport {
+    bool                 active = false;
+    int                  width  = 0;
+    int                  height = 0;
+    std::vector<uint8_t> rgba;   // RGBA8 premultiplied, width*height*4
+};
+std::mutex          g_pendingImportMutex;
+PendingImageImport  g_pendingImport;
 
 // Shapes added from the UI thread are queued separately because they
 // carry per-shape data that doesn't fit in the int-tagged action queue.
@@ -984,6 +1012,10 @@ struct DragState {
     // accumulate float drift.
     float    anchorX = 0.0f, anchorY = 0.0f;
     float    initialRotation = 0.0f;
+    // Initial half-extents at scale-drag start. Only used by raster
+    // selections with fixedAspect set; lets applyRasterScaleTo derive
+    // a uniform scale factor preserving the original aspect ratio.
+    float    initialHalfW = 0.0f, initialHalfH = 0.0f;
     // Rotate: shape center (fixed), initial pen-to-center angle, and the
     // shape's initial rotation. Also a snapshot of the initial Line
     // endpoints (for rotating Lines, which have no rotation field).
@@ -1113,6 +1145,10 @@ struct RasterSelection {
     // Pre-lift snapshots of every tile that the bbox touched, used to
     // build the undo entry on commit and to restore on cancel.
     std::vector<TileSnap> liftedTiles;
+    // When true, scale-handle drags preserve the OBB's initial aspect
+    // ratio (uniform scaling). Set on imported images so the user can't
+    // accidentally squash the picture.
+    bool   fixedAspect = false;
 };
 std::mutex      g_rasterSelMutex;
 RasterSelection g_rasterSel;
@@ -1527,6 +1563,94 @@ void applyPendingLayerActions() {
                 applyPendingShapes();
                 deletePageImpl(static_cast<size_t>(idx));
             }
+        } else if (a == kActionImportImage) {
+            // Take ownership of the pending image bytes under the mutex
+            // so the UI thread can post a fresh import without racing.
+            PendingImageImport pending;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingImportMutex);
+                if (!g_pendingImport.active) continue;
+                pending = std::move(g_pendingImport);
+                g_pendingImport.active = false;
+                g_pendingImport.rgba.clear();
+            }
+            // A floating raster selection from earlier work needs to be
+            // committed first so we don't lose it (and so g_rasterSel is
+            // free for the new import).
+            commitRasterSelectionImpl();
+
+            // Append a fresh raster layer and make it active.
+            size_t prevActive = activeLayer();
+            layers().push_back(std::make_unique<Layer>());
+            activeLayer() = layers().size() - 1;
+            UndoEntry undo;
+            undo.op = UndoOp::LayerAdd;
+            undo.layerIdx = activeLayer();
+            undo.addedLayerType = LayerType::Raster;
+            undo.prevActiveLayer = prevActive;
+            pushUndoEntry(std::move(undo));
+
+            // Upload the image into a fresh content texture.
+            GLuint contentTex = 0;
+            glGenTextures(1, &contentTex);
+            glBindTexture(GL_TEXTURE_2D, contentTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                         pending.width, pending.height, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, pending.rgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+
+            // Compute an initial OBB centered on the page (or at the
+            // doc origin if no page bounds are set), scaled so the
+            // longer image dimension is at most 80% of the longer page
+            // dimension — fits with breathing room.
+            float pcx = 0.0f, pcy = 0.0f;
+            float pageW = static_cast<float>(pending.width);
+            float pageH = static_cast<float>(pending.height);
+            PageClip page = readPageClip();
+            if (page.active) {
+                pcx = (page.minX + page.maxX) * 0.5f;
+                pcy = (page.minY + page.maxY) * 0.5f;
+                pageW = page.maxX - page.minX;
+                pageH = page.maxY - page.minY;
+            }
+            float fitW = pageW * 0.8f;
+            float fitH = pageH * 0.8f;
+            float fx = fitW / static_cast<float>(pending.width);
+            float fy = fitH / static_cast<float>(pending.height);
+            // If the image already fits inside the budget at 1:1, don't
+            // upscale it — show actual size. Otherwise scale to fit.
+            float scale = std::min(1.0f, std::min(fx, fy));
+            float halfW = pending.width  * scale * 0.5f;
+            float halfH = pending.height * scale * 0.5f;
+
+            {
+                std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+                g_rasterSel.active   = true;
+                g_rasterSel.layerIdx = activeLayer();
+                g_rasterSel.bboxMinX = pcx - halfW;
+                g_rasterSel.bboxMinY = pcy - halfH;
+                g_rasterSel.bboxMaxX = pcx + halfW;
+                g_rasterSel.bboxMaxY = pcy + halfH;
+                g_rasterSel.centerX  = pcx;
+                g_rasterSel.centerY  = pcy;
+                g_rasterSel.halfW    = halfW;
+                g_rasterSel.halfH    = halfH;
+                g_rasterSel.rotation = 0.0f;
+                g_rasterSel.contentTex = contentTex;
+                g_rasterSel.contentW   = pending.width;
+                g_rasterSel.contentH   = pending.height;
+                // Imported image isn't lifted from anywhere; canceling
+                // simply drops it (and the empty layer remains).
+                g_rasterSel.liftedTiles.clear();
+                g_rasterSel.fixedAspect = true;
+            }
+            LOGI("import image: %dx%d → layer %zu (scale=%.3f)",
+                 pending.width, pending.height, activeLayer(),
+                 static_cast<double>(scale));
         } else if (a == kActionMovePage) {
             int from = -1, to = -1;
             {
@@ -2226,7 +2350,11 @@ void applyTileSnap(size_t layerIdx, const TileSnap& snap) {
 // samples (caller should skip snapshotting).
 bool currentStrokeTileBbox(int& tx0, int& tx1, int& ty0, int& ty1) {
     if (g_current.samples.empty()) return false;
-    float pad = kMaxRadius;
+    // Match bakeCurrentStrokeIntoTiles — pad by the actual maximum dab
+    // radius (scales with the stroke's brush-size snapshot), not the
+    // unscaled kMaxRadius constant. Otherwise undo snapshotting misses
+    // tiles for large brushes and an undo can leave stale pixels.
+    float pad = kMaxRadius * g_strokeBrushSizeScale;
     float minX = g_current.samples.front().x, maxX = minX;
     float minY = g_current.samples.front().y, maxY = minY;
     for (const auto& s : g_current.samples) {
@@ -3183,7 +3311,12 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
         return;
     }
 
-    float pad = kMaxRadius;
+    // The dab radius is kMaxRadius * brush-size scale. At higher brush
+    // sizes the bbox/touched checks below have to widen by the same
+    // factor or they'll skip tiles the stroke actually paints into,
+    // producing notches at tile corners after bake.
+    float maxR = kMaxRadius * g_strokeBrushSizeScale;
+    float pad  = maxR;
     float minX = g_current.samples.front().x, maxX = minX;
     float minY = g_current.samples.front().y, maxY = minY;
     for (const auto& s : g_current.samples) {
@@ -3257,8 +3390,8 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
 
             bool touched = false;
             for (const auto& s : g_current.samples) {
-                if (s.x + kMaxRadius >= tileX0 && s.x - kMaxRadius <= tileX1
-                 && s.y + kMaxRadius >= tileY0 && s.y - kMaxRadius <= tileY1) {
+                if (s.x + maxR >= tileX0 && s.x - maxR <= tileX1
+                 && s.y + maxR >= tileY0 && s.y - maxR <= tileY1) {
                     touched = true;
                     break;
                 }
@@ -3947,7 +4080,9 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         // over the page rectangle. With page disabled, fall back to a
         // single paper-white clear (the original behavior).
         glDisable(GL_BLEND);
-        glClearColor(0.86f, 0.87f, 0.89f, 1.0f);
+        // Warm beige, a touch lighter than the menus' paper (#F5F0E6).
+        // Matches the eyedropper's off-page fallback below.
+        glClearColor(0xFB / 255.0f, 0xF7 / 255.0f, 0xEE / 255.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(g_fill.program);
@@ -4128,6 +4263,91 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
+
+    // Eyedropper sample. Reads tile FBOs directly (source of truth) and
+    // composites raster layers per-pixel. This avoids glReadPixels on
+    // the framework's multi-buffer, which on some Android GPU drivers
+    // returns stale or empty pixels even when the visible composite is
+    // correct.
+    if (g_pendingSampleHasReq.exchange(0)) {
+        int xBits = g_pendingSampleDocXBits.load();
+        int yBits = g_pendingSampleDocYBits.load();
+        float dx, dy;
+        std::memcpy(&dx, &xBits, sizeof(float));
+        std::memcpy(&dy, &yBits, sizeof(float));
+        int idx = static_cast<int>(std::floor(dx));
+        int idy = static_cast<int>(std::floor(dy));
+        // Floor-divide to handle negative doc coordinates correctly.
+        int tx = (idx >= 0) ? (idx / kTileSize) : ((idx - (kTileSize - 1)) / kTileSize);
+        int ty = (idy >= 0) ? (idy / kTileSize) : ((idy - (kTileSize - 1)) / kTileSize);
+        int subX = idx - tx * kTileSize;          // [0, 256)
+        int subY = idy - ty * kTileSize;          // [0, 256), top-down doc
+
+        // Page background: paper-white inside the page rect, off-canvas
+        // gray outside (matches compositeAllLayers' clear / paper-fill).
+        PageClip page = readPageClip();
+        bool insidePage = !page.active
+            || (dx >= page.minX && dx < page.maxX
+                && dy >= page.minY && dy < page.maxY);
+        // Off-page beige matches compositeAllLayers' clear color above.
+        float accR = insidePage ? 1.0f : (0xF8 / 255.0f);
+        float accG = insidePage ? 1.0f : (0xF3 / 255.0f);
+        float accB = insidePage ? 1.0f : (0xE8 / 255.0f);
+
+        // Save FBO bindings so reading tile FBOs doesn't disturb the
+        // multi-buffer state for whatever runs after this.
+        GLint prevDrawFbo = 0, prevReadFbo = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFbo);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+
+        for (size_t i = 0; i < layers().size(); ++i) {
+            const auto& layer = layers()[i];
+            if (!layer) continue;
+            if (!layer->visible.load(std::memory_order_relaxed)) continue;
+            if (layer->type != LayerType::Raster) continue;
+            auto it = layer->tiles.find(tileKey(tx, ty));
+            if (it == layer->tiles.end()) continue;
+
+            // Bind the tile FBO and read one pixel. Tile interior occupies
+            // texels [kApron..kApron+kTileSize). NOTE: doc-y maps directly
+            // to framebuffer-y in tile FBOs — the bake's vertex shader
+            // (kDabVS) maps doc-y=0 to NDC.y=-1, which the GL viewport
+            // places at framebuffer-y=kApron (the bottom-most row of the
+            // interior in GL bottom-left convention). So doc-y=subY
+            // lives at framebuffer-y=kApron+subY. No Y-flip.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+            int glX = kApron + subX;
+            int glY = kApron + subY;
+            unsigned char tile[4] = {0, 0, 0, 0};
+            glReadPixels(glX, glY, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, tile);
+
+            // Tile pixels are premultiplied. Apply layer opacity, then
+            // composite Porter-Duff "over" onto the accumulator.
+            float lo = layer->opacity.load(std::memory_order_relaxed);
+            float sR = (tile[0] / 255.0f) * lo;
+            float sG = (tile[1] / 255.0f) * lo;
+            float sB = (tile[2] / 255.0f) * lo;
+            float sA = (tile[3] / 255.0f) * lo;
+            float inv = 1.0f - sA;
+            accR = sR + accR * inv;
+            accG = sG + accG * inv;
+            accB = sB + accB * inv;
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFbo);
+
+        auto byte = [](float v) -> int {
+            int b = static_cast<int>(std::round(v * 255.0f));
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            return b;
+        };
+        int rgb = (byte(accR) << 16) | (byte(accG) << 8) | byte(accB);
+        g_lastSampledRgb.store(rgb);
+        LOGI("eyedropper sample doc(%.1f,%.1f) tile(%d,%d) sub(%d,%d) "
+             "-> #%06X", static_cast<double>(dx), static_cast<double>(dy),
+             tx, ty, subX, subY, rgb);
+    }
+
 }
 
 // Renders a shape preview into the currently-bound framebuffer (the
@@ -4532,6 +4752,7 @@ void disposeRasterSelectionGl() {
     g_rasterSel.contentW = 0;
     g_rasterSel.contentH = 0;
     g_rasterSel.liftedTiles.clear();
+    g_rasterSel.fixedAspect = false;
 }
 
 // CPU scanline polygon fill into a single-channel R8 buffer. Output
@@ -5719,6 +5940,32 @@ Java_com_bk_drawing_NativeRenderer_setBrushColor(JNIEnv*, jobject, jint rgb) {
     g_currentBrushColor.store(static_cast<uint32_t>(rgb) & 0x00FFFFFFu);
 }
 
+// Eyedropper. UI thread submits a sample request in DOC pixels (matches
+// the same coordinate space tile FBOs use internally). The GL thread
+// drains at the end of compositeAllLayers, walks visible raster layers,
+// reads each layer's tile FBO directly, composites Porter-Duff "over",
+// and stores the result. UI polls getLastSampledColor a frame later.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_requestColorSample(JNIEnv*, jobject,
+                                                      jfloat docX, jfloat docY) {
+    int xBits, yBits;
+    std::memcpy(&xBits, &docX, sizeof(int));
+    std::memcpy(&yBits, &docY, sizeof(int));
+    g_pendingSampleDocXBits.store(xBits);
+    g_pendingSampleDocYBits.store(yBits);
+    // Stale prior result must not be served as the new answer.
+    g_lastSampledRgb.store(-1);
+    g_pendingSampleHasReq.store(1);
+}
+
+// Returns the most recently sampled color as 0xRRGGBB, or -1 if no
+// sample has been completed since the last requestColorSample. Single-
+// shot: subsequent calls return -1 until another request is submitted.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getLastSampledColor(JNIEnv*, jobject) {
+    return g_lastSampledRgb.exchange(-1);
+}
+
 // Brush size scale — multiplier on the per-pressure dab radius. Snapshot
 // at beginStroke so a slider change mid-stroke doesn't visibly split a
 // stroke. Pass any positive float; ignored if non-finite or <= 0.
@@ -6150,6 +6397,33 @@ void applyRasterScaleTo(float x, float y) {
     float newHh = std::fabs(ldy) * 0.5f;
     if (newHw < 0.5f) newHw = 0.5f;
     if (newHh < 0.5f) newHh = 0.5f;
+
+    // Fixed-aspect override: pick whichever axis the user has scaled
+    // furthest from its initial extent and apply that factor to both
+    // axes. The center is recomputed so the anchor (opposite corner)
+    // stays put, otherwise the OBB would slide as the constraint
+    // adjusts the dimensions.
+    bool aspectLocked = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        aspectLocked = g_rasterSel.active && g_rasterSel.fixedAspect;
+    }
+    if (aspectLocked && d.initialHalfW > 0.5f && d.initialHalfH > 0.5f) {
+        float fw = newHw / d.initialHalfW;
+        float fh = newHh / d.initialHalfH;
+        float f  = std::max(fw, fh);
+        if (f < 0.05f) f = 0.05f;
+        newHw = d.initialHalfW * f;
+        newHh = d.initialHalfH * f;
+        // anchor → center is (sign(ldx)*newHw, sign(ldy)*newHh) in local
+        // frame; rotate by the OBB's rotation and add to anchor.
+        float lcx = (ldx >= 0 ? 1.0f : -1.0f) * newHw;
+        float lcy = (ldy >= 0 ? 1.0f : -1.0f) * newHh;
+        float cw = std::cos(d.initialRotation);
+        float sw = std::sin(d.initialRotation);
+        newCx = d.anchorX + (lcx * cw - lcy * sw);
+        newCy = d.anchorY + (lcx * sw + lcy * cw);
+    }
 
     std::lock_guard<std::mutex> lock(g_rasterSelMutex);
     if (!g_rasterSel.active) return;
@@ -6646,6 +6920,11 @@ Java_com_bk_drawing_NativeRenderer_beginRasterInteractionAt(
         g_rasterDrag.anchorX = ax;
         g_rasterDrag.anchorY = ay;
         g_rasterDrag.initialRotation = obb.rotation;
+        // Snapshot the initial half-extents so applyRasterScaleTo can
+        // enforce a uniform scale when fixedAspect is set on the
+        // selection (imported images).
+        g_rasterDrag.initialHalfW = g_rasterSel.halfW;
+        g_rasterDrag.initialHalfH = g_rasterSel.halfH;
         return 2;
     }
     // Body hit → move.
@@ -6914,6 +7193,24 @@ Java_com_bk_drawing_NativeRenderer_getLayerCount(JNIEnv*, jobject) {
     return static_cast<jint>(g_pages[g_activePageIdx]->layers.size());
 }
 
+// Page-rect dimensions in doc-px — used by the exporter to allocate
+// bitmaps at the canvas's natural resolution. Returns 0 if no page
+// bounds are active (the doc behaves as an infinite plane in that case
+// and the caller should fall back to surface dims).
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageWidth(JNIEnv*, jobject) {
+    PageClip page = readPageClip();
+    if (!page.active) return 0;
+    return static_cast<jint>(std::max(0.0f, page.maxX - page.minX));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageHeight(JNIEnv*, jobject) {
+    PageClip page = readPageClip();
+    if (!page.active) return 0;
+    return static_cast<jint>(std::max(0.0f, page.maxY - page.minY));
+}
+
 JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_getActiveLayer(JNIEnv*, jobject) {
     if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return 0;
@@ -7075,6 +7372,49 @@ Java_com_bk_drawing_NativeRenderer_deletePage(JNIEnv*, jobject, jint idx) {
     if (idx < 0) return;
     g_pendingDeletePageIdx.store(idx);
     enqueuePendingAction(kActionDeletePage);
+}
+
+// Import a bitmap as a floating raster selection on a fresh layer. The
+// pixel array is ARGB ints in Android Color order (alpha << 24 | R<<16 |
+// G<<8 | B); we premultiply and reorder to RGBA8 here so the GL thread
+// can upload the bytes directly without another conversion pass.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_importImageAsSelection(
+        JNIEnv* env, jobject, jint width, jint height, jintArray argbArr) {
+    if (width  <= 0 || height <= 0) return JNI_FALSE;
+    if (argbArr == nullptr) return JNI_FALSE;
+    jsize n = env->GetArrayLength(argbArr);
+    if (n != width * height) return JNI_FALSE;
+
+    jint* src = env->GetIntArrayElements(argbArr, nullptr);
+    if (src == nullptr) return JNI_FALSE;
+
+    std::vector<uint8_t> rgba;
+    rgba.resize(static_cast<size_t>(width) * height * 4);
+    for (jsize i = 0; i < n; ++i) {
+        uint32_t c = static_cast<uint32_t>(src[i]);
+        uint8_t  a = static_cast<uint8_t>((c >> 24) & 0xFFu);
+        uint8_t  r = static_cast<uint8_t>((c >> 16) & 0xFFu);
+        uint8_t  g = static_cast<uint8_t>((c >>  8) & 0xFFu);
+        uint8_t  b = static_cast<uint8_t>( c        & 0xFFu);
+        // Premultiply to match the rest of the pipeline (tiles, content
+        // textures, blend equation are all premultiplied).
+        rgba[i * 4 + 0] = static_cast<uint8_t>((static_cast<uint32_t>(r) * a + 127u) / 255u);
+        rgba[i * 4 + 1] = static_cast<uint8_t>((static_cast<uint32_t>(g) * a + 127u) / 255u);
+        rgba[i * 4 + 2] = static_cast<uint8_t>((static_cast<uint32_t>(b) * a + 127u) / 255u);
+        rgba[i * 4 + 3] = a;
+    }
+    env->ReleaseIntArrayElements(argbArr, src, JNI_ABORT);
+
+    {
+        std::lock_guard<std::mutex> lock(g_pendingImportMutex);
+        g_pendingImport.active = true;
+        g_pendingImport.width  = width;
+        g_pendingImport.height = height;
+        g_pendingImport.rgba   = std::move(rgba);
+    }
+    enqueuePendingAction(kActionImportImage);
+    return JNI_TRUE;
 }
 
 // Move the page at `fromIdx` to `toIdx`. Same queueing rationale as

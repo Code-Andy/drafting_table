@@ -21,6 +21,9 @@ import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
+import android.net.Uri
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.res.ResourcesCompat
 import androidx.core.view.WindowCompat
@@ -52,6 +55,13 @@ class MainActivity : AppCompatActivity() {
     private val railToolTiles  = mutableMapOf<Tool, ImageView>()
     private lateinit var gridRailTile:   ImageView   // also used as panel toggle
     private lateinit var pagesRailTile:  ImageView
+    private lateinit var layersRailTile: ImageView
+    private lateinit var colorRailTile:  ImageView
+    // Layer panel sections — kept as lateinit refs so the layers / color
+    // rail tiles can flip them between VISIBLE and GONE. The wrappers
+    // include their adjacent panelDivider so toggling collapses cleanly.
+    private lateinit var layersSection:  View
+    private lateinit var colorSection:   View
 
     // ---- Layer panel ----------------------------------------------------
     private lateinit var layerListContainer: LinearLayout
@@ -155,12 +165,45 @@ class MainActivity : AppCompatActivity() {
     // mappings gave because dab accumulation saturates quickly).
     private val kAlphaDabsPerOverlap = 6.0
 
-    // Preset brush palette — 0xRRGGBB. First entry is the default.
+    // 32-cell default palette — 4 rows × 8 columns. Reads top-to-bottom as
+    // a value gradient (deep → standard → mid-tint → pale) with a
+    // consistent warm-to-cool hue order across each row. Same drafting-
+    // table family as the original 16; rows 1 and 3 are new.
+    //   Row 1 — deepest hues          (heavy ink, dense fills)
+    //   Row 2 — standard chromatics   (original row 1)
+    //   Row 3 — mid-light tints       (muted, mid-saturation)
+    //   Row 4 — pale neutrals + tints (original row 2)
+    // Column 1 is always a grayscale anchor (black → ink → mid gray → paper).
     private val palette = intArrayOf(
-        0x14171F, 0xB02828, 0xC07020, 0xB8A020,
-        0x408840, 0x3060B8, 0x782878, 0x806040
+        // Row 1 — deepest
+        0x000000, 0x6E2218, 0x8A3F0F, 0x886C18,
+        0x3D5E26, 0x195049, 0x1A3D60, 0x4A2A65,
+        // Row 2 — standard chromatics
+        0x1A1A1A, 0xB5482E, 0xC77A1F, 0xC8A030,
+        0x5A8C3A, 0x2F7E78, 0x2A5D8F, 0x6B3A8A,
+        // Row 3 — mid-light tints
+        0x6E6457, 0xC07A60, 0xD0A270, 0xCAB870,
+        0x95B070, 0x6FA59E, 0x6F95C0, 0xA088B5,
+        // Row 4 — pale neutrals + tints
+        0xFFFFFF, 0x7A7368, 0xA89E8A, 0xD9CFB8,
+        0xF2D89A, 0xF2A48F, 0x9DB8D8, 0xC7D2A8
     )
     private var currentColorRgb = palette[0]
+    // Tracked so the picker / palette can render the Photoshop-style
+    // active+previous swatch pair. Updated whenever the active color
+    // changes via setActiveColor().
+    private var previousColorRgb = palette[1]
+
+    // LRU recents (max 8) — filled implicitly every time the user picks a
+    // color. mySlots are user-curated (long-press a slot to set it to the
+    // current active color). Both are persisted in SharedPreferences.
+    private val recentColors = ArrayDeque<Int>()
+    private val kRecentsMax  = 8
+    // null entry = empty slot (renders as a dashed +).
+    private val mySlots: Array<Int?> = arrayOf(0x2F7E78, 0x9DB8D8, null, null)
+    private val kMySlotsCount = 4
+    private val kPrefRecents  = "color_recents"
+    private val kPrefMySlots  = "color_myslots"
 
     // ---- Fonts (downloadable) ------------------------------------------
     private var fontMono:          Typeface? = null
@@ -168,8 +211,30 @@ class MainActivity : AppCompatActivity() {
     private var fontInter:         Typeface? = null
     private var fontInterSemibold: Typeface? = null
 
+    // Image-import flow. Registered in onCreate; the contract returns the
+    // selected URI or null on cancel. The Activity Result API requires
+    // the launcher to be created before STARTED, so we bind it here.
+    private lateinit var imagePickerLauncher:  ActivityResultLauncher<String>
+    private lateinit var canvasPngLauncher:    ActivityResultLauncher<String>
+    private lateinit var documentPdfLauncher:  ActivityResultLauncher<String>
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        imagePickerLauncher = registerForActivityResult(
+            ActivityResultContracts.GetContent()
+        ) { uri: Uri? ->
+            if (uri != null) decodeAndImportImage(uri)
+        }
+        canvasPngLauncher = registerForActivityResult(
+            ActivityResultContracts.CreateDocument("image/png")
+        ) { uri: Uri? ->
+            if (uri != null) exportActivePageToPng(uri)
+        }
+        documentPdfLauncher = registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/pdf")
+        ) { uri: Uri? ->
+            if (uri != null) exportDocumentToPdf(uri)
+        }
         loadFonts()
 
         // Migrate the legacy single-doc layout, then pick which document
@@ -201,6 +266,9 @@ class MainActivity : AppCompatActivity() {
         // Palm-rejection mode persists across launches; defaults on so
         // accidental finger touches don't draw out of the box.
         stylusOnly = prefs().getBoolean(kPrefStylusOnly, true)
+        // Color picker state — recents + my-slots. Stored as comma-
+        // separated 6-digit hex. "" entries in mySlots persist as empty.
+        loadColorState()
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
@@ -223,22 +291,24 @@ class MainActivity : AppCompatActivity() {
         mainRow.addView(buildToolRail(),
             LinearLayout.LayoutParams(56.dp, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        sidebarScroll = buildPageSidebar()
-        mainRow.addView(sidebarScroll,
-            LinearLayout.LayoutParams(kSidebarWidthDp.dp, ViewGroup.LayoutParams.MATCH_PARENT))
-
-        mainRow.addView(buildLayerPanel(),
-            LinearLayout.LayoutParams(180.dp, ViewGroup.LayoutParams.MATCH_PARENT))
-
-        // Canvas frame: drawing surface + floating undo/redo chip on top.
-        val canvasFrame = FrameLayout(this).apply {
+        // Body: a single FrameLayout that holds the SurfaceView at full
+        // width plus an overlay row of [sidebar | layerPanel] in front.
+        // Keeping the SurfaceView at a fixed size avoids the black flash
+        // that the framework shows for one frame when its EGL surface is
+        // recreated on resize. Toggling the sidebar now shrinks/expands
+        // the overlay's width while the GL surface beneath is untouched.
+        val bodyContainer = FrameLayout(this).apply {
             setBackgroundColor(getColor(R.color.bezel))
         }
+
         val canvas = DrawingSurfaceView(this).also { v ->
             v.onToolChanged = { tool -> onToolChanged(tool) }
             v.onThumbnailsUpdated = { onThumbnailsUpdated() }
             v.stylusOnlyDrawing = stylusOnly
-            canvasFrame.addView(
+            v.onSurfaceFirstSize = { w, h -> applyInitialPageBounds(w, h) }
+            v.onUndoRequested = { userUndo() }
+            v.onSnapToggleRequested = { toggleSnap() }
+            bodyContainer.addView(
                 v,
                 FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -247,9 +317,49 @@ class MainActivity : AppCompatActivity() {
             )
         }
         drawingView = canvas
-        canvasFrame.addView(buildUndoRedoChip(), undoRedoChipParams())
+
+        // panelsRow itself is NOT clickable — instead each child (sidebar,
+        // layer panel) consumes touches inside its own bounds. That way
+        // when the layer panel collapses to WRAP_CONTENT height, the empty
+        // area below it falls through to the SurfaceView at the back of
+        // bodyContainer and the user gets canvas room down there.
+        sidebarScroll = buildPageSidebar().apply { isClickable = true }
+        val panelsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        panelsRow.addView(sidebarScroll,
+            LinearLayout.LayoutParams(kSidebarWidthDp.dp,
+                ViewGroup.LayoutParams.MATCH_PARENT))
+        // Layer panel height is WRAP_CONTENT so collapsing sections (LAYERS
+        // / COLOR via the rail tiles) frees up canvas area below the panel.
+        // gravity=TOP on the LinearLayout keeps it pinned to the top of
+        // its slot so the canvas reveal happens at the bottom.
+        panelsRow.addView(buildLayerPanel().apply { isClickable = true },
+            LinearLayout.LayoutParams(180.dp, ViewGroup.LayoutParams.WRAP_CONTENT))
+        bodyContainer.addView(panelsRow, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.START))
+
+        // Undo/redo chip floats at the visible canvas's top-left, which
+        // is panelsRow.right + 16dp. The marginStart updates whenever
+        // panelsRow's width changes (sidebar toggle).
+        val undoChip = buildUndoRedoChip()
+        val undoChipParams = undoRedoChipParams()
+        bodyContainer.addView(undoChip, undoChipParams)
+        panelsRow.addOnLayoutChangeListener { _, _, _, right, _, _, _, oldRight, _ ->
+            if (right != oldRight) {
+                val lp = undoChip.layoutParams as FrameLayout.LayoutParams
+                lp.marginStart = right + 16.dp
+                undoChip.layoutParams = lp
+                // resetView uses this to fit the page into the
+                // panel-free portion of the canvas.
+                drawingView?.visibleLeftInset = right
+            }
+        }
+
         mainRow.addView(
-            canvasFrame,
+            bodyContainer,
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f)
         )
 
@@ -306,9 +416,15 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY,
             KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY,
             KeyEvent.KEYCODE_STYLUS_BUTTON_TERTIARY -> {
-                if (event.action == KeyEvent.ACTION_DOWN
-                    && keyCode == KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY) {
-                    drawingView?.toggleTool()
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    when (keyCode) {
+                        // Closest-to-nib button: toggle snap.
+                        KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY   -> toggleSnap()
+                        // Middle button: brush ⇄ eraser toggle.
+                        KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY -> drawingView?.toggleTool()
+                        // Furthest-from-nib button: undo.
+                        KeyEvent.KEYCODE_STYLUS_BUTTON_TERTIARY  -> userUndo()
+                    }
                 }
                 return true
             }
@@ -364,19 +480,28 @@ class MainActivity : AppCompatActivity() {
         rail.addView(makeRailToolTile(Tool.SELECT_LASSO,R.drawable.ic_lasso,         "lasso"))
 
         rail.addView(railRule())
-        // Panel toggles. layers/color are present for design fidelity but
-        // don't toggle anything in Phase 1 (their panels are always shown
-        // in the layer column), so they stay unselected to avoid the
-        // visual clutter of every tile reading as active. pages + grid
-        // do reflect real state.
-        rail.addView(toolTile(R.drawable.ic_layers, "layers", isToggle = false) { /* no-op */ })
+        // Panel toggles — each flips visibility of one section in the
+        // layer column or the page sidebar. The selected state on the
+        // tile mirrors whether its section is currently shown, so the
+        // rail reads at a glance.
+        layersRailTile = toolTile(R.drawable.ic_layers, "layers", isToggle = false) { tile ->
+            toggleLayersSection()
+            tile.isSelected = layersSection.visibility == View.VISIBLE
+        } as ImageView
+        layersRailTile.isSelected = true
+        rail.addView(layersRailTile)
         pagesRailTile = toolTile(R.drawable.ic_pages, "pages", isToggle = false) { tile ->
             togglePageSidebar()
             tile.isSelected = sidebarScroll.visibility == View.VISIBLE
         } as ImageView
         pagesRailTile.isSelected = true
         rail.addView(pagesRailTile)
-        rail.addView(toolTile(R.drawable.ic_color, "color", isToggle = false) { /* no-op */ })
+        colorRailTile = toolTile(R.drawable.ic_color, "color", isToggle = false) { tile ->
+            toggleColorSection()
+            tile.isSelected = colorSection.visibility == View.VISIBLE
+        } as ImageView
+        colorRailTile.isSelected = true
+        rail.addView(colorRailTile)
         gridRailTile = toolTile(R.drawable.ic_grid, "grid", isToggle = false) { tile ->
             cycleGrid()
             tile.isSelected = (gridState != 0)
@@ -486,53 +611,80 @@ class MainActivity : AppCompatActivity() {
     // ====================================================================
 
     private fun buildLayerPanel(): View {
+        // Right-edge hairline is baked into the panel's background as a
+        // LayerDrawable (paper layer + 1dp rule layer inset to the right
+        // edge) instead of a separate sibling View. The previous design
+        // used a FrameLayout wrapper with a MATCH_PARENT rule view, but
+        // the rule's MATCH_PARENT height resolved to the full body height
+        // even when the wrapper was WRAP_CONTENT — leaking a thin vertical
+        // line down into the canvas area. With the rule as part of the
+        // background, it naturally clips to the panel's WRAP_CONTENT
+        // height as sections collapse.
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(getColor(R.color.paper))
+            background = android.graphics.drawable.LayerDrawable(arrayOf(
+                android.graphics.drawable.ColorDrawable(getColor(R.color.paper)),
+                android.graphics.drawable.ColorDrawable(getColor(R.color.rule))
+            )).apply {
+                // Inset the rule layer from the left so only a 1dp strip
+                // along the right edge remains visible.
+                setLayerInset(1, 180.dp - 1.dp.coerceAtLeast(1), 0, 0, 0)
+            }
         }
-        // Right-edge hairline (between layer panel and canvas frame).
-        // We add the rule as a sibling inside an outer FrameLayout so the
-        // rule doesn't take vertical space inside the column.
+        // The wrapper is now a no-op pass-through (kept so callers still
+        // get a View) — left in place for symmetry with the rest of the
+        // layer-panel build pipeline.
         val wrapper = FrameLayout(this)
         wrapper.addView(panel, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT
+            ViewGroup.LayoutParams.WRAP_CONTENT
         ))
-        wrapper.addView(View(this).apply {
-            setBackgroundColor(getColor(R.color.rule))
-        }, FrameLayout.LayoutParams(1.dp, ViewGroup.LayoutParams.MATCH_PARENT,
-            Gravity.END))
 
-        // ---- LAYERS section ----
-        panel.addView(buildLayerHeader(),
+        // ---- LAYERS section (collapsible via the rail's layers tile) ----
+        // Wrapped in its own column so toggling visibility takes the
+        // header + list + opacity slider + trailing divider down together.
+        val layersWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        layersWrap.addView(buildLayerHeader(),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp))
         layerListContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        panel.addView(layerListContainer,
+        layersWrap.addView(layerListContainer,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
-
         // Active-layer opacity slider, sitting just under the layer list
         // so it visually belongs to the LAYERS section rather than the
         // BRUSH section below.
-        panel.addView(buildLayerOpacityRow(),
+        layersWrap.addView(buildLayerOpacityRow(),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
+        layersWrap.addView(panelDivider())
+        layersSection = layersWrap
+        panel.addView(layersWrap, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        panel.addView(panelDivider())
-
-        // ---- BRUSH section ----
+        // ---- BRUSH section (always shown) ----
         panel.addView(buildBrushSection(),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        panel.addView(panelDivider())
-
-        // ---- COLOR section ----
-        panel.addView(buildColorSection(),
+        // ---- COLOR section (collapsible via the rail's color tile) ----
+        // Wrapped together with the divider above it so toggling cleanly
+        // removes both the rule and the section content.
+        val colorWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        colorWrap.addView(panelDivider())
+        colorWrap.addView(buildColorSection(),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
+        colorSection = colorWrap
+        panel.addView(colorWrap, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
 
         return wrapper
     }
@@ -1195,11 +1347,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // The COLOR section follows the Design A "shared palette" layout:
+    //   - active+previous swatch pair (Photoshop stack)  +  hex  +  eyedropper
+    //   - 16-cell default palette (2×8)
+    //   - recents strip (8 slots, auto, LRU)
+    //   - my-slots strip (4 slots, long-press to set)
+    // The full picker (HSV square + hue slider) opens via tap on the
+    // active swatch — see ColorPickerDialog. The header still keeps the
+    // tiny chip that mirrors the active color.
+    private lateinit var colorActiveSwatch: View
+    private lateinit var colorPreviousSwatch: View
+    private lateinit var colorHexLabel: TextView
+    private lateinit var colorPaletteGrid: GridLayout
+    private lateinit var colorRecentsRow: LinearLayout
+    private lateinit var colorMySlotsRow: LinearLayout
+
     private fun buildColorSection(): View {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        // Header with a small color chip on the right.
+        // Header with a small color chip on the right (mirrors active).
         val header = FrameLayout(this).apply {
             background = ResourcesCompat.getDrawable(
                 resources, R.drawable.panel_section_header, theme)
@@ -1226,36 +1393,358 @@ class MainActivity : AppCompatActivity() {
         container.addView(header,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 28.dp))
 
-        // 8-swatch grid (placeholder for the full HSV picker that's
-        // designed but not implemented — Phase 2).
-        val grid = GridLayout(this).apply {
-            columnCount = 4
+        // Body padding matches the brush + layer sections.
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setPadding(10.dp, 8.dp, 10.dp, 12.dp)
         }
-        palette.forEach { rgb ->
+
+        // ---- Row 1: active+previous swatches | hex readout | eyedropper -
+        body.addView(buildActiveColorRow(), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 12.dp })
+
+        // ---- Row 2: 16-cell default palette ------------------------------
+        body.addView(makePaletteSubsectionLabel("palette"))
+        colorPaletteGrid = GridLayout(this).apply {
+            columnCount = 8
+        }
+        rebuildPaletteGrid()
+        body.addView(colorPaletteGrid, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 12.dp })
+
+        // ---- Row 3: recents strip ----------------------------------------
+        body.addView(makePaletteSubsectionLabel("recent"))
+        colorRecentsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        rebuildRecentsRow()
+        body.addView(colorRecentsRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 12.dp })
+
+        // ---- Row 4: my-slots strip --------------------------------------
+        body.addView(makePaletteSubsectionLabel("my slots", "long-press to set"))
+        colorMySlotsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        rebuildMySlotsRow()
+        body.addView(colorMySlotsRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        container.addView(body)
+        return container
+    }
+
+    /** Active+previous swatch pair (Photoshop stack) + hex + eyedropper. */
+    private fun buildActiveColorRow(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        // Stacked swatch pair (active 28dp on top, previous 22dp behind).
+        // Each swatch handles its own taps: tapping the active swatch opens
+        // the picker; tapping the exposed corner of the previous swatch
+        // swaps the two so the user can flip back to the prior color
+        // without re-picking. Touch dispatch in FrameLayout goes top-down,
+        // so taps in the overlap region land on the active swatch and the
+        // previous swatch only sees the L-shape of pixels still visible.
+        val stack = FrameLayout(this)
+        colorPreviousSwatch = View(this).apply {
+            setBackgroundColor(0xFF000000.toInt() or previousColorRgb)
+            isClickable = true; isFocusable = true
+            contentDescription = "previous color · tap to swap"
+            setOnClickListener { swapPreviousAndCurrent() }
+        }
+        stack.addView(colorPreviousSwatch, FrameLayout.LayoutParams(22.dp, 22.dp,
+            Gravity.END or Gravity.BOTTOM))
+        colorActiveSwatch = View(this).apply {
+            isClickable = true; isFocusable = true
+            contentDescription = "active color · tap to open picker"
+            // Active swatch with a 1.5dp ink border (we approximate via a
+            // GradientDrawable to avoid needing an XML resource).
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                setColor(0xFF000000.toInt() or currentColorRgb)
+                setStroke(2.dp.coerceAtLeast(1), getColor(R.color.ink))
+            }
+            setOnClickListener { showColorPickerDialog() }
+        }
+        stack.addView(colorActiveSwatch, FrameLayout.LayoutParams(28.dp, 28.dp,
+            Gravity.START or Gravity.TOP))
+        row.addView(stack, LinearLayout.LayoutParams(36.dp, 36.dp).apply {
+            rightMargin = 8.dp
+        })
+
+        // Hex readout — tappable too so the user can also open the picker
+        // by tapping the value.
+        colorHexLabel = TextView(this).apply {
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.ink))
+            text = String.format("#%06X", currentColorRgb)
+            isClickable = true; isFocusable = true
+            setOnClickListener { showColorPickerDialog() }
+        }
+        row.addView(colorHexLabel, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        // Eyedropper button — arms a single-shot sample-from-canvas mode
+        // in DrawingSurfaceView. The next tap on the canvas reads the
+        // pixel under the touch and applies it as the active color.
+        val eyedropper = ImageView(this).apply {
+            setImageResource(R.drawable.ic_eyedropper)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.ink))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(4.dp, 4.dp, 4.dp, 4.dp)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                setStroke(1.dp.coerceAtLeast(1), getColor(R.color.rule))
+                setColor(getColor(R.color.paper))
+            }
+            isClickable = true; isFocusable = true
+            contentDescription = "eyedropper"
+            setOnClickListener { armEyedropper() }
+        }
+        row.addView(eyedropper, LinearLayout.LayoutParams(28.dp, 28.dp))
+        return row
+    }
+
+    private fun makePaletteSubsectionLabel(label: String, hint: String? = null): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 4.dp }
+        }
+        row.addView(TextView(this).apply {
+            text = label
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 9f
+            letterSpacing = 0.08f
+            setTextColor(getColor(R.color.inkSoft))
+        }, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        if (hint != null) {
+            row.addView(TextView(this).apply {
+                text = hint
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 8f
+                setTextColor(getColor(R.color.inkFaint))
+            })
+        }
+        return row
+    }
+
+    private fun rebuildPaletteGrid() {
+        if (!::colorPaletteGrid.isInitialized) return
+        colorPaletteGrid.removeAllViews()
+        val swatchSize = 16.dp
+        val gap = 2.dp
+        for (rgb in palette) {
             val swatch = View(this).apply {
                 setBackgroundColor(0xFF000000.toInt() or rgb)
-                setOnClickListener {
-                    NativeRenderer.setBrushColor(rgb)
-                    currentColorRgb = rgb
-                    updateColorChip()
-                }
+                isClickable = true; isFocusable = true
+                setOnClickListener { setActiveColor(rgb) }
             }
             val lp = GridLayout.LayoutParams().apply {
-                width  = 30.dp
-                height = 22.dp
-                setMargins(2.dp, 2.dp, 2.dp, 2.dp)
+                width  = swatchSize
+                height = swatchSize
+                setMargins(gap, gap, gap, gap)
             }
-            grid.addView(swatch, lp)
+            colorPaletteGrid.addView(swatch, lp)
         }
-        container.addView(grid)
-        return container
+    }
+
+    private fun rebuildRecentsRow() {
+        if (!::colorRecentsRow.isInitialized) return
+        colorRecentsRow.removeAllViews()
+        val swatchSize = 18.dp
+        val gap = 2.dp
+        for (i in 0 until kRecentsMax) {
+            val rgb = recentColors.getOrNull(i)
+            val view = if (rgb != null) View(this).apply {
+                setBackgroundColor(0xFF000000.toInt() or rgb)
+                isClickable = true; isFocusable = true
+                setOnClickListener { setActiveColor(rgb) }
+            } else View(this).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    setStroke(1.dp.coerceAtLeast(1), getColor(R.color.rule),
+                        4f * resources.displayMetrics.density,
+                        3f * resources.displayMetrics.density)
+                    setColor(0)
+                }
+            }
+            colorRecentsRow.addView(view, LinearLayout.LayoutParams(swatchSize, swatchSize)
+                .apply { if (i > 0) leftMargin = gap })
+        }
+    }
+
+    private fun rebuildMySlotsRow() {
+        if (!::colorMySlotsRow.isInitialized) return
+        colorMySlotsRow.removeAllViews()
+        val swatchSize = 28.dp
+        val gap = 4.dp
+        for (i in 0 until kMySlotsCount) {
+            val rgb = mySlots[i]
+            val view = if (rgb != null) View(this).apply {
+                setBackgroundColor(0xFF000000.toInt() or rgb)
+                isClickable = true; isFocusable = true
+                setOnClickListener { setActiveColor(rgb) }
+                setOnLongClickListener {
+                    setMySlot(i, currentColorRgb); true
+                }
+            } else TextView(this).apply {
+                text = "+"
+                gravity = Gravity.CENTER
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 14f
+                setTextColor(getColor(R.color.inkFaint))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    setStroke(1.dp.coerceAtLeast(1), getColor(R.color.rule),
+                        4f * resources.displayMetrics.density,
+                        3f * resources.displayMetrics.density)
+                    setColor(0)
+                }
+                isClickable = true; isFocusable = true
+                setOnClickListener { setMySlot(i, currentColorRgb) }
+            }
+            colorMySlotsRow.addView(view, LinearLayout.LayoutParams(swatchSize, swatchSize)
+                .apply { if (i > 0) leftMargin = gap })
+        }
+    }
+
+    /** Single source of truth for "the user picked a color". Updates the
+     *  native brush color, mirrors into UI state, prepends to recents
+     *  (dedup), and persists. previous tracks the most recent prior value
+     *  so the Photoshop-style stack still reads. */
+    private fun setActiveColor(rgb: Int) {
+        val masked = rgb and 0xFFFFFF
+        if (masked != currentColorRgb) {
+            previousColorRgb = currentColorRgb
+            currentColorRgb  = masked
+        }
+        NativeRenderer.setBrushColor(currentColorRgb)
+        // Prepend to recents (dedup).
+        recentColors.remove(currentColorRgb)
+        recentColors.addFirst(currentColorRgb)
+        while (recentColors.size > kRecentsMax) recentColors.removeLast()
+        saveColorState()
+        refreshColorUi()
+    }
+
+    private fun setMySlot(idx: Int, rgb: Int) {
+        if (idx !in 0 until kMySlotsCount) return
+        mySlots[idx] = rgb and 0xFFFFFF
+        saveColorState()
+        rebuildMySlotsRow()
+    }
+
+    /** Arm the eyedropper. The next tap on the canvas inside
+     *  DrawingSurfaceView samples that pixel and applies it as the
+     *  active color (single-shot). Toast lets the user know the mode
+     *  is armed since there's no other affordance on the canvas. */
+    private fun armEyedropper() {
+        val v = drawingView ?: return
+        v.onColorSampled = { rgb -> setActiveColor(rgb) }
+        v.eyedropperPending = true
+        android.widget.Toast.makeText(this,
+            "tap canvas to sample color",
+            android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    /** Flip active and previous. Goes through native (so the brush color
+     *  follows) and refreshes the UI; intentionally bypasses recents,
+     *  since the swap doesn't represent a fresh choice — the previous
+     *  color is already in the user's history. */
+    private fun swapPreviousAndCurrent() {
+        if (currentColorRgb == previousColorRgb) return
+        val tmp = currentColorRgb
+        currentColorRgb = previousColorRgb
+        previousColorRgb = tmp
+        NativeRenderer.setBrushColor(currentColorRgb)
+        refreshColorUi()
+    }
+
+    /** Open the full picker dialog — Design A's HSV square + hue slider. */
+    private fun showColorPickerDialog() {
+        ColorPickerDialog(
+            context = this,
+            initialRgb = currentColorRgb,
+            mono = fontMono,
+            monoSemibold = fontMonoSemibold,
+            onColorPicked = { rgb -> setActiveColor(rgb) }
+        ).show()
+    }
+
+    /** Refresh every UI element that mirrors the active color. */
+    private fun refreshColorUi() {
+        updateColorChip()
+        if (::colorActiveSwatch.isInitialized) {
+            (colorActiveSwatch.background as?
+                android.graphics.drawable.GradientDrawable)
+                ?.setColor(0xFF000000.toInt() or currentColorRgb)
+        }
+        if (::colorPreviousSwatch.isInitialized) {
+            colorPreviousSwatch.setBackgroundColor(
+                0xFF000000.toInt() or previousColorRgb)
+        }
+        if (::colorHexLabel.isInitialized) {
+            colorHexLabel.text = String.format("#%06X", currentColorRgb)
+        }
+        rebuildRecentsRow()
+        rebuildMySlotsRow()
     }
 
     private fun updateColorChip() {
         if (::colorChip.isInitialized) {
             colorChip.setBackgroundColor(0xFF000000.toInt() or currentColorRgb)
         }
+    }
+
+    private fun loadColorState() {
+        val recentsStr = prefs().getString(kPrefRecents, "") ?: ""
+        recentColors.clear()
+        for (token in recentsStr.split(',')) {
+            val t = token.trim()
+            if (t.length == 6) {
+                runCatching { Integer.parseInt(t, 16) }
+                    .getOrNull()?.let { recentColors.addLast(it and 0xFFFFFF) }
+                if (recentColors.size >= kRecentsMax) break
+            }
+        }
+        val slotsStr = prefs().getString(kPrefMySlots, null)
+        if (slotsStr != null) {
+            val parts = slotsStr.split(',')
+            for (i in 0 until kMySlotsCount) {
+                val t = parts.getOrNull(i)?.trim().orEmpty()
+                mySlots[i] = if (t.length == 6) {
+                    runCatching { Integer.parseInt(t, 16) }.getOrNull()
+                        ?.let { it and 0xFFFFFF }
+                } else null
+            }
+        }
+    }
+
+    private fun saveColorState() {
+        val recentsStr = recentColors.joinToString(",") { String.format("%06X", it) }
+        val slotsStr = mySlots.joinToString(",") { rgb ->
+            if (rgb != null) String.format("%06X", rgb) else ""
+        }
+        prefs().edit()
+            .putString(kPrefRecents, recentsStr)
+            .putString(kPrefMySlots, slotsStr)
+            .apply()
     }
 
     // ====================================================================
@@ -1494,8 +1983,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun togglePageSidebar() {
+        // GONE so the layer panel can shift left and the canvas can claim
+        // the freed space. The canvas right edge stays put (it's already
+        // pinned to the screen edge), and DrawingSurfaceView.onSizeChanged
+        // shifts viewPanX by the width delta so existing strokes don't
+        // appear to slide on screen — only new room appears on the left.
         sidebarScroll.visibility =
             if (sidebarScroll.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+    }
+
+    /** Show / hide the LAYERS section in the layer panel. The wrapper
+     *  contains the header, list, opacity slider, and the trailing
+     *  divider — toggling visibility removes them all together so the
+     *  remaining sections close up cleanly. */
+    private fun toggleLayersSection() {
+        if (!::layersSection.isInitialized) return
+        layersSection.visibility =
+            if (layersSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+    }
+
+    /** Show / hide the COLOR section. Same wrapper pattern as layers —
+     *  the leading divider is included so the panel doesn't end on a
+     *  stray rule when the section is collapsed. */
+    private fun toggleColorSection() {
+        if (!::colorSection.isInitialized) return
+        colorSection.visibility =
+            if (colorSection.visibility == View.VISIBLE) View.GONE else View.VISIBLE
     }
 
     // ====================================================================
@@ -1604,6 +2117,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showOverflowMenu(anchor: View) {
         val menu = PopupMenu(this, anchor, Gravity.END)
+        menu.menu.add("Import image…")
+        menu.menu.add("Export canvas as PNG…")
+        menu.menu.add("Export document as PDF…")
         menu.menu.add("Snap: ${if (snapEnabled) "on" else "off"}")
         menu.menu.add("Stylus only: ${if (stylusOnly) "on" else "off"}")
         menu.menu.add("Delete selection")
@@ -1612,16 +2128,209 @@ class MainActivity : AppCompatActivity() {
         menu.setOnMenuItemClickListener { item ->
             val title = item.title.toString()
             when {
-                title == "Delete selection"       -> userDeleteSelection()
-                title == "Copy"                   -> drawingView?.queueCopySelection()
-                title == "Paste"                  -> drawingView?.queuePasteSelection()
-                title.startsWith("Snap:")         -> toggleSnap()
-                title.startsWith("Stylus only:")  -> toggleStylusOnly()
+                title == "Import image…"            -> launchImageImport()
+                title == "Export canvas as PNG…"    -> launchCanvasPngExport()
+                title == "Export document as PDF…"  -> launchDocumentPdfExport()
+                title == "Delete selection"         -> userDeleteSelection()
+                title == "Copy"                     -> drawingView?.queueCopySelection()
+                title == "Paste"                    -> drawingView?.queuePasteSelection()
+                title.startsWith("Snap:")           -> toggleSnap()
+                title.startsWith("Stylus only:")    -> toggleStylusOnly()
             }
             true
         }
         menu.show()
     }
+
+    /** Default name for the active page's PNG export. Pages are 1-indexed
+     *  in the user-facing name to match the page-number badge in the
+     *  sidebar (which also displays "01", "02", etc.). */
+    private fun defaultPngFilename(): String {
+        val pageIdx = NativeRenderer.getActivePage()
+        val docName = currentDocName.ifBlank { "Untitled" }
+        return "${docName}_p${pageIdx + 1}.png"
+    }
+
+    private fun defaultPdfFilename(): String {
+        val docName = currentDocName.ifBlank { "Untitled" }
+        return "${docName}.pdf"
+    }
+
+    private fun launchCanvasPngExport() {
+        canvasPngLauncher.launch(defaultPngFilename())
+    }
+
+    private fun launchDocumentPdfExport() {
+        documentPdfLauncher.launch(defaultPdfFilename())
+    }
+
+    /** Compute the natural export resolution. Falls back to the SurfaceView
+     *  size when no page bounds are set (the doc behaves as an infinite
+     *  plane in that mode). Capped to a sane upper bound so we don't try
+     *  to allocate gigabytes for a thousand-page export. */
+    private fun computeExportDimensions(): Pair<Int, Int> {
+        val pw = NativeRenderer.getPageWidth()
+        val ph = NativeRenderer.getPageHeight()
+        if (pw > 0 && ph > 0) return Pair(pw.coerceAtMost(kExportMaxDim),
+                                          ph.coerceAtMost(kExportMaxDim))
+        val v = drawingView
+        val w = (v?.width  ?: 1024).coerceAtLeast(1).coerceAtMost(kExportMaxDim)
+        val h = (v?.height ?: 1024).coerceAtLeast(1).coerceAtMost(kExportMaxDim)
+        return Pair(w, h)
+    }
+
+    private val kExportMaxDim = 4096
+
+    /** Render the active page into a fresh bitmap on the GL thread,
+     *  then write it to [uri] as a PNG. Failure → toast; the bitmap is
+     *  always recycled. */
+    private fun exportActivePageToPng(uri: Uri) {
+        val v = drawingView ?: return
+        val (w, h) = computeExportDimensions()
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val pageIdx = NativeRenderer.getActivePage()
+        v.queueExportRender(
+            listOf(DrawingSurfaceView.ExportPage(pageIdx, bitmap))
+        ) {
+            try {
+                contentResolver.openOutputStream(uri)?.use { os ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, os)
+                }
+                android.widget.Toast.makeText(this,
+                    "Exported PNG", android.widget.Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                android.util.Log.e("DrawingApp", "PNG export failed", e)
+                android.widget.Toast.makeText(this,
+                    "Export failed: ${e.message}",
+                    android.widget.Toast.LENGTH_LONG).show()
+            } finally {
+                bitmap.recycle()
+            }
+        }
+    }
+
+    /** Render every page into its own bitmap on the GL thread, then
+     *  build a multi-page PdfDocument with one bitmap per page (1 doc-px
+     *  = 1 PDF point — keeps the on-paper geometry intact). */
+    private fun exportDocumentToPdf(uri: Uri) {
+        val v = drawingView ?: return
+        val (w, h) = computeExportDimensions()
+        val pageCount = NativeRenderer.getPageCount().coerceAtLeast(1)
+        val bitmaps = (0 until pageCount).map {
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        }
+        val renders = bitmaps.mapIndexed { i, b ->
+            DrawingSurfaceView.ExportPage(i, b)
+        }
+        v.queueExportRender(renders) {
+            try {
+                val pdf = android.graphics.pdf.PdfDocument()
+                for ((i, bmp) in bitmaps.withIndex()) {
+                    val info = android.graphics.pdf.PdfDocument.PageInfo
+                        .Builder(w, h, i + 1).create()
+                    val page = pdf.startPage(info)
+                    page.canvas.drawBitmap(bmp, 0f, 0f, null)
+                    pdf.finishPage(page)
+                }
+                contentResolver.openOutputStream(uri)?.use { os ->
+                    pdf.writeTo(os)
+                }
+                pdf.close()
+                android.widget.Toast.makeText(this,
+                    "Exported PDF · $pageCount page${if (pageCount == 1) "" else "s"}",
+                    android.widget.Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                android.util.Log.e("DrawingApp", "PDF export failed", e)
+                android.widget.Toast.makeText(this,
+                    "Export failed: ${e.message}",
+                    android.widget.Toast.LENGTH_LONG).show()
+            } finally {
+                bitmaps.forEach { it.recycle() }
+            }
+        }
+    }
+
+    /** Open the system image picker. Result handled in the launcher
+     *  registered in onCreate, which calls [decodeAndImportImage]. */
+    private fun launchImageImport() {
+        // GetContent's input is the MIME type filter.
+        imagePickerLauncher.launch("image/*")
+    }
+
+    /** Decode a picked image, downsample if oversized, and hand the
+     *  ARGB pixel array to native. The new layer + floating selection
+     *  appear once the GL thread drains the action; we sync the layer
+     *  panel + force a redraw so the user sees the import immediately. */
+    private fun decodeAndImportImage(uri: Uri) {
+        val bitmap = try {
+            decodeBitmapBoundedTo(uri, kImportMaxDim)
+        } catch (e: Exception) {
+            android.util.Log.e("DrawingApp", "image import: decode failed", e)
+            null
+        }
+        if (bitmap == null) {
+            android.widget.Toast.makeText(this,
+                "Couldn't load that image",
+                android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val w = bitmap.width
+        val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        bitmap.recycle()
+        val ok = NativeRenderer.importImageAsSelection(w, h, pixels)
+        if (!ok) {
+            android.widget.Toast.makeText(this,
+                "Image import failed",
+                android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        drawingView?.forceRedraw()
+        // The new layer becomes active in the drain; the panel needs to
+        // reflect it. ~60ms gives the GL thread time to run the action.
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
+    /** Decode the URI, downsampling on the way in if either dimension
+     *  exceeds [maxDim]. Two-pass: first inJustDecodeBounds to get the
+     *  raw size, then a real decode with inSampleSize. Returns ARGB_8888. */
+    private fun decodeBitmapBoundedTo(uri: Uri, maxDim: Int): Bitmap? {
+        // Probe size.
+        val opts = android.graphics.BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        contentResolver.openInputStream(uri)?.use {
+            android.graphics.BitmapFactory.decodeStream(it, null, opts)
+        }
+        val w0 = opts.outWidth
+        val h0 = opts.outHeight
+        if (w0 <= 0 || h0 <= 0) return null
+        // Largest power-of-2 inSampleSize that keeps both dims ≥ maxDim.
+        var sample = 1
+        while (w0 / (sample * 2) >= maxDim || h0 / (sample * 2) >= maxDim) {
+            sample *= 2
+        }
+        val realOpts = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val bmp = contentResolver.openInputStream(uri)?.use {
+            android.graphics.BitmapFactory.decodeStream(it, null, realOpts)
+        } ?: return null
+        // Final clamp: even after inSampleSize, the dimension can still
+        // exceed maxDim by up to 2x. Scale down if so.
+        val scale = (maxDim.toFloat() / maxOf(bmp.width, bmp.height)).coerceAtMost(1f)
+        return if (scale < 1f) {
+            val nw = (bmp.width  * scale).toInt().coerceAtLeast(1)
+            val nh = (bmp.height * scale).toInt().coerceAtLeast(1)
+            val scaled = Bitmap.createScaledBitmap(bmp, nw, nh, true)
+            if (scaled !== bmp) bmp.recycle()
+            scaled
+        } else bmp
+    }
+
+    private val kImportMaxDim = 2048
 
     private fun showLayerOverflow(anchor: View) {
         val menu = PopupMenu(this, anchor, Gravity.END)
@@ -1889,19 +2598,232 @@ class MainActivity : AppCompatActivity() {
     }
     private fun lastOpenedDocName(): String? = prefs().getString(kPrefLastDoc, null)
 
-    private fun switchToDocument(name: String) {
+    /** Switch to (or open) a document. If [sizeOverride] is non-null,
+     *  the doc's page rect is reset to those dimensions and persisted —
+     *  used by the new-document dialog. Otherwise we read the saved
+     *  size from &lt;docDir&gt;/page_size.txt; legacy docs (no file) get
+     *  their current surface dims written back as a self-heal step so
+     *  every doc has a stable page rect from then on. */
+    private fun switchToDocument(name: String, sizeOverride: Pair<Int, Int>? = null) {
         val dir = docDirFor(name).apply { mkdirs() }
+        if (sizeOverride != null) {
+            writePageSize(dir, sizeOverride.first, sizeOverride.second)
+        }
+        var size = readPageSize(dir)
+        if (size == null) {
+            // Legacy / never-saved doc: lock in the current canvas dims.
+            // Falls back to a sensible default if the surface isn't laid
+            // out yet (e.g. very early in onCreate).
+            val v = drawingView
+            val w = (v?.width  ?: 1024).coerceAtLeast(1)
+            val h = (v?.height ?: 1024).coerceAtLeast(1)
+            writePageSize(dir, w, h)
+            size = Pair(w, h)
+        }
+        NativeRenderer.setPageBounds(0f, 0f, size.first.toFloat(), size.second.toFloat())
         currentDocName = name
         rememberDocName(name)
         if (::statusDocText.isInitialized) statusDocText.text = "doc · $name"
         NativeRenderer.loadDocument(dir.absolutePath)
         drawingView?.forceRedraw()
+        // Frame the new doc's page in the visible canvas, same as the
+        // launch-time path does. post() so the layout listeners (which
+        // update visibleLeftInset on panel toggles) get a chance to fire
+        // first if anything is mid-resize when we get here.
+        drawingView?.post { drawingView?.resetView() }
         lastBuiltPageCount = -1
         lastBuiltActivePage = -1
     }
 
+    /** Open the new-document size dialog, then create the doc with the
+     *  chosen size. Cancel falls back to no-op (no document is created). */
     private fun userNewDocument() {
-        switchToDocument(nextUntitledName())
+        showNewDocumentSizeDialog { size ->
+            switchToDocument(nextUntitledName(), size)
+        }
+    }
+
+    /** Build and show the new-document size picker. Presets cover the
+     *  common cases (current device default, US Letter, A4, a 2× hi-res
+     *  default) plus a Custom row for arbitrary dimensions. The chosen
+     *  size is delivered to [onPick]; Cancel does nothing. */
+    private fun showNewDocumentSizeDialog(onPick: (Pair<Int, Int>) -> Unit) {
+        val v = drawingView
+        val defaultW = (v?.width  ?: 1024).coerceAtLeast(1)
+        val defaultH = (v?.height ?: 1024).coerceAtLeast(1)
+
+        // (label, w, h) — null entry = the Custom row.
+        data class Preset(val label: String, val w: Int, val h: Int)
+        val presets = listOf(
+            Preset("Default · ${defaultW} × ${defaultH}",         defaultW, defaultH),
+            Preset("Letter portrait · 1700 × 2200",               1700, 2200),
+            Preset("Letter landscape · 2200 × 1700",              2200, 1700),
+            Preset("A4 portrait · 1654 × 2339",                   1654, 2339),
+            Preset("A4 landscape · 2339 × 1654",                  2339, 1654),
+            Preset("High-res default · ${defaultW * 2} × ${defaultH * 2}",
+                                                                  defaultW * 2, defaultH * 2)
+        )
+
+        val pad = 16.dp
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, 8.dp, pad, 8.dp)
+        }
+
+        // Selected preset index (or null if Custom is being edited).
+        var selectedIdx: Int? = 0
+        val radioGroup = android.widget.RadioGroup(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val radios = presets.mapIndexed { i, p ->
+            android.widget.RadioButton(this).apply {
+                text = p.label
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 12f
+                setTextColor(getColor(R.color.ink))
+                isChecked = (i == 0)
+                radioGroup.addView(this, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT))
+            }
+        }
+        // Custom radio + two number inputs.
+        val customRadio = android.widget.RadioButton(this).apply {
+            text = "Custom"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(getColor(R.color.ink))
+            radioGroup.addView(this, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        container.addView(radioGroup, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val customRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(28.dp, 0, 0, 0)
+        }
+        val widthEdit = android.widget.EditText(this).apply {
+            setText(defaultW.toString())
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            isSingleLine = true
+            filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(5))
+            typeface = fontMono ?: Typeface.MONOSPACE
+        }
+        val heightEdit = android.widget.EditText(this).apply {
+            setText(defaultH.toString())
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            isSingleLine = true
+            filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(5))
+            typeface = fontMono ?: Typeface.MONOSPACE
+        }
+        val xLabel = TextView(this).apply {
+            text = " × "
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        customRow.addView(widthEdit,  LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        customRow.addView(xLabel)
+        customRow.addView(heightEdit, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(customRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        // Manage radio exclusivity manually since RadioGroup only owns
+        // one set; clicking a preset deselects Custom and vice versa.
+        val allButtons = radios + customRadio
+        for ((i, btn) in allButtons.withIndex()) {
+            btn.setOnClickListener {
+                for (other in allButtons) other.isChecked = (other === btn)
+                selectedIdx = if (btn === customRadio) null else i
+                if (btn === customRadio) widthEdit.requestFocus()
+            }
+        }
+        // Editing either field auto-selects Custom.
+        val selectCustom = {
+            for (other in allButtons) other.isChecked = (other === customRadio)
+            selectedIdx = null
+        }
+        val watcher = object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                if (selectedIdx != null) selectCustom()
+            }
+        }
+        widthEdit.addTextChangedListener(watcher)
+        heightEdit.addTextChangedListener(watcher)
+
+        AlertDialog.Builder(this)
+            .setTitle("New document")
+            .setView(container)
+            .setPositiveButton("Create") { _, _ ->
+                val sizeIdx = selectedIdx
+                val size = if (sizeIdx != null) {
+                    Pair(presets[sizeIdx].w, presets[sizeIdx].h)
+                } else {
+                    val w = widthEdit.text.toString().toIntOrNull()
+                        ?.coerceIn(64, 8192)
+                    val h = heightEdit.text.toString().toIntOrNull()
+                        ?.coerceIn(64, 8192)
+                    if (w == null || h == null) {
+                        android.widget.Toast.makeText(this,
+                            "Custom size must be 64–8192",
+                            android.widget.Toast.LENGTH_SHORT).show()
+                        return@setPositiveButton
+                    }
+                    Pair(w, h)
+                }
+                onPick(size)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private val kPageSizeFile = "page_size.txt"
+
+    private fun readPageSize(dir: java.io.File): Pair<Int, Int>? {
+        val f = java.io.File(dir, kPageSizeFile)
+        if (!f.exists()) return null
+        val txt = runCatching { f.readText().trim() }.getOrNull() ?: return null
+        val parts = txt.split('x', 'X', '×')
+        if (parts.size != 2) return null
+        val w = parts[0].trim().toIntOrNull() ?: return null
+        val h = parts[1].trim().toIntOrNull() ?: return null
+        if (w <= 0 || h <= 0) return null
+        return Pair(w, h)
+    }
+
+    private fun writePageSize(dir: java.io.File, w: Int, h: Int) {
+        runCatching {
+            java.io.File(dir, kPageSizeFile).writeText("${w}x${h}")
+        }.onFailure { android.util.Log.e("DrawingApp", "writePageSize failed", it) }
+    }
+
+    /** Called once, the first time the SurfaceView has dims. Reads the
+     *  initial document's saved page size if present; otherwise locks
+     *  in the surface dims as the doc's page size and writes the file
+     *  so future loads of this doc are deterministic. Schedules a fit-
+     *  to-canvas reset on the next frame so launches open with the
+     *  whole page visible (mirrors the rail's reset-view button) — the
+     *  post() defers until panelsRow's layout listener has updated the
+     *  visibleLeftInset, otherwise the fit math is off by the panel
+     *  width. */
+    private fun applyInitialPageBounds(surfaceW: Int, surfaceH: Int) {
+        val dir = docDirFor(currentDocName).apply { mkdirs() }
+        val saved = readPageSize(dir)
+        val (w, h) = if (saved != null) saved else {
+            writePageSize(dir, surfaceW, surfaceH)
+            Pair(surfaceW, surfaceH)
+        }
+        NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())
+        drawingView?.post { drawingView?.resetView() }
     }
 
     private fun userDeleteCurrentDocument() {

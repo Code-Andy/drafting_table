@@ -226,7 +226,39 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 }
                 post { onThumbnailsUpdated?.invoke() }
             }
+
+            // Drain any queued export render. Same pattern as the
+            // thumbnail targets — bitmaps allocated on the UI thread, GL
+            // thread fills the pixels, then we post the completion to
+            // the UI thread to do the actual file write / encoding.
+            val exportReq = pendingExportRequest
+            if (exportReq != null) {
+                pendingExportRequest = null
+                for ((idx, bitmap) in exportReq.pages) {
+                    if (idx in 0 until NativeRenderer.getPageCount()) {
+                        NativeRenderer.renderPageThumbnail(idx, bitmap)
+                    }
+                }
+                post { exportReq.onComplete() }
+            }
         }
+    }
+
+    // Export render queue. queueExportRender stashes a request from the
+    // UI thread; the next onDrawMultiBufferedLayer drains it and fills
+    // each (pageIdx, bitmap) pair on the GL thread. After the pixels are
+    // written, the completion callback runs on the UI thread.
+    data class ExportPage(val pageIdx: Int, val bitmap: android.graphics.Bitmap)
+    private data class ExportRequest(
+        val pages: List<ExportPage>,
+        val onComplete: () -> Unit,
+    )
+    @Volatile
+    private var pendingExportRequest: ExportRequest? = null
+
+    fun queueExportRender(pages: List<ExportPage>, onComplete: () -> Unit) {
+        pendingExportRequest = ExportRequest(pages, onComplete)
+        forceRedraw()
     }
 
     // Map of page index → Bitmap to write thumbnail pixels into. Set by
@@ -275,6 +307,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private val tmpDocToView = FloatArray(16)
     private val tmpComposed = FloatArray(16)
 
+    // Most recent framework-supplied view→buffer matrix, captured every
+    // onDraw{Front,Multi}BufferedLayer callback. The eyedropper handler
+    // reads it on the UI thread to map a view-px touch into buffer-px
+    // before submitting the sample request to native. Only changes on
+    // surface rotation, so a one-frame stale snapshot is fine.
+    private var lastFramebufferTransform: FloatArray? = null
+
     /** Convert a view-pixel coordinate to its doc-pixel equivalent. */
     private fun viewToDoc(vx: Float, vy: Float, out: FloatArray) {
         val tx = vx - viewPanX
@@ -304,8 +343,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     /** Compose framework's view→buffer transform with our doc→view, giving
-     *  the doc→buffer matrix the native shaders consume as `uTransform`. */
+     *  the doc→buffer matrix the native shaders consume as `uTransform`.
+     *  Side effect: caches the framebufferTransform for the eyedropper. */
     private fun composedTransform(framebufferTransform: FloatArray): FloatArray {
+        // Snapshot for the eyedropper's view-px → buffer-px mapping.
+        if (lastFramebufferTransform == null ||
+            !lastFramebufferTransform.contentEqualsLocal(framebufferTransform)) {
+            lastFramebufferTransform = framebufferTransform.copyOf()
+        }
         fillDocToViewMatrix(tmpDocToView)
         Matrix.multiplyMM(tmpComposed, 0,
             framebufferTransform, 0,
@@ -313,12 +358,48 @@ class DrawingSurfaceView @JvmOverloads constructor(
         return tmpComposed
     }
 
-    /** Reset view transform to identity. Forces a redraw. */
+    private fun FloatArray?.contentEqualsLocal(other: FloatArray): Boolean {
+        val a = this ?: return false
+        if (a.size != other.size) return false
+        for (i in a.indices) if (a[i] != other[i]) return false
+        return true
+    }
+
+    /** Visible canvas inset in view-px (typically the right edge of the
+     *  panels overlay). MainActivity updates this whenever the layer +
+     *  sidebar columns resize so resetView's fit math accounts for the
+     *  obscured strip on the left. Zero = no inset (full SurfaceView is
+     *  visible to the user). */
+    var visibleLeftInset: Int = 0
+
+    /** Frame the page rect in the visible canvas area. If page bounds
+     *  aren't set we fall back to identity (the doc behaves as an
+     *  infinite plane in that mode and there's no natural "frame"). */
     fun resetView() {
-        viewScale = 1.0f
-        viewRotation = 0.0f
-        viewPanX = 0.0f
-        viewPanY = 0.0f
+        val pageW = NativeRenderer.getPageWidth()
+        val pageH = NativeRenderer.getPageHeight()
+        viewRotation = 0f
+        if (pageW > 0 && pageH > 0 && width > 0 && height > 0) {
+            // Visible canvas region after subtracting the left-side
+            // overlay (sidebar + layer panel). Page is fitted edge-to-
+            // edge — the dominant axis hits the visible bounds exactly,
+            // and the orthogonal axis centers the leftover slack.
+            val avail  = (width - visibleLeftInset).toFloat()
+            val availH = height.toFloat()
+            val sx = avail  / pageW.toFloat()
+            val sy = availH / pageH.toFloat()
+            val s  = minOf(sx, sy).coerceAtLeast(0.01f)
+            viewScale = s
+            // Center the scaled page within the visible region. The
+            // doc→view mapping is view = scale*doc + viewPan, so the
+            // page top-left lands at (viewPanX, viewPanY) in view-px.
+            viewPanX = visibleLeftInset + (avail  - s * pageW) * 0.5f
+            viewPanY = (availH - s * pageH) * 0.5f
+        } else {
+            viewScale = 1f
+            viewPanX = 0f
+            viewPanY = 0f
+        }
         NativeRenderer.setViewScale(viewScale)
         forceRedraw()
     }
@@ -331,6 +412,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var shapeP1Y = 0f
 
     private var currentTool = Tool.BRUSH
+
+    // Eyedropper. Single-shot: once `eyedropperPending` is true, the next
+    // ACTION_DOWN inside this view samples the pixel under the touch and
+    // fires `onColorSampled` with the resulting RGB. The flag clears
+    // automatically after the sample completes (or fails).
+    var eyedropperPending: Boolean = false
+    var onColorSampled: ((rgb: Int) -> Unit)? = null
+    private val tmpBufferPx = FloatArray(2)
 
     /** Notified after the active tool changes (from the UI button or
      *  the stylus side-button). MainActivity uses this to refresh the
@@ -379,8 +468,11 @@ class DrawingSurfaceView @JvmOverloads constructor(
         onToolChanged?.invoke(currentTool)
     }
 
-    /** Public so MainActivity's tool button can route through the same
-     *  code path the stylus side-button uses. Cycles through every tool. */
+    /** Public so the stylus side-button (and the matching key-event path
+     *  in MainActivity) can route through the same code. Toggles the
+     *  brush/eraser pair: brush → eraser, eraser → brush, anything else
+     *  → brush. The pair are the only two raster stroke tools, so this
+     *  is the most common in-flow swap. */
     fun toggleTool() {
         // Auto-commit any floating raster selection before swapping tools
         // so the user doesn't lose their work or end up with a stranded
@@ -391,23 +483,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
             forceRedraw()
         }
         currentTool = when (currentTool) {
-            Tool.BRUSH       -> Tool.ERASER
-            Tool.ERASER      -> Tool.BUCKET
-            Tool.BUCKET      -> Tool.LINE
-            Tool.LINE        -> Tool.RECTANGLE
-            Tool.RECTANGLE   -> Tool.CIRCLE
-            Tool.CIRCLE      -> Tool.ELLIPSE
-            Tool.ELLIPSE     -> Tool.SELECT
-            Tool.SELECT       -> Tool.SELECT_RECT
-            Tool.SELECT_RECT  -> Tool.SELECT_LASSO
-            Tool.SELECT_LASSO -> Tool.BRUSH
+            Tool.BRUSH  -> Tool.ERASER
+            Tool.ERASER -> Tool.BRUSH
+            else        -> Tool.BRUSH
         }
-        // Native only knows about the raster stroke tools (brush/eraser);
-        // shape and select tools are handled entirely on the Kotlin side
-        // via their own gesture paths.
-        if (currentTool == Tool.BRUSH || currentTool == Tool.ERASER) {
-            NativeRenderer.setTool(currentTool.nativeId)
-        }
+        // Both sides of the toggle are raster stroke tools — push the
+        // ID to native so the bake path uses the right blend mode.
+        NativeRenderer.setTool(currentTool.nativeId)
         Log.i("DrawingApp", "tool -> ${currentTool.name.lowercase()}")
         onToolChanged?.invoke(currentTool)
     }
@@ -426,12 +508,38 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *      event.buttonState (catches presses during hover that don't
      *      generate ACTION_BUTTON_PRESS).
      */
+    /** Fired when the stylus's furthest-from-nib button is pressed.
+     *  MainActivity wires this to userUndo so the layer panel sync
+     *  fires alongside the native undo (matches the on-screen chip). */
+    var onUndoRequested: (() -> Unit)? = null
+
+    /** Fired when the stylus's closest-to-nib button is pressed.
+     *  Toggles snapping on/off — handy mid-stroke when starting a
+     *  vector action snapped but wanting to finish it free-hand. */
+    var onSnapToggleRequested: (() -> Unit)? = null
+
     private fun handleStylusButton(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
             val ab = event.actionButton
-            Log.i("DrawingApp", "ACTION_BUTTON_PRESS: 0x${ab.toString(16)}")
             if (ab == MotionEvent.BUTTON_STYLUS_SECONDARY) {
                 toggleTool()
+                prevButtonState = event.buttonState
+                return true
+            }
+            if (ab == MotionEvent.BUTTON_TERTIARY) {
+                // MovinkPad's furthest-from-nib button reports via the
+                // legacy BUTTON_TERTIARY bit. ACTION_BUTTON_PRESS and
+                // the state-transition path below both cover it.
+                onUndoRequested?.invoke()
+                prevButtonState = event.buttonState
+                return true
+            }
+            // Closest-to-nib button — covered both standard
+            // BUTTON_STYLUS_PRIMARY (0x20) and the legacy BUTTON_SECONDARY
+            // (0x2) aliases, since EMR devices report it inconsistently.
+            if (ab == MotionEvent.BUTTON_STYLUS_PRIMARY
+                || ab == MotionEvent.BUTTON_SECONDARY) {
+                onSnapToggleRequested?.invoke()
                 prevButtonState = event.buttonState
                 return true
             }
@@ -439,11 +547,31 @@ class DrawingSurfaceView @JvmOverloads constructor(
         val state = event.buttonState
         val newlyPressed = state and prevButtonState.inv()
         prevButtonState = state
-        if (newlyPressed and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) {
+        // Diagnostic: unmapped newly-pressed bits get logged so future
+        // unmapped buttons surface in logcat without code changes.
+        val mapped = MotionEvent.BUTTON_STYLUS_SECONDARY or
+                     MotionEvent.BUTTON_TERTIARY or
+                     MotionEvent.BUTTON_STYLUS_PRIMARY or
+                     MotionEvent.BUTTON_SECONDARY or
+                     MotionEvent.BUTTON_PRIMARY  // pen tip; expected
+        val unmapped = newlyPressed and mapped.inv()
+        if (unmapped != 0) {
             Log.i("DrawingApp",
-                "stylus button transition (during action=${event.actionMasked}): " +
-                "0x${newlyPressed.toString(16)}")
+                "stylus button: unmapped newly=0x${unmapped.toString(16)} " +
+                "state=0x${state.toString(16)}")
+        }
+        if (newlyPressed and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) {
             toggleTool()
+            return true
+        }
+        if (newlyPressed and MotionEvent.BUTTON_TERTIARY != 0) {
+            onUndoRequested?.invoke()
+            return true
+        }
+        if (newlyPressed and
+            (MotionEvent.BUTTON_STYLUS_PRIMARY
+             or MotionEvent.BUTTON_SECONDARY) != 0) {
+            onSnapToggleRequested?.invoke()
             return true
         }
         return false
@@ -648,6 +776,22 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // Palm-rejection gate: in stylus-only mode, finger/palm contacts
         // are consumed but not dispatched. Stylus events fall through.
         if (stylusOnlyDrawing && tt != MotionEvent.TOOL_TYPE_STYLUS) {
+            return true
+        }
+        // Eyedropper takes precedence over the active tool. While the
+        // mode is armed, every touch event is swallowed — the FIRST DOWN
+        // fires the sample, MOVE / extra DOWNs do nothing, UP / CANCEL
+        // disarms. Critically we DO NOT disarm before UP, otherwise the
+        // trailing MOVE+UP fall through to handleStrokeEvent and a dab
+        // gets painted at the touch point (which then becomes whatever
+        // glReadPixels reads back, defeating the eyedropper).
+        if (eyedropperPending) {
+            when (action) {
+                MotionEvent.ACTION_DOWN -> handleEyedropperTap(event.x, event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    eyedropperPending = false
+                }
+            }
             return true
         }
         return when (currentTool) {
@@ -857,6 +1001,34 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  no GL context is current on the UI thread — so we just stash the
      *  request and trigger a multi-buffer pass. The pass's GL-thread
      *  callback (onDrawMultiBufferedLayer) actually runs the fill. */
+
+    /** Eyedropper: convert the view-px touch to buffer-px via the cached
+     *  framework view→buffer matrix, queue a sample request to native,
+     *  then poll for the result one frame later. The cached transform is
+     *  identity on a non-rotated SurfaceView (the MovinkPad's case), but
+     *  applying it makes us future-proof against orientation changes. */
+    private fun handleEyedropperTap(viewX: Float, viewY: Float) {
+        // The caller (onTouchEvent) keeps eyedropperPending=true through
+        // the rest of the gesture; clearing happens on UP/CANCEL. Don't
+        // touch the flag here.
+        // The native sampler reads tile FBOs directly, so we want
+        // doc-space coordinates. viewToDoc handles scale/rotation/pan.
+        viewToDoc(viewX, viewY, tmpDoc)
+        NativeRenderer.requestColorSample(tmpDoc[0], tmpDoc[1])
+        // Trigger a multi-buffer pass so the GL thread actually performs
+        // the sample. requestColorSample already cleared the prior result.
+        forceRedraw()
+
+        // Poll the result a couple of frames later — at 90 Hz a single
+        // frame is ~11ms, but the framework can defer the multi-buffer
+        // pass slightly. ~60ms is generous and still feels instant.
+        val cb = onColorSampled
+        postDelayed({
+            val rgb = NativeRenderer.getLastSampledColor()
+            if (rgb >= 0 && cb != null) cb(rgb)
+        }, 60L)
+    }
+
     private fun handleBucketEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             viewToDoc(event.x, event.y, tmpDoc)
@@ -1029,21 +1201,29 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
     private var pageBoundsInitialized = false
 
+    /** Optional callback fired once the surface has dims for the first
+     *  time. MainActivity uses it to consult the active doc's saved
+     *  page_size.txt and call setPageBounds with the right dimensions
+     *  (rather than the surface dims, which can be larger now that the
+     *  side panels overlay the SurfaceView). */
+    var onSurfaceFirstSize: ((Int, Int) -> Unit)? = null
+
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         Log.i("DrawingApp", "onSizeChanged ${oldw}x${oldh} -> ${w}x${h}")
-        // First time we know the surface size, kick a multi-buffer pass so
-        // the saved document loads and shows immediately on app launch
-        // (rather than only appearing after the first stroke commit). The
-        // gate used to be `(oldw == 0 && oldh == 0)`, but with the new
-        // multi-column layout the surface can be measured at an
-        // intermediate non-zero size first and we'd silently skip the
-        // bounds set. Track explicitly instead.
+        // First time we know the surface size, hand control over to
+        // MainActivity so it can decide what page bounds to apply (saved
+        // dims for an existing doc, surface fallback for a legacy one).
+        // We still kick a multi-buffer pass either way so the saved
+        // document loads and shows immediately on app launch.
         if (!pageBoundsInitialized && w > 0 && h > 0) {
             pageBoundsInitialized = true
-            // Page-boundary rectangle defaults to the initial visible
-            // viewport — what the user sees as "the page" at startup.
-            NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())
+            val cb = onSurfaceFirstSize
+            if (cb != null) {
+                cb(w, h)
+            } else {
+                NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())
+            }
             renderer?.commit()
         }
     }

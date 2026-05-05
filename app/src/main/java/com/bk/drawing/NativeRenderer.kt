@@ -378,6 +378,13 @@ object NativeRenderer {
     external fun getLayerCount(): Int
     external fun getActiveLayer(): Int
 
+    /** Page rect dimensions in doc-px. Returns 0 when no page bounds
+     *  are active; in that case the caller should fall back to the
+     *  current SurfaceView size (the document behaves as an infinite
+     *  plane). Used by the exporter to pick a 1:1 output resolution. */
+    external fun getPageWidth(): Int
+    external fun getPageHeight(): Int
+
     /**
      * Per-layer metadata accessors for the active page.
      *
@@ -449,6 +456,36 @@ object NativeRenderer {
      * Per-page contents are preserved. Queued.
      */
     external fun movePage(fromIdx: Int, toIdx: Int)
+
+    /**
+     * Eyedropper. Queue a 1×1 sample request at [docX], [docY] in
+     * doc pixels (the same space tile FBOs use). The GL thread runs
+     * the composite at the end of the next compositeAllLayers pass —
+     * walks visible raster layers, reads tile FBOs directly, and
+     * Porter-Duff "over"-composites the layer pixels onto the page
+     * background. After submitting, call [getLastSampledColor]
+     * roughly one frame later to retrieve the result.
+     */
+    external fun requestColorSample(docX: Float, docY: Float)
+
+    /**
+     * Returns the most recently sampled color as 0xRRGGBB, or -1 if no
+     * sample has been completed since the last requestColorSample.
+     * Single-shot: subsequent calls return -1 until another request.
+     */
+    external fun getLastSampledColor(): Int
+
+    /**
+     * Import [argbPixels] (Android Color int format: 0xAARRGGBB) as a
+     * floating raster selection on a fresh layer of the active page.
+     * The drain creates a new layer at the top of the stack, uploads
+     * the pixels into a content texture, and parks the result on
+     * g_rasterSel with fixedAspect=true so the user can scale it
+     * uniformly via the existing transform handles. Returns false if
+     * the input is malformed (zero dims, mismatched array length).
+     */
+    external fun importImageAsSelection(width: Int, height: Int,
+                                        argbPixels: IntArray): Boolean
 
     /**
      * Render a thumbnail of the given page into the provided Bitmap
