@@ -64,6 +64,7 @@
 #include <cstring>
 #include <deque>
 #include <dirent.h>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1207,6 +1208,13 @@ struct UndoEntry {
     // MergeLayerDown: full snapshot of the deleted source layer.
     LayerSnapshot srcSnapshot;
 
+    // MergeLayerDown: undo entries that were pinned to the source
+    // layer at merge time (RasterStroke, RasterizeLayer, etc.).
+    // Captured before the merge's deleteLayerImpl drops them; re-
+    // pushed onto the undo stack when the merge is undone so the
+    // source's prior history is reachable.
+    std::vector<UndoEntry> srcLayerUndoEntries;
+
     size_t bytes = 0;                // approximate memory cost
 };
 
@@ -1277,6 +1285,19 @@ struct RasterClipboard {
 std::mutex       g_rasterClipboardMutex;
 RasterClipboard  g_rasterClipboard;
 
+// Parallel clipboard for vector shapes — copy/cut/paste of a single
+// selected vector shape. Last-write-wins between this and the raster
+// clipboard via g_clipboardKind, so paste knows which one to drop.
+struct VectorClipboard {
+    bool      present = false;
+    ShapeData shape;
+};
+std::mutex      g_vectorClipboardMutex;
+VectorClipboard g_vectorClipboard;
+
+// 0=empty, 1=raster, 2=vector. Set by each copy/cut, read by paste.
+std::atomic<int> g_clipboardKind{0};
+
 size_t computeEntrySize(const UndoEntry& e) {
     size_t s = sizeof(UndoEntry);
     for (const auto& t : e.beforeTiles) s += t.bytes.size();
@@ -1293,6 +1314,10 @@ size_t computeEntrySize(const UndoEntry& e) {
     s += e.srcSnapshot.ellipses.size() * sizeof(Ellipse);
     s += e.srcSnapshot.circles.size()  * sizeof(Circle);
     s += e.srcSnapshot.name.size();
+    // Nested entries (MergeLayerDown's per-layer history capture).
+    for (const auto& nested : e.srcLayerUndoEntries) {
+        s += computeEntrySize(nested);
+    }
     return s;
 }
 
@@ -1511,6 +1536,10 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1);
 bool liftRasterSelectionPolygon(const float* points, size_t nPoints);
 void commitRasterSelectionImpl();
 void cancelRasterSelectionImpl();
+void discardRasterSelectionImpl();
+void copyVectorSelectionImpl();
+void cutVectorSelectionImpl();
+bool pasteVectorSelectionImpl();
 void copyRasterSelectionImpl();
 bool pasteRasterSelectionImpl();
 void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
@@ -2689,6 +2718,57 @@ size_t mapLayerIdxAfterDelete(size_t i, size_t deletedIdx) {
     return i;
 }
 
+// Walks an UndoEntry (and any MergeLayerDown's nested entries) applying
+// the post-delete index remap. Returns false when the entry should be
+// dropped (its primary or target layer was the deleted slot, or any
+// nested entry that survives is impossible).
+bool remapEntryAfterDelete(UndoEntry& e, size_t deletedIdx) {
+    size_t newIdx = mapLayerIdxAfterDelete(e.layerIdx, deletedIdx);
+    if (newIdx == kInvalidLayerIdx) return false;
+    if (e.op == UndoOp::RasterizeShapeBelow
+     || e.op == UndoOp::MergeLayerDown) {
+        size_t newTgt = mapLayerIdxAfterDelete(e.targetLayerIdx, deletedIdx);
+        if (newTgt == kInvalidLayerIdx) return false;
+        e.targetLayerIdx = newTgt;
+    }
+    e.layerIdx = newIdx;
+    if (e.op == UndoOp::LayerAdd) {
+        size_t prev = mapLayerIdxAfterDelete(e.prevActiveLayer, deletedIdx);
+        e.prevActiveLayer = (prev == kInvalidLayerIdx) ? 0 : prev;
+    }
+    if (e.op == UndoOp::MergeLayerDown) {
+        for (auto it = e.srcLayerUndoEntries.begin();
+             it != e.srcLayerUndoEntries.end(); ) {
+            if (!remapEntryAfterDelete(*it, deletedIdx)) {
+                it = e.srcLayerUndoEntries.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return true;
+}
+
+// Walks an UndoEntry applying the post-move index remap. No drop case —
+// move is order-preserving, never invalidates an entry.
+void remapEntryAfterMove(UndoEntry& e, size_t from, size_t to) {
+    e.layerIdx = mapLayerIdxAfterMove(e.layerIdx, from, to);
+    if (e.op == UndoOp::LayerAdd) {
+        e.prevActiveLayer =
+            mapLayerIdxAfterMove(e.prevActiveLayer, from, to);
+    }
+    if (e.op == UndoOp::RasterizeShapeBelow
+     || e.op == UndoOp::MergeLayerDown) {
+        e.targetLayerIdx =
+            mapLayerIdxAfterMove(e.targetLayerIdx, from, to);
+    }
+    if (e.op == UndoOp::MergeLayerDown) {
+        for (auto& nested : e.srcLayerUndoEntries) {
+            remapEntryAfterMove(nested, from, to);
+        }
+    }
+}
+
 // Delete the layer at `idx` on the active page. No-op if there's only one
 // layer left (the document needs at least one). Frees GL resources, wipes
 // the on-disk dir, renumbers the trailing layer dirs to keep them
@@ -2717,36 +2797,17 @@ void deleteLayerImpl(size_t idx) {
         std::lock_guard<std::mutex> lock(g_undoMutex);
         auto remap = [&](std::deque<UndoEntry>& stack, size_t& totalBytes) {
             for (auto it = stack.begin(); it != stack.end(); ) {
-                size_t newIdx = mapLayerIdxAfterDelete(it->layerIdx, idx);
-                if (newIdx == kInvalidLayerIdx) {
+                if (!remapEntryAfterDelete(*it, idx)) {
                     totalBytes -= it->bytes;
                     it = stack.erase(it);
-                    continue;
+                } else {
+                    // Bytes may have changed (nested entries dropped);
+                    // re-account for it.
+                    totalBytes -= it->bytes;
+                    it->bytes = computeEntrySize(*it);
+                    totalBytes += it->bytes;
+                    ++it;
                 }
-                // RasterizeShapeBelow + MergeLayerDown carry a second
-                // layer reference (targetLayerIdx). If THAT layer was
-                // deleted, we can't restore its tiles, so the entry
-                // has to go too.
-                if (it->op == UndoOp::RasterizeShapeBelow
-                 || it->op == UndoOp::MergeLayerDown) {
-                    size_t newTgt =
-                        mapLayerIdxAfterDelete(it->targetLayerIdx, idx);
-                    if (newTgt == kInvalidLayerIdx) {
-                        totalBytes -= it->bytes;
-                        it = stack.erase(it);
-                        continue;
-                    }
-                    it->targetLayerIdx = newTgt;
-                }
-                it->layerIdx = newIdx;
-                if (it->op == UndoOp::LayerAdd) {
-                    // prevActiveLayer being the deleted layer means the
-                    // pre-add active slot is gone. Falling back to 0 is
-                    // safe because layers().size() >= 1 is invariant.
-                    size_t prev = mapLayerIdxAfterDelete(it->prevActiveLayer, idx);
-                    it->prevActiveLayer = (prev == kInvalidLayerIdx) ? 0 : prev;
-                }
-                ++it;
             }
         };
         remap(g_undoStack, g_undoTotalBytes);
@@ -2819,16 +2880,7 @@ void moveLayerImpl(size_t from, size_t to) {
         std::lock_guard<std::mutex> lock(g_undoMutex);
         auto remap = [&](std::deque<UndoEntry>& stack) {
             for (auto& e : stack) {
-                e.layerIdx = mapLayerIdxAfterMove(e.layerIdx, from, to);
-                if (e.op == UndoOp::LayerAdd) {
-                    e.prevActiveLayer =
-                        mapLayerIdxAfterMove(e.prevActiveLayer, from, to);
-                }
-                if (e.op == UndoOp::RasterizeShapeBelow
-                 || e.op == UndoOp::MergeLayerDown) {
-                    e.targetLayerIdx =
-                        mapLayerIdxAfterMove(e.targetLayerIdx, from, to);
-                }
+                remapEntryAfterMove(e, from, to);
             }
         };
         remap(g_undoStack);
@@ -3512,9 +3564,34 @@ void mergeRasterLayerDownImpl(size_t idx) {
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
 
+    // Extract any undo entries pinned to the source layer BEFORE the
+    // delete drops them. Stored on the merge entry so undo of the
+    // merge can re-push them — preserving the layer's pre-merge edit
+    // history (e.g. a rasterize-layer that happened just before the
+    // merge stays undoable after the merge is undone).
+    {
+        std::lock_guard<std::mutex> lock(g_undoMutex);
+        auto extract = [&](std::deque<UndoEntry>& stack, size_t& total) {
+            for (auto it = stack.begin(); it != stack.end(); ) {
+                if (it->layerIdx == idx) {
+                    total -= it->bytes;
+                    entry.srcLayerUndoEntries.push_back(std::move(*it));
+                    it = stack.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+        extract(g_undoStack, g_undoTotalBytes);
+        // Redo stack will be cleared by pushUndoEntry below — no need
+        // to extract from it; those entries are about to vanish anyway.
+    }
+
     // Delete the source layer. deleteLayerImpl handles GL teardown,
     // dir removal + renumber, active-layer adjustment, and remaps
-    // surviving undo entries to the new layer-idx scheme.
+    // surviving undo entries to the new layer-idx scheme. (The
+    // source-layer entries we just extracted aren't in the stack, so
+    // the remap pass leaves them untouched.)
     deleteLayerImpl(idx);
 
     // Push our entry AFTER the delete remap so the freshly-pushed
@@ -5552,7 +5629,7 @@ void clearLayerDirOnDisk(size_t layerIdx) {
 }
 
 // Reverse a previously-recorded action.
-void applyEntryReverse(const UndoEntry& e) {
+void applyEntryReverse(UndoEntry& e) {
     switch (e.op) {
         case UndoOp::RasterStroke: {
             for (const auto& s : e.beforeTiles) applyTileSnap(e.layerIdx, s);
@@ -5690,22 +5767,46 @@ void applyEntryReverse(const UndoEntry& e) {
             // self-remap.)
             {
                 std::lock_guard<std::mutex> lock(g_undoMutex);
-                auto remap = [&](std::deque<UndoEntry>& stack) {
-                    for (auto& other : stack) {
-                        if (other.layerIdx >= e.layerIdx) ++other.layerIdx;
-                        if ((other.op == UndoOp::RasterizeShapeBelow
-                          || other.op == UndoOp::MergeLayerDown)
-                            && other.targetLayerIdx >= e.layerIdx) {
-                            ++other.targetLayerIdx;
-                        }
-                        if (other.op == UndoOp::LayerAdd
-                            && other.prevActiveLayer >= e.layerIdx) {
-                            ++other.prevActiveLayer;
-                        }
+                auto shiftUp = [&](UndoEntry& other) {
+                    if (other.layerIdx >= e.layerIdx) ++other.layerIdx;
+                    if ((other.op == UndoOp::RasterizeShapeBelow
+                      || other.op == UndoOp::MergeLayerDown)
+                        && other.targetLayerIdx >= e.layerIdx) {
+                        ++other.targetLayerIdx;
+                    }
+                    if (other.op == UndoOp::LayerAdd
+                        && other.prevActiveLayer >= e.layerIdx) {
+                        ++other.prevActiveLayer;
                     }
                 };
-                remap(g_undoStack);
-                remap(g_redoStack);
+                std::function<void(UndoEntry&)> shiftRecursive =
+                    [&](UndoEntry& other) {
+                        shiftUp(other);
+                        if (other.op == UndoOp::MergeLayerDown) {
+                            for (auto& nested : other.srcLayerUndoEntries) {
+                                shiftRecursive(nested);
+                            }
+                        }
+                    };
+                for (auto& other : g_undoStack) shiftRecursive(other);
+                for (auto& other : g_redoStack) shiftRecursive(other);
+
+                // Re-push the source-layer's pre-merge undo history
+                // onto the bottom of the undo stack. Their layerIdx
+                // values were captured PRE-delete, then tracked through
+                // any subsequent ops via the recursive remap helpers.
+                // After insertLayerWithSnapshot above, the source
+                // layer is back at e.layerIdx, so they're addressable.
+                for (auto& nested : e.srcLayerUndoEntries) {
+                    nested.bytes = computeEntrySize(nested);
+                    g_undoTotalBytes += nested.bytes;
+                    g_undoStack.push_back(std::move(nested));
+                }
+                e.srcLayerUndoEntries.clear();
+                // Bytes shrunk (nested entries moved out); recompute so
+                // applyUndo's redoTotalBytes += e.bytes accounting is
+                // correct.
+                e.bytes = computeEntrySize(e);
             }
             break;
         }
@@ -5713,7 +5814,7 @@ void applyEntryReverse(const UndoEntry& e) {
 }
 
 // Re-apply a previously-undone action.
-void applyEntryForward(const UndoEntry& e) {
+void applyEntryForward(UndoEntry& e) {
     switch (e.op) {
         case UndoOp::RasterStroke: {
             for (const auto& s : e.afterTiles) applyTileSnap(e.layerIdx, s);
@@ -5827,6 +5928,22 @@ void applyEntryForward(const UndoEntry& e) {
             break;
         }
         case UndoOp::MergeLayerDown: {
+            // Pull the source-layer's history back out of the undo
+            // stack INTO this entry, so the next undo of this merge
+            // can re-restore them. (Mirror image of applyEntryReverse,
+            // which moved them onto the stack.)
+            {
+                std::lock_guard<std::mutex> lock(g_undoMutex);
+                for (auto it = g_undoStack.begin(); it != g_undoStack.end(); ) {
+                    if (it->layerIdx == e.layerIdx) {
+                        g_undoTotalBytes -= it->bytes;
+                        e.srcLayerUndoEntries.push_back(std::move(*it));
+                        it = g_undoStack.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             // Re-apply post-merge tiles to the target.
             if (e.targetLayerIdx < layers().size() && layers()[e.targetLayerIdx]) {
                 for (const auto& s : e.afterTiles) {
@@ -5835,12 +5952,13 @@ void applyEntryForward(const UndoEntry& e) {
             }
             // Delete the source layer that undo re-inserted. Use
             // deleteLayerImpl so trailing layers + their dirs renumber
-            // correctly.
+            // correctly. Its remap pass leaves our extracted source-
+            // layer entries alone (they're inside e, not in the stack).
             if (e.layerIdx < layers().size() && layers()[e.layerIdx]) {
                 deleteLayerImpl(e.layerIdx);
-                // deleteLayerImpl already remapped the rest of the
-                // stack; nothing to do here.
             }
+            // Recompute bytes — we just absorbed the nested entries.
+            e.bytes = computeEntrySize(e);
             break;
         }
     }
@@ -6501,6 +6619,63 @@ void commitRasterSelectionImpl() {
     if (diff) pushUndoEntry(std::move(entry));
 }
 
+// Discard the floating selection WITHOUT restoring the lifted tiles —
+// the source layer keeps the hole that was punched out at lift time.
+// Used by cut: the clipboard already holds the pixels, so the source
+// loses them. Pushes a RasterStroke undo entry whose beforeTiles are
+// the pre-lift snapshots (held on the floating selection since the
+// lift itself never pushed an entry — the assumption used to be that
+// cancel/commit would each balance the books) and whose afterTiles
+// are the current hole-punched state. Undo restores the original
+// pixels; redo re-applies the hole.
+void discardRasterSelectionImpl() {
+    GLuint contentTex = 0;
+    size_t layerIdx = 0;
+    std::vector<TileSnap> beforeTiles;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        if (!g_rasterSel.active) return;
+        contentTex  = g_rasterSel.contentTex;
+        layerIdx    = g_rasterSel.layerIdx;
+        beforeTiles = std::move(g_rasterSel.liftedTiles);
+        g_rasterSel.contentTex = 0;
+        g_rasterSel.active = false;
+    }
+    if (contentTex) glDeleteTextures(1, &contentTex);
+
+    if (beforeTiles.empty()) return;
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& layer = *layers()[layerIdx];
+
+    // Snapshot the same tile keys' current (hole) state for redo.
+    std::vector<TileSnap> afterTiles;
+    afterTiles.reserve(beforeTiles.size());
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    for (const auto& b : beforeTiles) {
+        TileSnap a;
+        a.tx = b.tx;
+        a.ty = b.ty;
+        auto it = layer.tiles.find(tileKey(b.tx, b.ty));
+        if (it != layer.tiles.end()) {
+            a.existed = true;
+            a.bytes.resize(kTileBytes);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, a.bytes.data());
+        }
+        afterTiles.push_back(std::move(a));
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+
+    UndoEntry entry;
+    entry.op          = UndoOp::RasterStroke;
+    entry.layerIdx    = layerIdx;
+    entry.beforeTiles = std::move(beforeTiles);
+    entry.afterTiles  = std::move(afterTiles);
+    pushUndoEntry(std::move(entry));
+}
+
 // Discard the floating selection by restoring each lifted tile's
 // pre-lift bytes. No undo entry is pushed (net zero change).
 void cancelRasterSelectionImpl() {
@@ -6558,16 +6733,19 @@ void copyRasterSelectionImpl() {
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
     glDeleteFramebuffers(1, &tmpFbo);
 
-    std::lock_guard<std::mutex> lock(g_rasterClipboardMutex);
-    g_rasterClipboard.bytes    = std::move(bytes);
-    g_rasterClipboard.w        = w;
-    g_rasterClipboard.h        = h;
-    g_rasterClipboard.centerX  = cx;
-    g_rasterClipboard.centerY  = cy;
-    g_rasterClipboard.halfW    = hw;
-    g_rasterClipboard.halfH    = hh;
-    g_rasterClipboard.rotation = rot;
-    g_rasterClipboard.present  = true;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterClipboardMutex);
+        g_rasterClipboard.bytes    = std::move(bytes);
+        g_rasterClipboard.w        = w;
+        g_rasterClipboard.h        = h;
+        g_rasterClipboard.centerX  = cx;
+        g_rasterClipboard.centerY  = cy;
+        g_rasterClipboard.halfW    = hw;
+        g_rasterClipboard.halfH    = hh;
+        g_rasterClipboard.rotation = rot;
+        g_rasterClipboard.present  = true;
+    }
+    g_clipboardKind.store(1, std::memory_order_release);   // 1 = Raster
 }
 
 // Create a fresh floating raster selection from the global clipboard at
@@ -7054,6 +7232,161 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
          affected.size(), pageW, pageH);
 }
 
+// ---- Vector clipboard helpers --------------------------------------------
+//
+// Forward-declared near the raster equivalents at the top of the
+// anonymous namespace; defined here so they sit alongside the
+// matching JNI dispatchers below.
+
+// Snapshot the currently-selected vector shape into the vector
+// clipboard. No-op if there's no vector selection or the layer/shape
+// it points at is gone. Selection state is left unchanged. Sets
+// g_clipboardKind so a subsequent paste knows to drop a vector shape.
+void copyVectorSelectionImpl() {
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+    }
+    if (sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
+    if (layer.type != LayerType::Vector) return;
+
+    ShapeData sd;
+    sd.kind = sel.kind;
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx >= layer.lines.size())    return;
+            sd.line    = layer.lines[sel.shapeIdx];
+            break;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx >= layer.rects.size())    return;
+            sd.rect    = layer.rects[sel.shapeIdx];
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx >= layer.ellipses.size()) return;
+            sd.ellipse = layer.ellipses[sel.shapeIdx];
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx >= layer.circles.size())  return;
+            sd.circle  = layer.circles[sel.shapeIdx];
+            break;
+        default: return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_vectorClipboardMutex);
+        g_vectorClipboard.present = true;
+        g_vectorClipboard.shape   = sd;
+    }
+    g_clipboardKind.store(2, std::memory_order_release);   // 2 = Vector
+}
+
+// Cut for vectors: copy then erase the shape from its layer. Pushes a
+// VectorDelete undo entry so the cut is reversible (mirrors the
+// existing deleteSelection JNI's bookkeeping).
+void cutVectorSelectionImpl() {
+    copyVectorSelectionImpl();
+    if (g_clipboardKind.load() != 2) return;   // copy didn't take
+
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+        g_selection = Selection{};
+    }
+    if (sel.kind == ShapeKind::None) return;
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
+    Layer& layer = *layers()[sel.layerIdx];
+    if (layer.type != LayerType::Vector) return;
+
+    UndoEntry entry;
+    entry.op       = UndoOp::VectorDelete;
+    entry.layerIdx = sel.layerIdx;
+    entry.shapeIdx = sel.shapeIdx;
+    entry.beforeShape.kind = sel.kind;
+    bool captured = false;
+    switch (sel.kind) {
+        case ShapeKind::Line:
+            if (sel.shapeIdx < layer.lines.size()) {
+                entry.beforeShape.line = layer.lines[sel.shapeIdx];
+                layer.lines.erase(layer.lines.begin() + sel.shapeIdx);
+                captured = true;
+            }
+            break;
+        case ShapeKind::Rect:
+            if (sel.shapeIdx < layer.rects.size()) {
+                entry.beforeShape.rect = layer.rects[sel.shapeIdx];
+                layer.rects.erase(layer.rects.begin() + sel.shapeIdx);
+                captured = true;
+            }
+            break;
+        case ShapeKind::Ellipse:
+            if (sel.shapeIdx < layer.ellipses.size()) {
+                entry.beforeShape.ellipse = layer.ellipses[sel.shapeIdx];
+                layer.ellipses.erase(layer.ellipses.begin() + sel.shapeIdx);
+                captured = true;
+            }
+            break;
+        case ShapeKind::Circle:
+            if (sel.shapeIdx < layer.circles.size()) {
+                entry.beforeShape.circle = layer.circles[sel.shapeIdx];
+                layer.circles.erase(layer.circles.begin() + sel.shapeIdx);
+                captured = true;
+            }
+            break;
+        case ShapeKind::None: break;
+    }
+    saveVectorLayer(sel.layerIdx, layer);
+    if (captured) pushUndoEntry(std::move(entry));
+}
+
+// Paste from the vector clipboard: append the shape to the active
+// layer (which must be vector). Returns false if the clipboard is
+// empty or the active layer isn't vector. Pushes a VectorAdd entry.
+bool pasteVectorSelectionImpl() {
+    ShapeData sd;
+    {
+        std::lock_guard<std::mutex> lock(g_vectorClipboardMutex);
+        if (!g_vectorClipboard.present) return false;
+        sd = g_vectorClipboard.shape;
+    }
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return false;
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Vector) return false;
+
+    size_t idx = 0;
+    switch (sd.kind) {
+        case ShapeKind::Line:
+            idx = layer.lines.size();    layer.lines.push_back(sd.line);       break;
+        case ShapeKind::Rect:
+            idx = layer.rects.size();    layer.rects.push_back(sd.rect);       break;
+        case ShapeKind::Ellipse:
+            idx = layer.ellipses.size(); layer.ellipses.push_back(sd.ellipse); break;
+        case ShapeKind::Circle:
+            idx = layer.circles.size();  layer.circles.push_back(sd.circle);   break;
+        default: return false;
+    }
+    saveVectorLayer(activeLayer(), layer);
+
+    UndoEntry entry;
+    entry.op          = UndoOp::VectorAdd;
+    entry.layerIdx    = activeLayer();
+    entry.shapeIdx    = idx;
+    entry.afterShape  = sd;
+    pushUndoEntry(std::move(entry));
+
+    // Select the pasted shape so the user can immediately drag it.
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection.kind     = sd.kind;
+        g_selection.layerIdx = activeLayer();
+        g_selection.shapeIdx = idx;
+    }
+    return true;
+}
+
 }  // namespace
 
 // ---- JNI ------------------------------------------------------------------
@@ -7260,7 +7593,36 @@ Java_com_bk_drawing_NativeRenderer_cancelRasterSelection(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_copySelection(JNIEnv*, jobject) {
     ensureInited();
-    copyRasterSelectionImpl();
+    bool rasterActive = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        rasterActive = g_rasterSel.active;
+    }
+    if (rasterActive) {
+        copyRasterSelectionImpl();
+    } else {
+        copyVectorSelectionImpl();
+    }
+}
+
+// Cut = copy + discard the floating raster selection without
+// restoring its lifted pixels. For vector selections, defers to
+// cutVectorSelectionImpl. Source layer keeps the hole / shape
+// removed; the clipboard holds the content for a subsequent paste.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_cutSelection(JNIEnv*, jobject) {
+    ensureInited();
+    bool rasterActive = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        rasterActive = g_rasterSel.active;
+    }
+    if (rasterActive) {
+        copyRasterSelectionImpl();
+        discardRasterSelectionImpl();
+        return;
+    }
+    cutVectorSelectionImpl();
 }
 
 JNIEXPORT jboolean JNICALL
@@ -7270,13 +7632,30 @@ Java_com_bk_drawing_NativeRenderer_pasteSelection(JNIEnv*, jobject) {
     applyPendingLayerActions();
     applyPendingShapes();
     ensureAtLeastOneLayer();
+    int kind = g_clipboardKind.load(std::memory_order_acquire);
+    if (kind == 2) {
+        return pasteVectorSelectionImpl() ? JNI_TRUE : JNI_FALSE;
+    }
     return pasteRasterSelectionImpl() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_bk_drawing_NativeRenderer_hasClipboardContent(JNIEnv*, jobject) {
+    int kind = g_clipboardKind.load(std::memory_order_acquire);
+    if (kind == 2) {
+        std::lock_guard<std::mutex> lock(g_vectorClipboardMutex);
+        return g_vectorClipboard.present ? JNI_TRUE : JNI_FALSE;
+    }
     std::lock_guard<std::mutex> lock(g_rasterClipboardMutex);
     return g_rasterClipboard.present ? JNI_TRUE : JNI_FALSE;
+}
+
+// 0 = empty, 1 = raster, 2 = vector. Used by the UI to pick the right
+// post-paste select tool (raster floating sel vs vector shape sel).
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getClipboardKind(JNIEnv*, jobject) {
+    return static_cast<jint>(
+        g_clipboardKind.load(std::memory_order_acquire));
 }
 
 JNIEXPORT jboolean JNICALL

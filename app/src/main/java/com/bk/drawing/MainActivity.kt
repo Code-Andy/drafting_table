@@ -732,11 +732,24 @@ class MainActivity : AppCompatActivity() {
             setImageResource(R.drawable.ic_plus)
             imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
             setPadding(8.dp, 4.dp, 4.dp, 4.dp)
-            contentDescription = "add layer"
+            contentDescription = "add raster layer"
             isClickable = true; isFocusable = true
             setOnClickListener { userAddLayer() }
         }
-        // ⋯ overflow → vector-layer / clear / delete
+        // + vector layer — promoted out of the ⋯ overflow so it's a
+        // first-class action alongside raster. Padding mirrors `plus`
+        // so both icons get the same image-area size, otherwise the
+        // identical SVG paths inside render at different scales.
+        val plusVector = ImageView(this).apply {
+            setImageResource(R.drawable.ic_plus_vector)
+            imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
+            setPadding(8.dp, 4.dp, 4.dp, 4.dp)
+            contentDescription = "add vector layer"
+            isClickable = true; isFocusable = true
+            setOnClickListener { userAddVectorLayer() }
+        }
+        // ⋯ overflow → clear / delete (vector add lives next to the
+        // raster +; the menu still keeps it as a backup option).
         val more = ImageView(this).apply {
             setImageResource(R.drawable.ic_more)
             imageTintList = ColorStateList.valueOf(getColor(R.color.inkSoft))
@@ -748,8 +761,9 @@ class MainActivity : AppCompatActivity() {
         val rightRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(plus, LinearLayout.LayoutParams(28.dp, 28.dp))
-            addView(more, LinearLayout.LayoutParams(32.dp, 28.dp))
+            addView(plus,       LinearLayout.LayoutParams(28.dp, 28.dp))
+            addView(plusVector, LinearLayout.LayoutParams(28.dp, 28.dp))
+            addView(more,       LinearLayout.LayoutParams(32.dp, 28.dp))
         }
         header.addView(rightRow, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2268,6 +2282,7 @@ class MainActivity : AppCompatActivity() {
         menu.menu.add("Stylus only: ${if (stylusOnly) "on" else "off"}")
         menu.menu.add("Delete selection")
         menu.menu.add("Rasterize selection to layer below")
+        menu.menu.add("Cut")
         menu.menu.add("Copy")
         menu.menu.add("Paste")
         menu.setOnMenuItemClickListener { item ->
@@ -2278,6 +2293,7 @@ class MainActivity : AppCompatActivity() {
                 title == "Export document as PDF…"             -> launchDocumentPdfExport()
                 title == "Delete selection"                    -> userDeleteSelection()
                 title == "Rasterize selection to layer below"  -> userRasterizeSelectionBelow()
+                title == "Cut"                                 -> drawingView?.queueCutSelection()
                 title == "Copy"                                -> drawingView?.queueCopySelection()
                 title == "Paste"                               -> drawingView?.queuePasteSelection()
                 title.startsWith("Stylus only:")               -> toggleStylusOnly()
@@ -2599,16 +2615,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun userAddLayer() {
         NativeRenderer.addLayer()
-        layerCount++
-        activeLayerIndex = layerCount - 1
-        rebuildLayerList()
+        // Native creates the layer on the GL thread when the action
+        // queue drains; sync after a beat so getLayerType / Count /
+        // ActiveLayer reflect the new state. Without the delayed sync
+        // the panel can render with stale type info — e.g. a freshly-
+        // added vector layer briefly showing as raster.
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
     private fun userAddVectorLayer() {
         NativeRenderer.addVectorLayer()
-        layerCount++
-        activeLayerIndex = layerCount - 1
-        rebuildLayerList()
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
     private fun userCycleLayer() {
@@ -3163,6 +3182,17 @@ class MainActivity : AppCompatActivity() {
         if (pc != lastBuiltPageCount || ap != lastBuiltActivePage) {
             syncLayerStateFromNative()
             rebuildSidebar()
+        }
+        // Layer count / active-layer drift: catches the case where a
+        // queued action (merge, rasterize, delete, add) drains AFTER
+        // the postDelayed-60ms sync from its caller. Without this
+        // check, e.g. a merge that takes 100+ms can leave the panel
+        // showing the just-merged source layer until the next
+        // unrelated user action triggers another sync.
+        val lc = NativeRenderer.getLayerCount()
+        val al = NativeRenderer.getActiveLayer()
+        if (lc != layerCount || al != activeLayerIndex) {
+            syncLayerStateFromNative()
         }
         updateStatusBarPage()
     }

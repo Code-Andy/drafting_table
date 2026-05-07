@@ -360,8 +360,26 @@ object NativeRenderer {
      *     Cheap; safe to call from any thread for UI button enabling.
      */
     external fun copySelection()
+    /**
+     * Cut: snapshot the active floating raster selection's pixels into
+     * the global clipboard, then discard the floating selection
+     * without restoring its lifted tiles — the source layer keeps the
+     * hole. No-op if no selection is active. Same GL-thread / current-
+     * context requirements as copySelection. Pair with pasteSelection
+     * later to drop the cut content elsewhere.
+     */
+    external fun cutSelection()
     external fun pasteSelection(): Boolean
     external fun hasClipboardContent(): Boolean
+
+    /**
+     * What's currently in the clipboard:
+     *   0 = empty
+     *   1 = raster pixels (paste creates a floating raster selection)
+     *   2 = vector shape (paste appends to active vector layer)
+     * UI uses this to pick the right select tool after a paste.
+     */
+    external fun getClipboardKind(): Int
 
     /**
      * Raster floating-selection transforms (Phase 3). Mirror the vector

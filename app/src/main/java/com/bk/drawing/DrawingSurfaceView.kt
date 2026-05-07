@@ -189,13 +189,18 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 pendingBeginLassoSel = null
                 NativeRenderer.beginLassoSelection(beginLasso)
             }
-            // Copy is a snapshot of the current selection, so drain it
+            // Copy / cut are snapshots of the current selection, drained
             // BEFORE paste (which may auto-commit and replace the active
             // selection). Drain after begin so a fresh just-lifted
-            // selection is also copyable in the same gesture.
+            // selection is also copyable in the same gesture. Cut also
+            // discards the floating selection (source keeps the hole).
             if (pendingCopySel) {
                 pendingCopySel = false
                 NativeRenderer.copySelection()
+            }
+            if (pendingCutSel) {
+                pendingCutSel = false
+                NativeRenderer.cutSelection()
             }
             if (pendingPasteSel) {
                 pendingPasteSel = false
@@ -435,17 +440,40 @@ class DrawingSurfaceView @JvmOverloads constructor(
         forceRedraw()
     }
 
-    /** Create a fresh floating raster selection from the native
-     *  clipboard, at the same doc-coord OBB as the original copy.
-     *  Auto-commits any existing floating sel first. Queued onto the
-     *  next multi-buffer pass (texture allocation + upload). If the
-     *  current tool can't interact with floating selections (i.e.
-     *  isn't SELECT_RECT/SELECT_LASSO), switch to SELECT_RECT so the
-     *  user can immediately drag/scale/rotate the pasted content. */
+    /** Cut: snapshot the active floating raster selection into the
+     *  clipboard AND discard the floating selection without restoring
+     *  its lifted tiles. The source layer keeps the hole. Pair with
+     *  queuePasteSelection to drop the content elsewhere. */
+    fun queueCutSelection() {
+        pendingCutSel = true
+        forceRedraw()
+    }
+
+    /** Drop the clipboard's content. Switches to whichever select tool
+     *  matches the clipboard kind so the user can immediately interact
+     *  with the pasted content:
+     *    raster pixels  → SELECT_RECT (floating sel handles)
+     *    vector shape   → SELECT (vector tap-to-select)
+     *  Auto-commits any existing floating raster sel first. Queued
+     *  onto the next multi-buffer pass since both paste paths need
+     *  GL state (texture allocation for raster; shape append for
+     *  vector). Empty-clipboard taps fall through as a no-op. */
     fun queuePasteSelection() {
-        if (currentTool != Tool.SELECT_RECT && currentTool != Tool.SELECT_LASSO) {
-            currentTool = Tool.SELECT_RECT
-            onToolChanged?.invoke(currentTool)
+        when (NativeRenderer.getClipboardKind()) {
+            2 -> {  // vector
+                if (currentTool != Tool.SELECT) {
+                    currentTool = Tool.SELECT
+                    onToolChanged?.invoke(currentTool)
+                }
+            }
+            1 -> {  // raster
+                if (currentTool != Tool.SELECT_RECT
+                    && currentTool != Tool.SELECT_LASSO) {
+                    currentTool = Tool.SELECT_RECT
+                    onToolChanged?.invoke(currentTool)
+                }
+            }
+            // else: empty clipboard, paste will silently no-op
         }
         pendingPasteSel = true
         forceRedraw()
@@ -1062,6 +1090,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var pendingBeginLassoSel: FloatArray? = null
     @Volatile
     private var pendingCopySel = false
+    private var pendingCutSel  = false
     @Volatile
     private var pendingPasteSel = false
 
