@@ -1,6 +1,20 @@
 # Drafting Table
 
-Custom Android sketching / technical-notebook app for the Wacom MovinkPad 11 (standalone Android tablet, EMR pen). Single-developer, single-device target. The overriding priority is **input responsiveness** — feature breadth is secondary. See `NOTES.md` for original design intent and `CLAUDE.md` for architecture details.
+Ben's notes:
+
+I wanted a drawing app for my [Wacom MovinkPad 11](https://estore.wacom.com/en-us/wacom-movinkpad-11-dtha116cl0z.html) tablet that combines features from conventional drawing programs, slide decks, and paper engineering notebooks.  This is a  attempt at creating that.  This is *not* intended to be a full-blown painting program: it's designed for making technical sketches.
+
+"Documents" are organized into pages, with a sidebar for previewing and navigating between pages, like a slide deck.  Tapping on a page in the sidebar loads that page onto the canvas.  Each page has its own set of layers.  
+
+In addition to raster brush tools, vector primitives (lines, rectangles, circles, ellipses) can be constructed on vector layers. I find these useful for creating construction geometry in technical sketches.  Vector objects can be transformed after creation, or rastered down to the raster layer below. Vector "snapping" can be toggled, so the start/end/midpoints of vector objects snap to points on other vector objects, or to nodes on the (toggleable) graph paper background.  Snapping can be toggled from the pen, so it's easy to snap one end of a vector but not the other, mid-creation.
+
+Currently measuring ~60ms latency pen-to-glass on the brush stroke, measured by recording a video of a brush stroke.  Worse than I'd like, but it seems a better than Sketchbook/Clip Studio with all smoothing disabled, and is very useable.
+
+I have only tested on the MovinkPad 11, and it will almost certainly not work out-of-the-box on any other tablet. But Claude can probably fix it for you :P
+
+Beware:  100% of the code is written by Claude.  
+
+Claude Code generated Readme below:
 
 ## Features
 
@@ -43,7 +57,7 @@ Custom Android sketching / technical-notebook app for the Wacom MovinkPad 11 (st
 - Palm rejection.
 
 **Other**
-- Undo / redo, 50 entries / 200 MB, covers raster strokes, vector add/delete/mutate, layer clear, layer add. Survives layer and page reorders.
+- Undo / redo, 50 entries / 200 MB, covers raster strokes, vector add/delete/mutate, layer clear, layer add..
 - Status bar with quick toggles for grid and snap.
 - Reset-view fits the page edge-to-edge.
 
