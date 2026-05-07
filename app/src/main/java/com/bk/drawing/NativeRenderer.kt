@@ -404,6 +404,14 @@ object NativeRenderer {
     external fun getLayerCount(): Int
     external fun getActiveLayer(): Int
 
+    /**
+     * True once the GL thread has fully loaded the document from disk.
+     * Polled by the UI on launch / after loadDocument so the layer panel
+     * doesn't render with default-constructed Layer slots before disk
+     * metadata (names, types, visibility) lands.
+     */
+    external fun isFullyLoaded(): Boolean
+
     /** Page rect dimensions in doc-px. Returns 0 when no page bounds
      *  are active; in that case the caller should fall back to the
      *  current SurfaceView size (the document behaves as an infinite

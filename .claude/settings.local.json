@@ -30,7 +30,12 @@
       "Bash(mkdir -p /tmp/snap_design)",
       "Bash(cp \"C:/Users/ben/.claude/projects/C--Users-ben-Documents-drawing-app/f3fea3b6-9d16-47ba-b629-0ff2947980dc/tool-results/webfetch-1777960454268-g097ro.bin\" /tmp/snap_design.gz)",
       "Bash(gunzip -c /tmp/snap_design.gz)",
-      "Bash(tar -x -C /tmp/snap_design)"
+      "Bash(tar -x -C /tmp/snap_design)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(python -c \"import cv2; print\\(cv2.__version__\\)\" 2>&1)",
+      "PowerShell(python -c \"import imageio; print\\(imageio.__version__\\)\" 2>&1)",
+      "PowerShell(python -c \"import imageio; r = imageio.get_reader\\(r'C:\\\\Users\\\\ben\\\\Documents\\\\drawing_app\\\\Screen_recording_20260505_205514.mp4'\\); print\\(r.get_meta_data\\(\\)\\); print\\('nframes:', r.count_frames\\(\\)\\)\" 2>&1)",
+      "PowerShell(python -m pip install --quiet imageio-ffmpeg 2>&1 | Select-Object -Last 5)"
     ]
   }
 }

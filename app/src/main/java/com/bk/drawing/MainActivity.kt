@@ -400,13 +400,14 @@ class MainActivity : AppCompatActivity() {
         // Push the persisted color into native and reflect it in the chip.
         NativeRenderer.setBrushColor(currentColorRgb)
         updateColorChip()
-        // Once the GL thread has had time to ensureLoaded(), pull real
-        // layer/page state and rebuild the panels.
-        canvas.postDelayed({
+        // Pull real layer/page state. setDocumentDir already populated
+        // metadata synchronously, so this can run as soon as the layout
+        // is up — no need to race the GL thread's lazy ensureLoaded.
+        canvas.post {
             syncLayerStateFromNative()
             rebuildSidebar()
             rebuildLayerList()
-        }, 250L)
+        }
     }
 
     override fun onDestroy() {

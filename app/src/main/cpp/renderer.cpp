@@ -759,9 +759,45 @@ inline float currentViewScale() {
     return f > 1e-6f ? f : 1.0f;
 }
 
+// Mirror of the user's view scale that is NEVER overwritten by the
+// transient render scales used during page-thumbnail rendering and
+// bucket-fill compositing (both paths save/restore g_viewScaleBits).
+// UI-thread code paths — snap, hit-test, velocity gating — must read
+// this instead of currentViewScale(), otherwise a thumbnail render
+// landing between MotionEvent dispatches makes snap radii alternate
+// between sane (e.g. 4 doc-px at 3× zoom) and absurd (240 doc-px at
+// the thumbnail's 0.05× scale), which manifests as snap engagement
+// flickering on every other event.
+std::atomic<uint32_t> g_userViewScaleBits{0x3F800000u};   // 1.0f
+inline float userViewScale() {
+    uint32_t bits = g_userViewScaleBits.load();
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f > 1e-6f ? f : 1.0f;
+}
+
 // All values below are *view-pixel* targets — divided by currentViewScale()
 // at use time to get the equivalent doc-pixel radius/threshold.
-constexpr float    kSnapRadiusViewPx   = 20.0f;
+// Engagement zone — pen must be within this distance (in view-px,
+// scaled to doc-px at use time) of a snap target to START snapping.
+// Smaller is more deliberate; vector vertices farther than this on
+// screen no longer pull the selection.
+constexpr float    kSnapRadiusViewPx   = 12.0f;
+// Release zone — once locked, the pen has to drift past this
+// distance (in view-px) before unlocking. Two values: a wide one
+// when the pen is slow/stationary (so natural hand tremor can't
+// flick the lock off — the dominant cause of stationary-pen
+// vibration when zoomed in) and a tight one once the pen is moving
+// deliberately (so dragging the object clear feels responsive,
+// not "rubber-banded" against the snap point).
+constexpr float    kSnapReleaseSlowViewPx = 60.0f;
+constexpr float    kSnapReleaseFastViewPx = 22.0f;
+// Velocity gate — fresh snap engagement is suppressed when the pen
+// is moving faster than this (view-px per applyMoveTo call). Existing
+// locks still hold via hysteresis. The intent: "snap when pen settles
+// near a target", not "snap to every vertex the pen sweeps past".
+// 6 view-px/call ≈ a few cm/sec on screen at 90Hz — slow, deliberate.
+constexpr float    kSnapVelocityViewPx = 6.0f;
 constexpr uint32_t kSnapMarkerColor    = 0xFFC020u;       // amber
 constexpr float    kSnapMarkerRViewPx  = 9.0f;            // ring radius (view px)
 
@@ -885,7 +921,13 @@ struct DabEmitter;                  // forward-decl
 extern DabEmitter g_liveEmitter;
 
 std::string g_docDir;               // empty = persistence disabled
-bool        g_loaded = false;
+// True only after loadAllLayersFromDisk() has fully populated g_pages.
+// Atomic + write-after-load so the UI thread can poll for "is the
+// layer panel safe to render?" — without that, a syncLayerStateFromNative
+// call landing mid-load reads default-constructed Layer slots (empty
+// name, visible=true, type=Raster) and the layer panel shows stale
+// placeholders until the user taps something.
+std::atomic<bool> g_loaded{false};
 
 // On-disk layout helpers — every page lives in its own directory and
 // hosts its layer subdirs. Using these consistently is what made the
@@ -1041,6 +1083,12 @@ struct DragState {
     // Read by compositeAllLayers to draw an amber marker.
     bool     snapActive = false;
     float    snapX = 0.0f, snapY = 0.0f;
+    // Previous query position (in doc-px). Used to compute pen
+    // velocity per call so snap engagement can be gated — the user
+    // wants snap to activate only when the pen has settled near a
+    // target, not when it sweeps through the area at speed.
+    bool     hasPrevQuery = false;
+    float    prevQueryX = 0.0f, prevQueryY = 0.0f;
 };
 DragState g_drag;
 
@@ -1502,6 +1550,9 @@ void applyPendingLayerActions() {
             layer.ellipses.clear();
             layer.circles.clear();
             // Wipe the on-disk copy so the cleared state persists.
+            // Metadata files (name.txt, opacity.txt, hidden.flag) belong
+            // to the layer itself, not its content — keep them so a
+            // user-set name / opacity / hidden state survives a clear.
             if (!g_docDir.empty()) {
                 std::string layerDir = activeLayerDir(activeLayer());
                 DIR* d = opendir(layerDir.c_str());
@@ -1510,6 +1561,9 @@ void applyPendingLayerActions() {
                     while ((e = readdir(d)) != nullptr) {
                         const char* n = e->d_name;
                         if (n[0] == '.') continue;
+                        if (std::strcmp(n, "name.txt") == 0
+                            || std::strcmp(n, "opacity.txt") == 0
+                            || std::strcmp(n, "hidden.flag") == 0) continue;
                         std::string p = layerDir + "/" + n;
                         unlink(p.c_str());
                     }
@@ -1795,7 +1849,7 @@ void closeCurrentDocument() {
     }
     g_current.samples.clear();
     g_liveEmitter.reset();
-    g_loaded = false;
+    g_loaded.store(false, std::memory_order_release);
 }
 
 // ---- Shader / program helpers --------------------------------------------
@@ -3274,7 +3328,11 @@ void loadTilesIntoLayer(Layer& layer, const std::string& dir) {
 // Load every layer of a single page from <docDir>/page_<pageIdx>/ into
 // the supplied Page. Detects each layer's type by file presence
 // (shapes.bin → Vector; tile_*.bin → Raster).
-void loadPageLayersFromDisk(size_t pageIdx, Page& page) {
+//
+// loadContent=false skips the GL-touching parts (raster tile upload,
+// vector shapes table) — see loadAllPageMetadataFromDisk's comment for
+// why we want a metadata-only mode reachable from the UI thread.
+void loadPageLayersFromDisk(size_t pageIdx, Page& page, bool loadContent = true) {
     if (g_docDir.empty()) return;
     std::string root = pageDirOf(pageIdx);
     DIR* d = opendir(root.c_str());
@@ -3305,10 +3363,10 @@ void loadPageLayersFromDisk(size_t pageIdx, Page& page) {
         std::string shapesPath = dirPath + "/shapes.bin";
         if (stat(shapesPath.c_str(), &st) == 0) {
             layer.type = LayerType::Vector;
-            loadVectorLayerShapes(layer, dirPath);
+            if (loadContent) loadVectorLayerShapes(layer, dirPath);
         } else {
             layer.type = LayerType::Raster;
-            loadTilesIntoLayer(layer, dirPath);
+            if (loadContent) loadTilesIntoLayer(layer, dirPath);
         }
         // Optional layer-hidden flag. Presence = layer is hidden in
         // the composite. Absence (the default) = visible. Atomic
@@ -3357,7 +3415,7 @@ void loadPageLayersFromDisk(size_t pageIdx, Page& page) {
     }
 }
 
-void loadAllLayersFromDisk() {
+void loadAllLayersFromDisk(bool loadContent = true) {
     if (g_docDir.empty()) return;
 
     // Two-step legacy migration: bare tiles → layer_0/, root layer_* →
@@ -3387,14 +3445,23 @@ void loadAllLayersFromDisk() {
         if (!slot) slot = std::make_unique<Page>();
     }
     for (int idx : pageIndices) {
-        loadPageLayersFromDisk(static_cast<size_t>(idx), *g_pages[idx]);
+        loadPageLayersFromDisk(static_cast<size_t>(idx), *g_pages[idx], loadContent);
     }
-    LOGI("loaded %zu pages", g_pages.size());
+    if (loadContent) LOGI("loaded %zu pages", g_pages.size());
+}
+
+// Metadata-only load — reads layer types, names, visibility, opacity
+// from disk into g_pages without touching any GL state. Safe to call
+// from the UI thread, which we do from setDocumentDir so the layer
+// panel can render correct state immediately, instead of waiting for
+// the GL thread's lazy ensureLoaded (which races a fixed-delay or
+// polled UI sync).
+void loadAllPageMetadataFromDisk() {
+    loadAllLayersFromDisk(/*loadContent=*/false);
 }
 
 void ensureLoaded() {
-    if (g_loaded) return;
-    g_loaded = true;
+    if (g_loaded.load(std::memory_order_acquire)) return;
 
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
@@ -3403,6 +3470,8 @@ void ensureLoaded() {
     // Guarantee at least one page exists post-load so subsequent code can
     // freely call layers() / activeLayer() (which deref g_pages).
     ensureAtLeastOnePage();
+    // Publish *after* the load is complete — see comment on g_loaded.
+    g_loaded.store(true, std::memory_order_release);
 }
 
 // ---- Vector-layer persistence --------------------------------------------
@@ -3975,18 +4044,35 @@ bool obbForSelection(const Selection& sel, Obb& out) {
     if (sel.kind == ShapeKind::None) return false;
     if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return false;
     const Layer& layer = *layers()[sel.layerIdx];
+    // VALUE COPIES — see compositeVectorLayer's note. UI-thread
+    // applyMoveTo can mutate shape fields without locking; reading
+    // through a reference here would let obbForLine etc. see torn
+    // values (x0 from the new state, x1 from the old) and produce a
+    // bogus OBB.
     switch (sel.kind) {
         case ShapeKind::Line:
-            if (sel.shapeIdx < layer.lines.size())   { out = obbForLine(layer.lines[sel.shapeIdx]);   return true; }
+            if (sel.shapeIdx < layer.lines.size()) {
+                Line snap = layer.lines[sel.shapeIdx];
+                out = obbForLine(snap); return true;
+            }
             break;
         case ShapeKind::Rect:
-            if (sel.shapeIdx < layer.rects.size())   { out = obbForRect(layer.rects[sel.shapeIdx]);   return true; }
+            if (sel.shapeIdx < layer.rects.size()) {
+                Rect snap = layer.rects[sel.shapeIdx];
+                out = obbForRect(snap); return true;
+            }
             break;
         case ShapeKind::Ellipse:
-            if (sel.shapeIdx < layer.ellipses.size()){ out = obbForEllipse(layer.ellipses[sel.shapeIdx]); return true; }
+            if (sel.shapeIdx < layer.ellipses.size()) {
+                Ellipse snap = layer.ellipses[sel.shapeIdx];
+                out = obbForEllipse(snap); return true;
+            }
             break;
         case ShapeKind::Circle:
-            if (sel.shapeIdx < layer.circles.size()) { out = obbForCircle(layer.circles[sel.shapeIdx]); return true; }
+            if (sel.shapeIdx < layer.circles.size()) {
+                Circle snap = layer.circles[sel.shapeIdx];
+                out = obbForCircle(snap); return true;
+            }
             break;
         case ShapeKind::None:
             break;
@@ -4064,12 +4150,16 @@ void forEachShapeSnapTarget(const F& cb, const Selection* exclude = nullptr) {
 // is on and no shape target qualifies.
 struct SnapHit { float x, y; bool found; };
 
-SnapHit findSnap(float x, float y, const Selection* exclude = nullptr) {
+SnapHit findSnap(float x, float y, const Selection* exclude = nullptr,
+                 const SnapHit* prev = nullptr,
+                 float releaseRViewPx = kSnapReleaseFastViewPx) {
     if (g_snapEnabled.load() == 0) return { x, y, false };
 
     // Convert the view-pixel target radius into doc-px at the current zoom
     // so snap stays the same on-screen distance regardless of view scale.
-    float radiusDoc  = kSnapRadiusViewPx / currentViewScale();
+    // Use userViewScale() — currentViewScale() can be transiently clobbered
+    // by GL-thread thumbnail/bucket-fill renders.
+    float radiusDoc  = kSnapRadiusViewPx / userViewScale();
     float bestDist2  = radiusDoc * radiusDoc;
     SnapHit best     = { x, y, false };
 
@@ -4082,12 +4172,44 @@ SnapHit findSnap(float x, float y, const Selection* exclude = nullptr) {
         }
     }, exclude);
 
-    if (!best.found && g_gridEnabled.load() != 0) {
+    // Grid intersections compete on the same closest-wins basis as
+    // vector vertices; previously the grid was only tested when no
+    // shape target was in range, which let a far-away line endpoint
+    // win over a nearby cell corner — visible to the user as the
+    // selection snapping to vector geometry many grid cells away
+    // when the pen sat near a grid cell center.
+    if (g_gridEnabled.load() != 0) {
         float gx = std::round(x / kGridSpacing) * kGridSpacing;
         float gy = std::round(y / kGridSpacing) * kGridSpacing;
         float dx = gx - x, dy = gy - y;
-        if (dx * dx + dy * dy < radiusDoc * radiusDoc) {
-            best = { gx, gy, true };
+        float gd2 = dx * dx + dy * dy;
+        if (gd2 < bestDist2) {
+            best     = { gx, gy, true };
+            bestDist2 = gd2;
+        }
+    }
+
+    // Hysteresis: when the previous frame's target is provided, keep
+    // snapping to it unless a different candidate is meaningfully
+    // closer. Absorbs both the EMR sensor's micro-jitter on a
+    // "stationary" pen and slow hand drift when zoomed in.
+    //   - Release radius is independent of entry — set in view-px so
+    //     a locked snap stays locked through the user's normal hand
+    //     drift, regardless of zoom.
+    //   - Stickiness ratio: a new candidate has to be ≥30% closer
+    //     (squared = ≥51%) than the previous target to win.
+    if (prev != nullptr && prev->found) {
+        float pdx = prev->x - x, pdy = prev->y - y;
+        float pd2 = pdx * pdx + pdy * pdy;
+        float releaseR = releaseRViewPx / userViewScale();
+        if (pd2 < releaseR * releaseR) {
+            if (best.found) {
+                if (bestDist2 > pd2 * 0.49f) {
+                    best = *prev;
+                }
+            } else {
+                best = *prev;
+            }
         }
     }
     return best;
@@ -4279,7 +4401,7 @@ constexpr float kHitThresholdPadViewPx = 6.0f;       // tap tolerance, view px
 // zoom level, so tapping near a shape outline keeps the same on-screen
 // tolerance regardless of how zoomed-in the user is.
 inline float hitThresholdPadDoc() {
-    return kHitThresholdPadViewPx / currentViewScale();
+    return kHitThresholdPadViewPx / userViewScale();
 }
 
 inline bool isShapeSelected(const Selection& sel, size_t layerIdx,
@@ -4403,8 +4525,16 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     glUniform1f(g_lineProg.uOpacity,
                 layer.opacity.load(std::memory_order_relaxed));
 
+    // VALUE COPIES (not references) — applyMoveTo / applyScaleTo /
+    // applyRotateTo run on the UI thread and mutate shape coordinates
+    // without locking. If we kept references, the halo and the line
+    // could read different values for x0/y0/x1/y1 within a single
+    // render frame, producing a visible offset between the halo and
+    // the stroke (the user reported this as "vibrating snap"). A
+    // local copy snapshots the shape's geometry per iteration so both
+    // draws come from the same data.
     for (size_t i = 0; i < layer.lines.size(); ++i) {
-        const auto& l = layer.lines[i];
+        const Line l = layer.lines[i];
         if (isShapeSelected(sel, layerIdx, ShapeKind::Line, i)) {
             drawLineSegment(l.x0, l.y0, l.x1, l.y1,
                             kSelectionHaloColor, l.width + kSelectionHaloPad * 2.0f,
@@ -4413,7 +4543,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
         drawLineSegment(l.x0, l.y0, l.x1, l.y1, l.color, l.width, 1.0f);
     }
     for (size_t i = 0; i < layer.rects.size(); ++i) {
-        const auto& r = layer.rects[i];
+        const Rect r = layer.rects[i];
         if (isShapeSelected(sel, layerIdx, ShapeKind::Rect, i)) {
             drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation,
                                  kSelectionHaloColor, r.width + kSelectionHaloPad * 2.0f,
@@ -4422,7 +4552,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
         drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation, r.color, r.width, 1.0f);
     }
     for (size_t i = 0; i < layer.ellipses.size(); ++i) {
-        const auto& e = layer.ellipses[i];
+        const Ellipse e = layer.ellipses[i];
         if (isShapeSelected(sel, layerIdx, ShapeKind::Ellipse, i)) {
             drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation,
                                kSelectionHaloColor, e.width + kSelectionHaloPad * 2.0f,
@@ -4431,7 +4561,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
         drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation, e.color, e.width, 1.0f);
     }
     for (size_t i = 0; i < layer.circles.size(); ++i) {
-        const auto& c = layer.circles[i];
+        const Circle c = layer.circles[i];
         if (isShapeSelected(sel, layerIdx, ShapeKind::Circle, i)) {
             drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f,
                                kSelectionHaloColor, c.width + kSelectionHaloPad * 2.0f,
@@ -4911,6 +5041,8 @@ void dropAllTilesGl(Layer& layer) {
 
 // Wipe the on-disk contents of a layer dir (but leave the dir itself).
 // Used by LayerClear redo to mirror the live clearActiveLayer path.
+// Metadata files (name.txt, opacity.txt, hidden.flag) are preserved —
+// the layer's identity survives a clear, only its content is dropped.
 void clearLayerDirOnDisk(size_t layerIdx) {
     if (g_docDir.empty()) return;
     std::string layerDir = activeLayerDir(layerIdx);
@@ -4918,8 +5050,12 @@ void clearLayerDirOnDisk(size_t layerIdx) {
     if (!d) return;
     struct dirent* dirEnt;
     while ((dirEnt = readdir(d)) != nullptr) {
-        if (dirEnt->d_name[0] == '.') continue;
-        std::string p = layerDir + "/" + dirEnt->d_name;
+        const char* n = dirEnt->d_name;
+        if (n[0] == '.') continue;
+        if (std::strcmp(n, "name.txt") == 0
+            || std::strcmp(n, "opacity.txt") == 0
+            || std::strcmp(n, "hidden.flag") == 0) continue;
+        std::string p = layerDir + "/" + n;
         unlink(p.c_str());
     }
     closedir(d);
@@ -6289,6 +6425,11 @@ Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring 
     g_docDir = str;
     env->ReleaseStringUTFChars(jpath, str);
     LOGI("document dir = %s", g_docDir.c_str());
+    // Synchronously pull layer metadata (names, types, visibility,
+    // opacity) so the UI thread can read correct state immediately.
+    // The GL-touching parts (raster tile uploads, vector shape tables)
+    // still happen lazily via ensureLoaded on the next render pass.
+    loadAllPageMetadataFromDisk();
 }
 
 // Switch the active document at runtime. Frees the current doc's GL
@@ -6767,7 +6908,19 @@ void applyRasterScaleTo(float x, float y) {
     }
     if (d.mode != DragMode::Scale) return;
 
-    SnapHit snap = findSnap(x, y, /*exclude*/ nullptr);
+    float vView = 0.0f;
+    bool fast = false;
+    if (d.hasPrevQuery) {
+        float qdx = x - d.prevQueryX;
+        float qdy = y - d.prevQueryY;
+        vView = std::sqrt(qdx * qdx + qdy * qdy) * userViewScale();
+        fast = vView > kSnapVelocityViewPx;
+    }
+    SnapHit prev = { d.snapX, d.snapY, d.snapActive };
+    float releaseR = fast ? kSnapReleaseFastViewPx : kSnapReleaseSlowViewPx;
+    SnapHit snap = findSnap(x, y, /*exclude*/ nullptr, &prev, releaseR);
+    if (fast && snap.found && !prev.found) snap.found = false;
+    float origQueryX = x, origQueryY = y;
     if (snap.found) { x = snap.x; y = snap.y; }
 
     // New center = midpoint of fixed anchor and dragged pen.
@@ -6822,6 +6975,9 @@ void applyRasterScaleTo(float x, float y) {
     g_rasterDrag.snapActive = snap.found;
     g_rasterDrag.snapX = snap.x;
     g_rasterDrag.snapY = snap.y;
+    g_rasterDrag.prevQueryX = origQueryX;
+    g_rasterDrag.prevQueryY = origQueryY;
+    g_rasterDrag.hasPrevQuery = true;
 }
 
 void applyRasterRotateTo(float x, float y) {
@@ -6863,7 +7019,20 @@ void applyRasterMoveTo(float x, float y) {
     float targetCx = x - d.moveOffsetX;
     float targetCy = y - d.moveOffsetY;
 
-    SnapHit snap = findSnap(targetCx, targetCy, /*exclude*/ nullptr);
+    float vView = 0.0f;
+    bool fast = false;
+    if (d.hasPrevQuery) {
+        float qdx = targetCx - d.prevQueryX;
+        float qdy = targetCy - d.prevQueryY;
+        vView = std::sqrt(qdx * qdx + qdy * qdy) * userViewScale();
+        fast = vView > kSnapVelocityViewPx;
+    }
+
+    SnapHit prev = { d.snapX, d.snapY, d.snapActive };
+    float releaseR = fast ? kSnapReleaseFastViewPx : kSnapReleaseSlowViewPx;
+    SnapHit snap = findSnap(targetCx, targetCy, /*exclude*/ nullptr, &prev, releaseR);
+    if (fast && snap.found && !prev.found) snap.found = false;
+    float origQueryX = targetCx, origQueryY = targetCy;
     if (snap.found) { targetCx = snap.x; targetCy = snap.y; }
 
     std::lock_guard<std::mutex> lock(g_rasterSelMutex);
@@ -6873,6 +7042,9 @@ void applyRasterMoveTo(float x, float y) {
     g_rasterDrag.snapActive = snap.found;
     g_rasterDrag.snapX = snap.x;
     g_rasterDrag.snapY = snap.y;
+    g_rasterDrag.prevQueryX = origQueryX;
+    g_rasterDrag.prevQueryY = origQueryY;
+    g_rasterDrag.hasPrevQuery = true;
 }
 
 // Begin an interaction at (x, y). Tries handles first, then shape body
@@ -6881,6 +7053,13 @@ void applyRasterMoveTo(float x, float y) {
 JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
         JNIEnv*, jobject, jfloat x, jfloat y) {
+    // Reset stale snap state from a prior drag so the hysteresis in
+    // findSnap doesn't bias the first frame of this new interaction.
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_drag.snapActive = false;
+        g_drag.hasPrevQuery = false;
+    }
     int handleHit = hitTestSelectionHandle(x, y);
 
     if (handleHit == -2) {
@@ -7046,7 +7225,26 @@ void applyMoveTo(float x, float y) {
     float targetCx = x - d.moveOffsetX;
     float targetCy = y - d.moveOffsetY;
 
-    SnapHit snap = findSnap(targetCx, targetCy, &sel);
+    // Velocity gate: don't engage a fresh snap while the pen is
+    // sweeping through the canvas. Existing locks still hold via the
+    // hysteresis in findSnap.
+    float vView = 0.0f;
+    bool fast = false;
+    if (d.hasPrevQuery) {
+        float qdx = targetCx - d.prevQueryX;
+        float qdy = targetCy - d.prevQueryY;
+        vView = std::sqrt(qdx * qdx + qdy * qdy) * userViewScale();
+        fast = vView > kSnapVelocityViewPx;
+    }
+
+    SnapHit prev = { d.snapX, d.snapY, d.snapActive };
+    float releaseR = fast ? kSnapReleaseFastViewPx : kSnapReleaseSlowViewPx;
+    SnapHit snap = findSnap(targetCx, targetCy, &sel, &prev, releaseR);
+    if (fast && snap.found && !prev.found) {
+        // Fresh engagement while moving fast — suppress.
+        snap.found = false;
+    }
+    float origQueryX = targetCx, origQueryY = targetCy;
     if (snap.found) {
         targetCx = snap.x;
         targetCy = snap.y;
@@ -7061,6 +7259,11 @@ void applyMoveTo(float x, float y) {
         g_drag.snapActive = snap.found;
         g_drag.snapX = snap.x;
         g_drag.snapY = snap.y;
+        // Track the unsnapped query position so the next call can
+        // measure pen velocity (not snap-distorted velocity).
+        g_drag.prevQueryX = origQueryX;
+        g_drag.prevQueryY = origQueryY;
+        g_drag.hasPrevQuery = true;
     }
 }
 
@@ -7081,7 +7284,19 @@ void applyScaleTo(float x, float y) {
 
     // Snap the dragged handle's pen position against other shapes'
     // targets (excluding self) before recomputing extents.
-    SnapHit snap = findSnap(x, y, &sel);
+    float vView = 0.0f;
+    bool fast = false;
+    if (d.hasPrevQuery) {
+        float qdx = x - d.prevQueryX;
+        float qdy = y - d.prevQueryY;
+        vView = std::sqrt(qdx * qdx + qdy * qdy) * userViewScale();
+        fast = vView > kSnapVelocityViewPx;
+    }
+    SnapHit prev = { d.snapX, d.snapY, d.snapActive };
+    float releaseR = fast ? kSnapReleaseFastViewPx : kSnapReleaseSlowViewPx;
+    SnapHit snap = findSnap(x, y, &sel, &prev, releaseR);
+    if (fast && snap.found && !prev.found) snap.found = false;
+    float origQueryX = x, origQueryY = y;
     if (snap.found) {
         x = snap.x;
         y = snap.y;
@@ -7091,6 +7306,9 @@ void applyScaleTo(float x, float y) {
         g_drag.snapActive = snap.found;
         g_drag.snapX = snap.x;
         g_drag.snapY = snap.y;
+        g_drag.prevQueryX = origQueryX;
+        g_drag.prevQueryY = origQueryY;
+        g_drag.hasPrevQuery = true;
     }
 
     // New center is midpoint of anchor and pen in world.
@@ -7282,6 +7500,12 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
 JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_beginRasterInteractionAt(
         JNIEnv*, jobject, jfloat x, jfloat y) {
+    // Reset stale snap state from a prior drag — see beginInteractionAt.
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        g_rasterDrag.snapActive = false;
+        g_rasterDrag.hasPrevQuery = false;
+    }
     int hit = hitTestRasterSelectionHandle(x, y);
     if (hit == -2) {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
@@ -7558,6 +7782,7 @@ Java_com_bk_drawing_NativeRenderer_setViewScale(
     uint32_t bits;
     std::memcpy(&bits, &scale, sizeof(bits));
     g_viewScaleBits.store(bits);
+    g_userViewScaleBits.store(bits);
 }
 
 // Throw away an in-progress brush/eraser stroke without baking it into
@@ -7578,6 +7803,15 @@ JNIEXPORT jint JNICALL
 Java_com_bk_drawing_NativeRenderer_getLayerCount(JNIEnv*, jobject) {
     if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return 0;
     return static_cast<jint>(g_pages[g_activePageIdx]->layers.size());
+}
+
+// True once loadAllLayersFromDisk has fully populated all layer
+// metadata. UI uses this to defer the first layer-panel render past
+// the GL thread's lazy load — otherwise the panel paints with
+// default-constructed Layer slots that aren't yet filled in.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_isFullyLoaded(JNIEnv*, jobject) {
+    return g_loaded.load(std::memory_order_acquire) ? JNI_TRUE : JNI_FALSE;
 }
 
 // Page-rect dimensions in doc-px — used by the exporter to allocate
