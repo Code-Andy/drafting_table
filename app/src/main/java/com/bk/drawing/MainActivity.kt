@@ -889,18 +889,28 @@ class MainActivity : AppCompatActivity() {
         return row
     }
 
-    /** Per-row overflow menu: rename / delete. Reordering is done with the
-     *  drag handle; Delete is disabled when only one layer remains and
-     *  prompts for confirmation otherwise (no undo for layer deletes). */
+    /** Per-row overflow menu: rename / rasterize / merge-down / delete.
+     *  Reordering is done with the drag handle; Delete is disabled when
+     *  only one layer remains. "Merge with layer below" is shown for
+     *  raster layers when there's a raster layer beneath; greyed-out
+     *  otherwise so the menu shape stays stable. */
     private fun showLayerRowOverflow(anchor: View, idx: Int) {
         val menu = PopupMenu(this, anchor, Gravity.END)
         menu.menu.add(0, 0, 0, "Rename…")
         val isVector = NativeRenderer.getLayerType(idx) == 1
+        val belowIsRaster = idx > 0 &&
+            NativeRenderer.getLayerType(idx - 1) == 0
         // Rasterize is only meaningful for vector layers; show it
         // greyed-out for raster layers so the menu shape stays stable
         // and the user knows the option exists.
         val rasterize = menu.menu.add(0, 2, 2, "Rasterize layer")
         rasterize.isEnabled = isVector
+        // Merge-with-below requires both source and target to be
+        // raster (V1: vector merge would need rasterizing the target,
+        // which is a separate feature). Greyed when source is vector,
+        // when there's no layer below, or when below is vector.
+        val mergeDown = menu.menu.add(0, 3, 3, "Merge with layer below")
+        mergeDown.isEnabled = !isVector && belowIsRaster
         val delete = menu.menu.add(0, 1, 1, "Delete")
         delete.isEnabled = layerCount > 1
         menu.setOnMenuItemClickListener { item ->
@@ -908,32 +918,31 @@ class MainActivity : AppCompatActivity() {
                 0 -> showRenameLayerDialog(idx)
                 1 -> confirmDeleteLayer(idx)
                 2 -> userRasterizeLayer(idx)
+                3 -> userMergeLayerWithBelow(idx)
             }
             true
         }
         menu.show()
     }
 
+    /** Composite the raster layer [idx] onto the raster layer below using
+     *  premultiplied "src over dst", then delete the source layer. The
+     *  op is undoable (the native impl captures the source layer's full
+     *  state plus the target's tile diff). */
+    private fun userMergeLayerWithBelow(idx: Int) {
+        if (idx <= 0) return
+        NativeRenderer.mergeLayerWithBelow(idx)
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
+    }
+
     /** Bake the vector shapes on layer [idx] into raster tiles in place.
-     *  This converts the layer's type and is destructive (the original
-     *  shape data is gone), so we confirm first. Undo is cleared by
-     *  the native impl since shape indices become stale. */
+     *  Undoable — the native impl captures the pre-rasterize shape lists
+     *  + the post-rasterize tiles in a RasterizeLayer entry. */
     private fun userRasterizeLayer(idx: Int) {
-        val customName = NativeRenderer.getLayerName(idx)
-        val isVector = NativeRenderer.getLayerType(idx) == 1
-        val displayName = if (customName.isNotEmpty()) customName
-                          else (if (isVector) "vector ${idx + 1}" else "layer ${idx + 1}")
-        AlertDialog.Builder(this)
-            .setTitle("Rasterize layer")
-            .setMessage("Bake every shape on “$displayName” into raster tiles? " +
-                        "The original vector data can't be recovered.")
-            .setPositiveButton("Rasterize") { _, _ ->
-                NativeRenderer.rasterizeLayer(idx)
-                drawingView?.forceRedraw()
-                drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+        NativeRenderer.rasterizeLayer(idx)
+        drawingView?.forceRedraw()
+        drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
     /** Confirm-then-delete a layer. There is no undo for layer ops, so

@@ -966,6 +966,7 @@ constexpr int kActionMovePage       = 13;
 constexpr int kActionImportImage    = 14;
 constexpr int kActionRasterizeLayer       = 15;
 constexpr int kActionRasterizeShapeBelow  = 16;
+constexpr int kActionMergeLayerDown       = 17;
 // Target index for the next kActionSwitchPage drained. Stored separately
 // because the action queue is just `vector<int>`. Last-write-wins on
 // rapid taps: exchange(-1) at drain time picks up whichever target was
@@ -990,6 +991,11 @@ int              g_pendingMovePageTo    = -1;
 // Rasterize-layer side channel. The action queue carries the action
 // code; the layer index is stored here last-write-wins.
 std::atomic<int> g_pendingRasterizeLayerIdx{-1};
+
+// Merge-layer-down side channel. Same shape as rasterize: the action
+// code goes on the queue and the index of the source layer (the one
+// being merged into the layer below) is stored here last-write-wins.
+std::atomic<int> g_pendingMergeLayerIdx{-1};
 
 // Eyedropper: UI thread queues a sample-this-pixel request in DOC-px
 // (floats; matches doc convention y-down). The GL thread drains it at
@@ -1114,6 +1120,14 @@ enum class UndoOp : int {
     VectorMutate,       // shape was transformed (move/scale/rotate)
     LayerClear,         // active layer was cleared
     LayerAdd,           // a new layer was appended
+    RasterizeShapeBelow,// vector shape was baked onto the raster layer below
+                        // (combines a VectorDelete on layerIdx with a
+                        // RasterStroke-like tile diff on targetLayerIdx)
+    RasterizeLayer,     // a vector layer's shapes were baked into raster
+                        // tiles in place; type flipped Vector → Raster
+    MergeLayerDown,     // a raster layer was composited onto the layer
+                        // below ("src over dst") and then deleted; the
+                        // deleted layer is captured in srcSnapshot
 };
 
 struct TileSnap {
@@ -1128,6 +1142,22 @@ struct ShapeData {
     Rect    rect{};
     Ellipse ellipse{};
     Circle  circle{};
+};
+
+// Complete snapshot of a layer's state. Used by destructive layer ops
+// (merge, future delete) that need to fully recreate a layer on undo:
+// type, name, visibility, opacity, plus content (raster tiles or vector
+// shapes — only one applies per type).
+struct LayerSnapshot {
+    std::string           name;
+    LayerType             type    = LayerType::Raster;
+    bool                  visible = true;
+    float                 opacity = 1.0f;
+    std::vector<TileSnap> tiles;        // raster: every existing tile
+    std::vector<Line>     lines;        // vector: shape lists
+    std::vector<Rect>     rects;
+    std::vector<Ellipse>  ellipses;
+    std::vector<Circle>   circles;
 };
 
 struct UndoEntry {
@@ -1157,6 +1187,25 @@ struct UndoEntry {
     // LayerAdd: type of the layer that was appended; previous active idx.
     LayerType addedLayerType  = LayerType::Raster;
     size_t    prevActiveLayer = 0;
+
+    // RasterizeShapeBelow: layerIdx is the SOURCE vector layer (where the
+    //   shape used to live); targetLayerIdx is the RASTER layer that
+    //   received the bake. shapeIdx + beforeShape carry the deleted
+    //   shape; beforeTiles / afterTiles carry the target's tile diff
+    //   over the shape's bbox.
+    // MergeLayerDown: layerIdx is the SOURCE (deleted) layer's original
+    //   index; targetLayerIdx is the layer below (merge target).
+    //   srcSnapshot carries the deleted layer's full state (so undo
+    //   can re-create it). beforeTiles / afterTiles carry the target's
+    //   tile diff.
+    size_t targetLayerIdx = 0;
+
+    // RasterizeLayer: layerTypeAfter is Raster (post-bake); layerType-
+    //   Before (the existing field, also used by LayerClear) is Vector.
+    LayerType layerTypeAfter = LayerType::Raster;
+
+    // MergeLayerDown: full snapshot of the deleted source layer.
+    LayerSnapshot srcSnapshot;
 
     size_t bytes = 0;                // approximate memory cost
 };
@@ -1236,6 +1285,14 @@ size_t computeEntrySize(const UndoEntry& e) {
     s += e.beforeRects.size()    * sizeof(Rect);
     s += e.beforeEllipses.size() * sizeof(Ellipse);
     s += e.beforeCircles.size()  * sizeof(Circle);
+    // srcSnapshot — used by MergeLayerDown (and any future op that
+    // captures a full layer for re-creation on undo).
+    for (const auto& t : e.srcSnapshot.tiles) s += t.bytes.size();
+    s += e.srcSnapshot.lines.size()    * sizeof(Line);
+    s += e.srcSnapshot.rects.size()    * sizeof(Rect);
+    s += e.srcSnapshot.ellipses.size() * sizeof(Ellipse);
+    s += e.srcSnapshot.circles.size()  * sizeof(Circle);
+    s += e.srcSnapshot.name.size();
     return s;
 }
 
@@ -1433,6 +1490,7 @@ void rasterizeShapesIntoTiles(size_t targetLayerIdx,
                               const std::vector<Circle>&  circles);
 void rasterizeVectorLayerImpl(size_t layerIdx);
 void rasterizeShapeBelowImpl();
+void mergeRasterLayerDownImpl(size_t layerIdx);
 // Shape draw primitives — defined down with the composite helpers but
 // called from rasterizeShapesIntoTiles up here.
 void drawLineSegment(float x0, float y0, float x1, float y1,
@@ -1654,6 +1712,12 @@ void applyPendingLayerActions() {
         } else if (a == kActionRasterizeShapeBelow) {
             applyPendingShapes();
             rasterizeShapeBelowImpl();
+        } else if (a == kActionMergeLayerDown) {
+            int idx = g_pendingMergeLayerIdx.exchange(-1);
+            if (idx >= 0) {
+                applyPendingShapes();
+                mergeRasterLayerDownImpl(static_cast<size_t>(idx));
+            }
         } else if (a == kActionImportImage) {
             // Take ownership of the pending image bytes under the mutex
             // so the UI thread can post a fresh import without racing.
@@ -2345,6 +2409,110 @@ void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 }
 
+// Capture a complete layer snapshot — type, name, visibility, opacity,
+// plus content (raster tiles or vector shapes per the type). Used by
+// destructive layer ops that need to re-create the layer on undo.
+// Reads tile FBOs directly, so it must run on the GL thread.
+void captureLayerSnapshot(size_t layerIdx, LayerSnapshot& out) {
+    out = LayerSnapshot{};
+    if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
+    Layer& layer = *layers()[layerIdx];
+    {
+        std::lock_guard<std::mutex> lock(g_layerNameMutex);
+        out.name = layer.name;
+    }
+    out.type    = layer.type;
+    out.visible = layer.visible.load(std::memory_order_relaxed);
+    out.opacity = layer.opacity.load(std::memory_order_relaxed);
+    if (layer.type == LayerType::Raster) {
+        snapshotAllTiles(layerIdx, out.tiles);
+    } else {
+        out.lines    = layer.lines;
+        out.rects    = layer.rects;
+        out.ellipses = layer.ellipses;
+        out.circles  = layer.circles;
+    }
+}
+
+// Insert a fresh Layer at [idx] populated from `snap`, shifting any
+// trailing layers (and their on-disk dirs) up by one. Restores tiles
+// or vector shapes per the snapshot's type, plus name/visibility/
+// opacity to disk so the layer survives the next launch. Must run on
+// the GL thread (creates tile textures).
+void insertLayerWithSnapshot(size_t idx, const LayerSnapshot& snap) {
+    auto& ls = layers();
+    if (idx > ls.size()) idx = ls.size();
+
+    // Renumber trailing layer dirs UP by one — top-down to avoid
+    // clobbering. Mirror image of the renumber-after-delete path in
+    // deleteLayerImpl.
+    if (!g_docDir.empty()) {
+        std::string pageDir = pageDirOf(g_activePageIdx);
+        for (long long j = static_cast<long long>(ls.size()) - 1;
+             j >= static_cast<long long>(idx); --j) {
+            std::string oldDir = pageDir + "/layer_" + std::to_string(j);
+            std::string newDir = pageDir + "/layer_" + std::to_string(j + 1);
+            struct stat st;
+            if (stat(oldDir.c_str(), &st) == 0) {
+                rename(oldDir.c_str(), newDir.c_str());
+            }
+        }
+    }
+
+    auto layer = std::make_unique<Layer>();
+    layer->type = snap.type;
+    layer->visible.store(snap.visible, std::memory_order_relaxed);
+    layer->opacity.store(snap.opacity, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_layerNameMutex);
+        layer->name = snap.name;
+    }
+    layer->lines    = snap.lines;
+    layer->rects    = snap.rects;
+    layer->ellipses = snap.ellipses;
+    layer->circles  = snap.circles;
+    ls.insert(ls.begin() + idx, std::move(layer));
+
+    // Restore raster tiles (creates GL textures + saves to disk).
+    if (snap.type == LayerType::Raster) {
+        for (const auto& t : snap.tiles) {
+            applyTileSnap(idx, t);
+        }
+    }
+    // Persist vector shapes (also creates the marker file used to
+    // detect Vector type at load time).
+    if (snap.type == LayerType::Vector) {
+        saveVectorLayer(idx, *ls[idx]);
+    }
+
+    // Persist metadata files. mkdir is no-op if the dir already exists
+    // (e.g. raster-layer tile saves above already created it).
+    if (!g_docDir.empty()) {
+        std::string dir = activeLayerDir(idx);
+        mkdir(dir.c_str(), 0755);
+        std::string namePath = dir + "/name.txt";
+        if (snap.name.empty()) {
+            std::remove(namePath.c_str());
+        } else if (FILE* f = std::fopen(namePath.c_str(), "wb")) {
+            std::fwrite(snap.name.data(), 1, snap.name.size(), f);
+            std::fclose(f);
+        }
+        std::string flagPath = dir + "/hidden.flag";
+        if (snap.visible) {
+            std::remove(flagPath.c_str());
+        } else if (FILE* f = std::fopen(flagPath.c_str(), "wb")) {
+            std::fclose(f);
+        }
+        std::string opath = dir + "/opacity.txt";
+        if (snap.opacity >= 0.999f) {
+            std::remove(opath.c_str());
+        } else if (FILE* f = std::fopen(opath.c_str(), "wb")) {
+            std::fprintf(f, "%.4f", snap.opacity);
+            std::fclose(f);
+        }
+    }
+}
+
 // Snapshot every existing tile in the layer (for full-layer-clear undo).
 void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out) {
     out.clear();
@@ -2555,6 +2723,21 @@ void deleteLayerImpl(size_t idx) {
                     it = stack.erase(it);
                     continue;
                 }
+                // RasterizeShapeBelow + MergeLayerDown carry a second
+                // layer reference (targetLayerIdx). If THAT layer was
+                // deleted, we can't restore its tiles, so the entry
+                // has to go too.
+                if (it->op == UndoOp::RasterizeShapeBelow
+                 || it->op == UndoOp::MergeLayerDown) {
+                    size_t newTgt =
+                        mapLayerIdxAfterDelete(it->targetLayerIdx, idx);
+                    if (newTgt == kInvalidLayerIdx) {
+                        totalBytes -= it->bytes;
+                        it = stack.erase(it);
+                        continue;
+                    }
+                    it->targetLayerIdx = newTgt;
+                }
                 it->layerIdx = newIdx;
                 if (it->op == UndoOp::LayerAdd) {
                     // prevActiveLayer being the deleted layer means the
@@ -2640,6 +2823,11 @@ void moveLayerImpl(size_t from, size_t to) {
                 if (e.op == UndoOp::LayerAdd) {
                     e.prevActiveLayer =
                         mapLayerIdxAfterMove(e.prevActiveLayer, from, to);
+                }
+                if (e.op == UndoOp::RasterizeShapeBelow
+                 || e.op == UndoOp::MergeLayerDown) {
+                    e.targetLayerIdx =
+                        mapLayerIdxAfterMove(e.targetLayerIdx, from, to);
                 }
             }
         };
@@ -2921,7 +3109,8 @@ void rasterizeShapesIntoTiles(size_t targetLayerIdx,
 // Convert a vector layer to a raster layer in place. Renders all of its
 // shapes into freshly-baked tiles, drops the shape arrays, flips
 // layer.type, and removes the on-disk shapes.bin so the type is
-// canonical after restart.
+// canonical after restart. Pushes a RasterizeLayer undo entry that
+// can flip the layer back to vector.
 void rasterizeVectorLayerImpl(size_t layerIdx) {
     if (layerIdx >= layers().size() || !layers()[layerIdx]) return;
     Layer& src = *layers()[layerIdx];
@@ -2929,6 +3118,7 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
     if (src.lines.empty() && src.rects.empty()
         && src.ellipses.empty() && src.circles.empty()) {
         // Empty vector layer — just flip the type and drop shapes.bin.
+        // No undo entry: nothing user-visible changed.
         src.type = LayerType::Raster;
         if (!g_docDir.empty()) {
             std::string p = activeLayerDir(layerIdx) + "/shapes.bin";
@@ -2936,6 +3126,19 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
         }
         return;
     }
+
+    // Capture pre-rasterize shape lists for undo. Then move them into
+    // typed locals so the rasterize call can consume them after the
+    // layer's shape vectors are cleared.
+    UndoEntry entry;
+    entry.op              = UndoOp::RasterizeLayer;
+    entry.layerIdx        = layerIdx;
+    entry.layerTypeBefore = LayerType::Vector;
+    entry.layerTypeAfter  = LayerType::Raster;
+    entry.beforeLines     = src.lines;
+    entry.beforeRects     = src.rects;
+    entry.beforeEllipses  = src.ellipses;
+    entry.beforeCircles   = src.circles;
 
     // Promote the layer type up front so rasterizeShapesIntoTiles
     // accepts it as a raster target. If we promoted after the call,
@@ -2949,6 +3152,10 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
     std::vector<Circle>  cs = std::move(src.circles);  src.circles.clear();
 
     rasterizeShapesIntoTiles(layerIdx, ls, rs, es, cs);
+
+    // Capture the resulting tiles so redo can re-apply them without
+    // re-running the GPU rasterize path.
+    snapshotAllTiles(layerIdx, entry.afterTiles);
 
     // Disk side: shapes.bin is no longer the source of truth — a vector
     // layer's presence-of-shapes.bin is how loadAllLayersFromDisk
@@ -2967,23 +3174,105 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
             g_selection = Selection{};
         }
     }
-    // Undo entries reference shape indices in the prior vector layer;
-    // the layer is now raster, those entries can't apply.
+    // Pre-existing undo entries on this layer reference shape indices
+    // that no longer exist (the layer is now raster). Drop just those;
+    // entries on OTHER layers stay intact.
     {
         std::lock_guard<std::mutex> lock(g_undoMutex);
-        g_undoStack.clear(); g_undoTotalBytes = 0;
-        g_redoStack.clear(); g_redoTotalBytes = 0;
+        auto purge = [&](std::deque<UndoEntry>& stack, size_t& total) {
+            for (auto it = stack.begin(); it != stack.end(); ) {
+                bool stale = (it->layerIdx == layerIdx)
+                    && (it->op == UndoOp::VectorAdd
+                     || it->op == UndoOp::VectorDelete
+                     || it->op == UndoOp::VectorMutate
+                     || it->op == UndoOp::LayerClear);
+                if (stale) {
+                    total -= it->bytes;
+                    it = stack.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+        purge(g_undoStack, g_undoTotalBytes);
+        purge(g_redoStack, g_redoTotalBytes);
     }
+
+    pushUndoEntry(std::move(entry));
 
     LOGI("rasterized vector layer %zu (%zu lines, %zu rects, "
          "%zu ellipses, %zu circles)",
          layerIdx, ls.size(), rs.size(), es.size(), cs.size());
 }
 
+// Doc-space AABB of a single vector shape, padded by half its stroke
+// width plus 1 doc-px so anti-aliased edges land safely inside the
+// snapshot region. Used by rasterizeShapeBelowImpl to bound the set of
+// target tiles whose pixels need to be captured for undo.
+struct DocBbox { float minX, minY, maxX, maxY; };
+DocBbox shapeAabb(const ShapeData& s) {
+    DocBbox b{0, 0, 0, 0};
+    float pad = 1.0f;
+    switch (s.kind) {
+        case ShapeKind::Line: {
+            const Line& l = s.line;
+            b.minX = std::min(l.x0, l.x1); b.maxX = std::max(l.x0, l.x1);
+            b.minY = std::min(l.y0, l.y1); b.maxY = std::max(l.y0, l.y1);
+            pad += l.width * 0.5f;
+            break;
+        }
+        case ShapeKind::Rect: {
+            const Rect& r = s.rect;
+            float cx = (r.x0 + r.x1) * 0.5f, cy = (r.y0 + r.y1) * 0.5f;
+            float hw = std::fabs(r.x1 - r.x0) * 0.5f;
+            float hh = std::fabs(r.y1 - r.y0) * 0.5f;
+            float c = std::cos(r.rotation), si = std::sin(r.rotation);
+            float ax = std::fabs(hw * c) + std::fabs(hh * si);
+            float ay = std::fabs(hw * si) + std::fabs(hh * c);
+            b.minX = cx - ax; b.maxX = cx + ax;
+            b.minY = cy - ay; b.maxY = cy + ay;
+            pad += r.width * 0.5f;
+            break;
+        }
+        case ShapeKind::Ellipse: {
+            const Ellipse& e = s.ellipse;
+            float c = std::cos(e.rotation), si = std::sin(e.rotation);
+            float ax = std::fabs(e.rx * c) + std::fabs(e.ry * si);
+            float ay = std::fabs(e.rx * si) + std::fabs(e.ry * c);
+            b.minX = e.cx - ax; b.maxX = e.cx + ax;
+            b.minY = e.cy - ay; b.maxY = e.cy + ay;
+            pad += e.width * 0.5f;
+            break;
+        }
+        case ShapeKind::Circle: {
+            const Circle& c = s.circle;
+            b.minX = c.cx - c.radius; b.maxX = c.cx + c.radius;
+            b.minY = c.cy - c.radius; b.maxY = c.cy + c.radius;
+            pad += c.width * 0.5f;
+            break;
+        }
+        default: return b;
+    }
+    b.minX -= pad; b.minY -= pad;
+    b.maxX += pad; b.maxY += pad;
+    return b;
+}
+
+// Floor-divide that handles negative numerators correctly (C++ /
+// truncates toward zero; we want toward -inf for tile coords on a
+// page anchored away from doc 0).
+inline int tileFloorDiv(int a, int b) {
+    int q = a / b;
+    if ((a ^ b) < 0 && q * b != a) --q;
+    return q;
+}
+
 // Rasterize the currently-selected vector shape onto the raster layer
 // directly below the source vector layer. No-op if there's no
 // selection, the layer below is missing or non-raster, or the source
-// shape index is out of range.
+// shape index is out of range. Pushes a single RasterizeShapeBelow
+// undo entry covering both the shape's removal and the target's tile
+// changes.
 void rasterizeShapeBelowImpl() {
     Selection sel;
     {
@@ -3000,8 +3289,10 @@ void rasterizeShapeBelowImpl() {
     if (!layers()[targetIdx]) return;
     if (layers()[targetIdx]->type != LayerType::Raster) return;
 
-    // Pluck the shape into its own one-element list, then erase from
-    // the source layer.
+    // Capture the shape into both a typed one-element list (for the
+    // rasterize call) and a ShapeData (for the undo entry).
+    ShapeData beforeShape;
+    beforeShape.kind = sel.kind;
     std::vector<Line>    ls;
     std::vector<Rect>    rs;
     std::vector<Ellipse> es;
@@ -3009,28 +3300,58 @@ void rasterizeShapeBelowImpl() {
     switch (sel.kind) {
         case ShapeKind::Line:
             if (sel.shapeIdx >= src.lines.size())    return;
-            ls.push_back(src.lines[sel.shapeIdx]);
+            beforeShape.line = src.lines[sel.shapeIdx];
+            ls.push_back(beforeShape.line);
             src.lines.erase(src.lines.begin() + sel.shapeIdx);
             break;
         case ShapeKind::Rect:
             if (sel.shapeIdx >= src.rects.size())    return;
-            rs.push_back(src.rects[sel.shapeIdx]);
+            beforeShape.rect = src.rects[sel.shapeIdx];
+            rs.push_back(beforeShape.rect);
             src.rects.erase(src.rects.begin() + sel.shapeIdx);
             break;
         case ShapeKind::Ellipse:
             if (sel.shapeIdx >= src.ellipses.size()) return;
-            es.push_back(src.ellipses[sel.shapeIdx]);
+            beforeShape.ellipse = src.ellipses[sel.shapeIdx];
+            es.push_back(beforeShape.ellipse);
             src.ellipses.erase(src.ellipses.begin() + sel.shapeIdx);
             break;
         case ShapeKind::Circle:
             if (sel.shapeIdx >= src.circles.size())  return;
-            cs.push_back(src.circles[sel.shapeIdx]);
+            beforeShape.circle = src.circles[sel.shapeIdx];
+            cs.push_back(beforeShape.circle);
             src.circles.erase(src.circles.begin() + sel.shapeIdx);
             break;
         default: return;
     }
 
-    rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs);
+    // Snapshot the target tiles within the shape's bbox BEFORE the
+    // bake; same range AFTER. Both go on the undo entry so reverse
+    // restores the target to its pre-bake pixels and forward restores
+    // the post-bake pixels. Clamp the bbox to the page rect (rasterize
+    // skips anything outside it anyway).
+    DocBbox bb = shapeAabb(beforeShape);
+    PageClip page = readPageClip();
+    if (page.active) {
+        bb.minX = std::max(bb.minX, page.minX);
+        bb.minY = std::max(bb.minY, page.minY);
+        bb.maxX = std::min(bb.maxX, page.maxX);
+        bb.maxY = std::min(bb.maxY, page.maxY);
+    }
+    std::vector<TileSnap> beforeTiles, afterTiles;
+    if (bb.maxX > bb.minX && bb.maxY > bb.minY) {
+        int tx0 = tileFloorDiv(static_cast<int>(std::floor(bb.minX)), kTileSize);
+        int tx1 = tileFloorDiv(
+            static_cast<int>(std::ceil(bb.maxX) - 1), kTileSize);
+        int ty0 = tileFloorDiv(static_cast<int>(std::floor(bb.minY)), kTileSize);
+        int ty1 = tileFloorDiv(
+            static_cast<int>(std::ceil(bb.maxY) - 1), kTileSize);
+        snapshotTilesInBbox(targetIdx, tx0, tx1, ty0, ty1, beforeTiles);
+        rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs);
+        snapshotTilesInBbox(targetIdx, tx0, tx1, ty0, ty1, afterTiles);
+    } else {
+        rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs);
+    }
 
     // Persist the source layer's new (one-shape-shorter) state.
     saveVectorLayer(sel.layerIdx, src);
@@ -3040,15 +3361,169 @@ void rasterizeShapeBelowImpl() {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         g_selection = Selection{};
     }
-    // Undo entries referencing the old shape index are stale.
-    {
-        std::lock_guard<std::mutex> lock(g_undoMutex);
-        g_undoStack.clear(); g_undoTotalBytes = 0;
-        g_redoStack.clear(); g_redoTotalBytes = 0;
-    }
+
+    // Push the reversible record. layerIdx points at the source vector
+    // layer (where the shape gets re-inserted on undo); targetLayerIdx
+    // points at the raster layer (whose tiles get restored).
+    UndoEntry entry;
+    entry.op             = UndoOp::RasterizeShapeBelow;
+    entry.layerIdx       = sel.layerIdx;
+    entry.targetLayerIdx = targetIdx;
+    entry.shapeIdx       = sel.shapeIdx;
+    entry.beforeShape    = beforeShape;
+    entry.beforeTiles    = std::move(beforeTiles);
+    entry.afterTiles     = std::move(afterTiles);
+    pushUndoEntry(std::move(entry));
 
     LOGI("rasterized shape from layer %zu onto layer %zu",
          sel.layerIdx, targetIdx);
+}
+
+// Merge the raster layer at [idx] onto the raster layer at [idx-1]
+// using premultiplied "src over dst" so the top layer's pixels stay on
+// top. Then delete the source. Refuses if either layer is vector or
+// the source is the bottom layer (nothing to merge with). Pushes a
+// MergeLayerDown undo entry capturing the source layer's full state
+// plus the target's tile diff.
+void mergeRasterLayerDownImpl(size_t idx) {
+    if (g_pages.empty() || g_activePageIdx >= g_pages.size()) return;
+    auto& ls = g_pages[g_activePageIdx]->layers;
+    if (idx == 0 || idx >= ls.size() || !ls[idx] || !ls[idx - 1]) {
+        LOGI("merge layer down %zu refused — bad index", idx);
+        return;
+    }
+    Layer& src = *ls[idx];
+    Layer& tgt = *ls[idx - 1];
+    if (src.type != LayerType::Raster || tgt.type != LayerType::Raster) {
+        LOGI("merge layer down %zu refused — both must be raster "
+             "(src=%d tgt=%d)", idx,
+             static_cast<int>(src.type), static_cast<int>(tgt.type));
+        return;
+    }
+
+    // Floating selection's lifted pixels live on its source layer; bake
+    // back to keep the merge operating on a consistent picture.
+    cancelRasterSelectionImpl();
+
+    // Capture the source layer's full state BEFORE we modify anything,
+    // so undo can re-create it. captureLayerSnapshot reads tile FBOs.
+    UndoEntry entry;
+    entry.op             = UndoOp::MergeLayerDown;
+    entry.layerIdx       = idx;
+    entry.targetLayerIdx = idx - 1;
+    captureLayerSnapshot(idx, entry.srcSnapshot);
+
+    // Snapshot the target tiles that source would touch BEFORE the
+    // composite. Source's tile keys are exactly the set of target
+    // tiles that may change (anything outside source's grid is
+    // untouched). Some target keys won't exist yet (new tile creation
+    // during merge) — TileSnap with existed=false handles that.
+    GLint prevReadFbo = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+
+    std::vector<int64_t> tileKeys;
+    tileKeys.reserve(src.tiles.size());
+    for (const auto& kv : src.tiles) tileKeys.push_back(kv.first);
+
+    auto readTileSnap = [&](Layer& layer, int64_t k, TileSnap& snap) {
+        unpackTileKey(k, snap.tx, snap.ty);
+        auto it = layer.tiles.find(k);
+        if (it != layer.tiles.end()) {
+            snap.existed = true;
+            snap.bytes.resize(kTileBytes);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+        }
+    };
+
+    entry.beforeTiles.reserve(tileKeys.size());
+    for (int64_t k : tileKeys) {
+        TileSnap snap;
+        readTileSnap(tgt, k, snap);
+        entry.beforeTiles.push_back(std::move(snap));
+    }
+
+    // Composite source over target, tile by tile.
+    std::vector<uint8_t> srcBytes(kTileBytes);
+    std::vector<uint8_t> tgtBytes(kTileBytes);
+    for (auto& kv : src.tiles) {
+        int tx, ty;
+        unpackTileKey(kv.first, tx, ty);
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, kv.second.fbo);
+        glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                     GL_RGBA, GL_UNSIGNED_BYTE, srcBytes.data());
+
+        bool anyOpaque = false;
+        for (size_t i = 3; i < srcBytes.size(); i += 4) {
+            if (srcBytes[i] != 0) { anyOpaque = true; break; }
+        }
+        if (!anyOpaque) continue;
+
+        auto it = tgt.tiles.find(kv.first);
+        if (it != tgt.tiles.end()) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, tgtBytes.data());
+        } else {
+            std::fill(tgtBytes.begin(), tgtBytes.end(), 0);
+        }
+
+        // Premultiplied "src over dst" — same blend the GPU does during
+        // composite, so the visual after merge matches what the user
+        // saw with both layers visible.
+        for (size_t i = 0; i < kTileBytes; i += 4) {
+            uint8_t sa = srcBytes[i + 3];
+            if (sa == 0) continue;
+            if (sa == 255) {
+                tgtBytes[i + 0] = srcBytes[i + 0];
+                tgtBytes[i + 1] = srcBytes[i + 1];
+                tgtBytes[i + 2] = srcBytes[i + 2];
+                tgtBytes[i + 3] = 255;
+            } else {
+                uint32_t inv = 255u - sa;
+                uint8_t dr = tgtBytes[i + 0];
+                uint8_t dg = tgtBytes[i + 1];
+                uint8_t db = tgtBytes[i + 2];
+                uint8_t da = tgtBytes[i + 3];
+                tgtBytes[i + 0] = static_cast<uint8_t>(
+                    srcBytes[i + 0] + (dr * inv + 127u) / 255u);
+                tgtBytes[i + 1] = static_cast<uint8_t>(
+                    srcBytes[i + 1] + (dg * inv + 127u) / 255u);
+                tgtBytes[i + 2] = static_cast<uint8_t>(
+                    srcBytes[i + 2] + (db * inv + 127u) / 255u);
+                tgtBytes[i + 3] = static_cast<uint8_t>(
+                    sa + (da * inv + 127u) / 255u);
+            }
+        }
+
+        uploadTileBytesAndSave(idx - 1, tx, ty, tgtBytes.data());
+    }
+
+    // Snapshot the post-composite target tiles (same key set) so redo
+    // can restore the merged pixels without re-running the blend.
+    entry.afterTiles.reserve(tileKeys.size());
+    for (int64_t k : tileKeys) {
+        TileSnap snap;
+        readTileSnap(tgt, k, snap);
+        entry.afterTiles.push_back(std::move(snap));
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+
+    // Delete the source layer. deleteLayerImpl handles GL teardown,
+    // dir removal + renumber, active-layer adjustment, and remaps
+    // surviving undo entries to the new layer-idx scheme.
+    deleteLayerImpl(idx);
+
+    // Push our entry AFTER the delete remap so the freshly-pushed
+    // entry's layerIdx (= original source idx) is correct in the
+    // post-delete index space — undo's insertLayerWithSnapshot will
+    // re-introduce that slot.
+    pushUndoEntry(std::move(entry));
+
+    LOGI("merged raster layer %zu down into %zu", idx, idx - 1);
 }
 
 // Recursively wipe a page dir (`<docDir>/page_<idx>/`). Walks two levels
@@ -4369,8 +4844,23 @@ void drawRectangleAsLines(float x0, float y0, float x1, float y1, float rotation
 
 void drawEllipseAsLines(float cx, float cy, float rx, float ry, float rotation,
                         uint32_t rgb, float width, float alpha) {
-    constexpr int   kSegments = 32;
-    constexpr float kTau      = 6.283185307179586f;
+    constexpr float kTau = 6.283185307179586f;
+    // Adaptive segment count: target ~3 view-pixels per chord so the
+    // polygonization stays imperceptible at any zoom. Use the larger
+    // semi-axis as a perimeter proxy (upper-bounds the true Ramanujan
+    // perimeter and is good enough for picking a segment count). Use
+    // currentViewScale so this scales correctly for thumbnail renders
+    // too — those use a transient render scale.
+    constexpr float kTargetChordViewPx = 3.0f;
+    constexpr int   kMinSegments       = 24;
+    constexpr int   kMaxSegments       = 256;
+    float maxRadiusView = std::max(std::fabs(rx), std::fabs(ry))
+                          * currentViewScale();
+    float perimViewUpper = kTau * maxRadiusView;
+    int segments = static_cast<int>(perimViewUpper / kTargetChordViewPx);
+    if (segments < kMinSegments) segments = kMinSegments;
+    if (segments > kMaxSegments) segments = kMaxSegments;
+
     float c = std::cos(rotation), s = std::sin(rotation);
     auto pointAt = [&](float a, float& x, float& y) {
         float lx = std::cos(a) * rx;
@@ -4380,8 +4870,8 @@ void drawEllipseAsLines(float cx, float cy, float rx, float ry, float rotation,
     };
     float prevX, prevY;
     pointAt(0.0f, prevX, prevY);
-    for (int i = 1; i <= kSegments; ++i) {
-        float a = (float)i / (float)kSegments * kTau;
+    for (int i = 1; i <= segments; ++i) {
+        float a = (float)i / (float)segments * kTau;
         float x, y;
         pointAt(a, x, y);
         drawLineSegment(prevX, prevY, x, y, rgb, width, alpha);
@@ -5139,6 +5629,86 @@ void applyEntryReverse(const UndoEntry& e) {
             }
             break;
         }
+        case UndoOp::RasterizeShapeBelow: {
+            // Restore target tiles to their pre-bake pixels.
+            if (e.targetLayerIdx < layers().size() && layers()[e.targetLayerIdx]) {
+                for (const auto& s : e.beforeTiles) {
+                    applyTileSnap(e.targetLayerIdx, s);
+                }
+            }
+            // Re-insert the shape at its original index in the source
+            // vector layer. Skip if the source has since been
+            // converted to raster — restoring tiles alone is still
+            // useful.
+            if (e.layerIdx < layers().size() && layers()[e.layerIdx]
+                && layers()[e.layerIdx]->type == LayerType::Vector) {
+                Layer& src = *layers()[e.layerIdx];
+                insertShapeAt(src, e.beforeShape.kind, e.shapeIdx, e.beforeShape);
+                saveVectorLayer(e.layerIdx, src);
+            }
+            break;
+        }
+        case UndoOp::RasterizeLayer: {
+            // Flip the layer back to vector: drop GL tile resources +
+            // disk tiles, restore shape lists, regenerate shapes.bin.
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
+            dropAllTilesGl(layer);
+            // Wipes tile_*.bin (and shapes.bin if any), preserves
+            // metadata (name/visibility/opacity).
+            clearLayerDirOnDisk(e.layerIdx);
+            layer.type     = LayerType::Vector;
+            layer.lines    = e.beforeLines;
+            layer.rects    = e.beforeRects;
+            layer.ellipses = e.beforeEllipses;
+            layer.circles  = e.beforeCircles;
+            saveVectorLayer(e.layerIdx, layer);
+            // Selection on this layer was cleared on the forward path;
+            // it stays cleared on reverse.
+            break;
+        }
+        case UndoOp::MergeLayerDown: {
+            // Restore target tiles to their pre-merge state. Do this
+            // BEFORE re-inserting the source layer so the target's
+            // index in `layers()` is still e.targetLayerIdx (insertion
+            // doesn't shift layers below the insert point, but doing
+            // tiles first keeps the order obvious).
+            if (e.targetLayerIdx < layers().size() && layers()[e.targetLayerIdx]) {
+                for (const auto& s : e.beforeTiles) {
+                    applyTileSnap(e.targetLayerIdx, s);
+                }
+            }
+            // Re-create the source layer at its original idx using the
+            // captured snapshot. This shifts trailing layers up + their
+            // on-disk dirs.
+            insertLayerWithSnapshot(e.layerIdx, e.srcSnapshot);
+            // Pre-existing entries' layerIdx pointed into the post-
+            // delete index space; the insert just shifted everything
+            // above e.layerIdx up by one. Mirror that shift on the
+            // remaining stack so future undos still target the right
+            // layers. (This entry is being popped now so it skips
+            // self-remap.)
+            {
+                std::lock_guard<std::mutex> lock(g_undoMutex);
+                auto remap = [&](std::deque<UndoEntry>& stack) {
+                    for (auto& other : stack) {
+                        if (other.layerIdx >= e.layerIdx) ++other.layerIdx;
+                        if ((other.op == UndoOp::RasterizeShapeBelow
+                          || other.op == UndoOp::MergeLayerDown)
+                            && other.targetLayerIdx >= e.layerIdx) {
+                            ++other.targetLayerIdx;
+                        }
+                        if (other.op == UndoOp::LayerAdd
+                            && other.prevActiveLayer >= e.layerIdx) {
+                            ++other.prevActiveLayer;
+                        }
+                    }
+                };
+                remap(g_undoStack);
+                remap(g_redoStack);
+            }
+            break;
+        }
     }
 }
 
@@ -5199,6 +5769,77 @@ void applyEntryForward(const UndoEntry& e) {
             activeLayer() = layers().size() - 1;
             if (e.addedLayerType == LayerType::Vector) {
                 saveVectorLayer(activeLayer(), *layers()[activeLayer()]);
+            }
+            break;
+        }
+        case UndoOp::RasterizeShapeBelow: {
+            // Re-erase the shape from the source vector layer.
+            if (e.layerIdx < layers().size() && layers()[e.layerIdx]
+                && layers()[e.layerIdx]->type == LayerType::Vector) {
+                Layer& src = *layers()[e.layerIdx];
+                eraseShapeAt(src, e.beforeShape.kind, e.shapeIdx);
+                saveVectorLayer(e.layerIdx, src);
+                {
+                    std::lock_guard<std::mutex> lock(g_selectionMutex);
+                    if (g_selection.kind == e.beforeShape.kind
+                        && g_selection.layerIdx == e.layerIdx
+                        && g_selection.shapeIdx == e.shapeIdx) {
+                        g_selection = Selection{};
+                    }
+                }
+            }
+            // Restore the post-bake tiles on the target raster layer.
+            if (e.targetLayerIdx < layers().size() && layers()[e.targetLayerIdx]) {
+                for (const auto& s : e.afterTiles) {
+                    applyTileSnap(e.targetLayerIdx, s);
+                }
+            }
+            break;
+        }
+        case UndoOp::RasterizeLayer: {
+            // Re-do the rasterize: drop the shapes, flip type, restore
+            // the post-bake tiles. The shapes.bin file gets removed by
+            // the type flip + saveVectorLayer-skip; clearLayerDirOnDisk
+            // would also drop tile files we're about to recreate, so
+            // we just unlink shapes.bin directly.
+            if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
+            Layer& layer = *layers()[e.layerIdx];
+            layer.lines.clear();
+            layer.rects.clear();
+            layer.ellipses.clear();
+            layer.circles.clear();
+            layer.type = LayerType::Raster;
+            for (const auto& s : e.afterTiles) {
+                applyTileSnap(e.layerIdx, s);
+            }
+            if (!g_docDir.empty()) {
+                std::string p = activeLayerDir(e.layerIdx) + "/shapes.bin";
+                unlink(p.c_str());
+            }
+            // Selection on this layer is gone — clear if it pointed here.
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                if (g_selection.kind != ShapeKind::None
+                    && g_selection.layerIdx == e.layerIdx) {
+                    g_selection = Selection{};
+                }
+            }
+            break;
+        }
+        case UndoOp::MergeLayerDown: {
+            // Re-apply post-merge tiles to the target.
+            if (e.targetLayerIdx < layers().size() && layers()[e.targetLayerIdx]) {
+                for (const auto& s : e.afterTiles) {
+                    applyTileSnap(e.targetLayerIdx, s);
+                }
+            }
+            // Delete the source layer that undo re-inserted. Use
+            // deleteLayerImpl so trailing layers + their dirs renumber
+            // correctly.
+            if (e.layerIdx < layers().size() && layers()[e.layerIdx]) {
+                deleteLayerImpl(e.layerIdx);
+                // deleteLayerImpl already remapped the rest of the
+                // stack; nothing to do here.
             }
             break;
         }
@@ -8047,6 +8688,20 @@ Java_com_bk_drawing_NativeRenderer_rasterizeLayer(JNIEnv*, jobject, jint idx) {
     if (idx < 0) return;
     g_pendingRasterizeLayerIdx.store(idx);
     enqueuePendingAction(kActionRasterizeLayer);
+}
+
+// Merge the raster layer at [idx] down onto the raster layer at [idx-1]
+// using premultiplied "src over dst" so the top layer's pixels stay on
+// top. The source layer is then deleted and trailing layer dirs are
+// renumbered. No-op (logged) when idx == 0 or either layer isn't
+// raster. Queued through the pending-action drain; clears the undo
+// stack since target tile pixels change in a way prior entries can't
+// reverse. Caller should forceRedraw + resync layer state afterward.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_mergeLayerWithBelow(JNIEnv*, jobject, jint idx) {
+    if (idx <= 0) return;
+    g_pendingMergeLayerIdx.store(idx);
+    enqueuePendingAction(kActionMergeLayerDown);
 }
 
 // Rasterize the currently-selected vector shape onto the raster layer

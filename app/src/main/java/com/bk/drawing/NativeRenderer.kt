@@ -120,6 +120,17 @@ object NativeRenderer {
     external fun rasterizeSelectionToLayerBelow()
 
     /**
+     * Merge the raster layer at [idx] down onto the raster layer
+     * directly below it using premultiplied "src over dst" — the top
+     * layer's pixels stay on top. The source layer is then deleted and
+     * trailing layer dirs renumber to fill the gap. No-op when idx==0
+     * (nothing below) or either layer isn't raster. Queued; clears the
+     * undo stack since target tile pixels change in a way prior entries
+     * can't reverse. Caller should forceRedraw + resync layer state.
+     */
+    external fun mergeLayerWithBelow(idx: Int)
+
+    /**
      * Append shapes to the active layer (only effective if the active
      * layer is a vector layer). Color and width follow the current brush
      * color and a fixed line width. Each gesture's (x0, y0, x1, y1)
