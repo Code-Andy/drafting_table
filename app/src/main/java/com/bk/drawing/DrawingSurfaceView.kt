@@ -502,6 +502,27 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  → brush. The pair are the only two raster stroke tools, so this
      *  is the most common in-flow swap. */
     fun toggleTool() {
+        // Repurpose the middle stylus button as the angle-snap toggle
+        // whenever brush/eraser swap doesn't apply: either the active
+        // layer is vector (raster brush/eraser don't paint there
+        // anyway), or the current tool is a shape tool (where the
+        // angle constraint is what the user is most likely after).
+        // Both checks together cover "LINE on a raster layer" — a
+        // valid setup that previously fell through to the brush
+        // swap and got blocked by the mid-stroke guard below.
+        val activeIsVector =
+            NativeRenderer.getLayerType(NativeRenderer.getActiveLayer()) == 1
+        val isShapeTool = currentTool == Tool.LINE
+                       || currentTool == Tool.RECTANGLE
+                       || currentTool == Tool.CIRCLE
+                       || currentTool == Tool.ELLIPSE
+        if (activeIsVector || isShapeTool) {
+            angleSnapEnabled = !angleSnapEnabled
+            Log.i("DrawingApp",
+                  "angle snap -> ${if (angleSnapEnabled) "on" else "off"}")
+            onAngleSnapChanged?.invoke(angleSnapEnabled)
+            return
+        }
         // Auto-commit any floating raster selection before swapping tools
         // so the user doesn't lose their work or end up with a stranded
         // floating overlay belonging to a tool they can no longer interact
@@ -510,11 +531,23 @@ class DrawingSurfaceView @JvmOverloads constructor(
             pendingCommitRasterSel = true
             forceRedraw()
         }
-        currentTool = when (currentTool) {
+        val nextTool = when (currentTool) {
             Tool.BRUSH  -> Tool.ERASER
             Tool.ERASER -> Tool.BRUSH
-            else        -> Tool.BRUSH
+            else        -> {
+                // Cross-family swap (e.g. LINE → BRUSH) mid-stroke is
+                // unsafe — the in-flight StrokeAction batch on the
+                // front-buffered renderer changes type from
+                // ShapePreview to Sample, and the next multi-buffer
+                // commit ends up baking the abandoned remnants into a
+                // black canvas (see logs from Wacom MovinkPad first
+                // press after launch). If the pen is in contact, skip
+                // the swap; the user can lift the pen and try again.
+                if (penInContact) return
+                Tool.BRUSH
+            }
         }
+        currentTool = nextTool
         // Both sides of the toggle are raster stroke tools — push the
         // ID to native so the bake path uses the right blend mode.
         NativeRenderer.setTool(currentTool.nativeId)
@@ -527,6 +560,22 @@ class DrawingSurfaceView @JvmOverloads constructor(
     // Wacom EMR while the pen is hovering — buttonState is reported on
     // hover events too, but the discrete press action isn't always).
     private var prevButtonState = 0
+    // Until we've seen at least one stylus event, prevButtonState is a
+    // synthetic 0; the FIRST event would otherwise look like every set
+    // bit was "newly pressed", which can mis-fire one of the button
+    // handlers (e.g. on launch, the closest-button press registers as
+    // a STYLUS_SECONDARY transition because the OS reports both bits
+    // briefly). Skip the transition logic until we've established a
+    // baseline.
+    private var prevButtonStateSeen = false
+    // True from ACTION_DOWN to ACTION_UP/CANCEL of the pen. Used to
+    // suppress the brush↔eraser tool swap when the user accidentally
+    // hits the middle stylus button mid-stroke from a non-stroke tool
+    // like LINE — that transition switches the StrokeAction type
+    // (ShapePreview → Sample) inside the same multi-buffer batch and
+    // corrupts the next commit. Same-family swaps (BRUSH↔ERASER) stay
+    // safe because they share the Sample StrokeAction.
+    private var penInContact = false
 
     /**
      * Detect stylus side-button presses two ways:
@@ -546,12 +595,36 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  vector action snapped but wanting to finish it free-hand. */
     var onSnapToggleRequested: (() -> Unit)? = null
 
+    /** Constrain a freshly-drawn LINE-tool stroke's angle to a multiple
+     *  of 15°, AND lock rotation/Line-endpoint drags to the same
+     *  step. Off by default. Toggleable from the status bar and from
+     *  the stylus middle button when a vector layer or shape tool is
+     *  active. The setter mirrors the new value into native via
+     *  setAngleSnapEnabled so applyRotateTo / applyScaleTo can read
+     *  it directly on the GL thread. */
+    var angleSnapEnabled: Boolean = false
+        set(value) {
+            field = value
+            NativeRenderer.setAngleSnapEnabled(value)
+        }
+    /** Notified after toggleTool flips angleSnapEnabled, so the UI
+     *  status indicator can re-paint. */
+    var onAngleSnapChanged: ((Boolean) -> Unit)? = null
+
+    /** Fires while a line-tool stroke is in progress AND angle snap
+     *  is on, carrying the line's currently-snapped angle in degrees
+     *  (0°=right, 90°=up, 180°=left, 270°=down). Null on UP/CANCEL or
+     *  whenever angle snap is off. The status bar uses it to show
+     *  e.g. "angle: 45°" so the user knows what they're locking to. */
+    var onLineAngleChanged: ((Float?) -> Unit)? = null
+
     private fun handleStylusButton(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
             val ab = event.actionButton
             if (ab == MotionEvent.BUTTON_STYLUS_SECONDARY) {
                 toggleTool()
                 prevButtonState = event.buttonState
+                prevButtonStateSeen = true
                 return true
             }
             if (ab == MotionEvent.BUTTON_TERTIARY) {
@@ -560,6 +633,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 // the state-transition path below both cover it.
                 onUndoRequested?.invoke()
                 prevButtonState = event.buttonState
+                prevButtonStateSeen = true
                 return true
             }
             // Closest-to-nib button — covered both standard
@@ -569,10 +643,18 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 || ab == MotionEvent.BUTTON_SECONDARY) {
                 onSnapToggleRequested?.invoke()
                 prevButtonState = event.buttonState
+                prevButtonStateSeen = true
                 return true
             }
         }
         val state = event.buttonState
+        if (!prevButtonStateSeen) {
+            // First stylus event — establish a baseline without firing
+            // any handlers. See prevButtonStateSeen's comment above.
+            prevButtonState = state
+            prevButtonStateSeen = true
+            return false
+        }
         val newlyPressed = state and prevButtonState.inv()
         prevButtonState = state
         // Diagnostic: unmapped newly-pressed bits get logged so future
@@ -751,6 +833,17 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
         val r = renderer ?: return super.onTouchEvent(event)
         val action = event.actionMasked
+
+        // Track pen-down state for toggleTool's mid-stroke guard. We
+        // only flip this on stylus events so finger touches don't
+        // confuse the gating.
+        if (event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) {
+            when (action) {
+                MotionEvent.ACTION_DOWN   -> penInContact = true
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> penInContact = false
+            }
+        }
 
         // ACTION_DOWN = transition from 0 → 1 pointers on screen, so no
         // prior gesture state should leak through. Reset defensively in
@@ -1095,7 +1188,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var pendingPasteSel = false
 
     // Drag state for the SELECT tool.
-    private var selectMode = 0          // 0=none, 1=move, 2=scale, 3=rotate
+    //   0=none, 1=move, 2=scale, 3=rotate, 4=marquee multi-select.
+    private var selectMode = 0
     private var selectChanged = false   // true if we should persist on UP
 
     private fun handleSelectEvent(event: MotionEvent): Boolean {
@@ -1119,6 +1213,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         selectChanged = true
                         forceRedraw()
                     }
+                    4 -> { // marquee — drag updates rectangle, no shape change
+                        NativeRenderer.updateInteractionAt(tmpDoc[0], tmpDoc[1])
+                        forceRedraw()
+                    }
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -1126,6 +1224,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 if (selectChanged) {
                     NativeRenderer.persistActiveVectorLayer()
                 }
+                // Marquee finalization needs a redraw to clear the
+                // rect overlay + paint the new selection halos.
+                if (selectMode == 4) forceRedraw()
                 selectMode = 0
                 selectChanged = false
             }
@@ -1182,6 +1283,31 @@ class DrawingSurfaceView @JvmOverloads constructor(
         return if (p1Snapped) Pair(snapOut[0], snapOut[1]) else Pair(x, y)
     }
 
+    /** Snap the LINE-tool endpoint's *direction* from p0 to a multiple
+     *  of 15°, preserving distance from p0. Returns (x, y, stepIdx)
+     *  where stepIdx is the integer multiple of 15° that was selected
+     *  — caller uses it to display the exact snapped angle without
+     *  going through an atan2(cos, sin) round-trip that can shave a
+     *  degree off due to float precision. stepIdx == Int.MIN_VALUE
+     *  means "no snap" (pen too close to p0). */
+    private data class AngleSnapResult(val x: Float, val y: Float, val stepIdx: Int)
+    private fun applyAngleSnap(p0x: Float, p0y: Float,
+                               p1x: Float, p1y: Float): AngleSnapResult {
+        val dx = p1x - p0x
+        val dy = p1y - p0y
+        val dist = kotlin.math.sqrt(dx * dx + dy * dy)
+        if (dist < 1.0f) return AngleSnapResult(p1x, p1y, Int.MIN_VALUE)
+        val step = kotlin.math.PI.toFloat() / 12f          // 15°
+        val ang  = kotlin.math.atan2(dy, dx)
+        val k    = kotlin.math.round(ang / step).toInt()
+        val snappedAng = k * step
+        return AngleSnapResult(
+            p0x + (kotlin.math.cos(snappedAng) * dist).toFloat(),
+            p0y + (kotlin.math.sin(snappedAng) * dist).toFloat(),
+            k,
+        )
+    }
+
     private fun handleShapeEvent(
         r: GLFrontBufferedRenderer<StrokeAction>,
         event: MotionEvent,
@@ -1201,7 +1327,30 @@ class DrawingSurfaceView @JvmOverloads constructor(
             MotionEvent.ACTION_MOVE -> {
                 viewToDoc(event.x, event.y, tmpDoc)
                 val (sx, sy) = snap(tmpDoc[0], tmpDoc[1])
-                shapeP1X = sx; shapeP1Y = sy
+                // Angle snap applies only to the LINE tool, only when
+                // point-snap didn't already lock the endpoint to a
+                // vertex (point snaps win — they're a deliberate hit on
+                // a known target; angle snap is just a direction
+                // constraint).
+                val angleSnapping = (shapeType == 0
+                                     && angleSnapEnabled
+                                     && !p1Snapped)
+                if (angleSnapping) {
+                    val r = applyAngleSnap(shapeP0X, shapeP0Y, sx, sy)
+                    shapeP1X = r.x; shapeP1Y = r.y
+                    if (r.stepIdx != Int.MIN_VALUE) {
+                        // 15° increments. Convert from doc-coord
+                        // convention (y down, so a positive stepIdx
+                        // means clockwise from +x) to display
+                        // convention (90°=up). dispDeg = -k * 15
+                        // wrapped into [0, 360).
+                        var deg = (-r.stepIdx * 15) % 360
+                        if (deg < 0) deg += 360
+                        onLineAngleChanged?.invoke(deg.toFloat())
+                    }
+                } else {
+                    shapeP1X = sx; shapeP1Y = sy
+                }
                 r.renderFrontBufferedLayer(
                     StrokeAction.ShapePreview(shapeType,
                         shapeP0X, shapeP0Y, shapeP1X, shapeP1Y, p1Snapped)
@@ -1219,10 +1368,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 // applies the queued shape and re-renders the document.
                 r.commit()
                 p1Snapped = false
+                onLineAngleChanged?.invoke(null)
             }
             MotionEvent.ACTION_CANCEL -> {
                 r.commit()
                 p1Snapped = false
+                onLineAngleChanged?.invoke(null)
             }
         }
         return true

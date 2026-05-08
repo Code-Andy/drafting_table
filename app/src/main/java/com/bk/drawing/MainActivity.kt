@@ -105,6 +105,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusDocText:   TextView
     private lateinit var statusGridText:  TextView
     private lateinit var statusSnapText:  TextView
+    private lateinit var statusAngleText: TextView
     private lateinit var statusPageText:  TextView
 
     // ---- Page sidebar (restyled to 84dp) -------------------------------
@@ -321,6 +322,8 @@ class MainActivity : AppCompatActivity() {
             v.onSurfaceFirstSize = { w, h -> applyInitialPageBounds(w, h) }
             v.onUndoRequested = { userUndo() }
             v.onSnapToggleRequested = { toggleSnap() }
+            v.onAngleSnapChanged = { refreshAngleSnapStatus() }
+            v.onLineAngleChanged = { deg -> showLineAngle(deg) }
             bodyContainer.addView(
                 v,
                 FrameLayout.LayoutParams(
@@ -2236,12 +2239,25 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (snapEnabled) R.color.hot else R.color.inkSoft))
         }
+        // Angle snap — line tool's endpoint locks to multiples of 15°.
+        // Toggleable here AND from the stylus middle button when a
+        // vector layer is active.
+        val angleOn = drawingView?.angleSnapEnabled == true
+        statusAngleText = makeStatusText(
+            if (angleOn) "angle: on" else "angle: off"
+        ).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { toggleAngleSnap() }
+            setTextColor(getColor(
+                if (angleOn) R.color.hot else R.color.inkSoft))
+        }
         statusPageText = makeStatusText("page —")
 
         bar.addView(statusDocText,  statusItemLp())
         bar.addView(statusToolText, statusItemLp())
         bar.addView(statusGridText, statusItemLp())
         bar.addView(statusSnapText, statusItemLp())
+        bar.addView(statusAngleText, statusItemLp())
         // Spacer pushes pageText to the right edge.
         bar.addView(View(this), LinearLayout.LayoutParams(
             0, 0, 1.0f))
@@ -2656,6 +2672,38 @@ class MainActivity : AppCompatActivity() {
             statusSnapText.setTextColor(getColor(
                 if (snapEnabled) R.color.hot else R.color.inkSoft))
         }
+    }
+
+    /** Flip the line-tool's angle-snap (15° increments). The state
+     *  lives on DrawingSurfaceView since it's read on every shape-tool
+     *  pen sample; we just mirror it into the status bar text. */
+    private fun toggleAngleSnap() {
+        val v = drawingView ?: return
+        v.angleSnapEnabled = !v.angleSnapEnabled
+        refreshAngleSnapStatus()
+    }
+
+    private fun refreshAngleSnapStatus() {
+        if (!::statusAngleText.isInitialized) return
+        val on = drawingView?.angleSnapEnabled == true
+        statusAngleText.text = if (on) "angle: on" else "angle: off"
+        statusAngleText.setTextColor(getColor(
+            if (on) R.color.hot else R.color.inkSoft))
+    }
+
+    /** While the user is drawing a line with angle-snap on, the status
+     *  bar shows the current snap angle (e.g. "angle: 45°") instead of
+     *  the on/off label. Null = drag ended; revert. */
+    private fun showLineAngle(deg: Float?) {
+        if (!::statusAngleText.isInitialized) return
+        if (deg == null) {
+            refreshAngleSnapStatus()
+            return
+        }
+        // Display as integer degrees in [0, 360).
+        val rounded = ((deg.toInt() % 360) + 360) % 360
+        statusAngleText.text = "angle: ${rounded}°"
+        statusAngleText.setTextColor(getColor(R.color.hot))
     }
 
     /** Flip palm-rejection mode. Persisted across launches; the view's

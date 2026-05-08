@@ -710,6 +710,10 @@ std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
 
 // Snapping is on by default. Settable from any thread.
 std::atomic<int> g_snapEnabled{1};
+// Angle-snap (LINE-tool draw + rotate handle), off by default. Mirror
+// of DrawingSurfaceView.angleSnapEnabled. When on, rotations and line
+// draws lock to 15° increments.
+std::atomic<int> g_angleSnapEnabled{0};
 
 // Page bounds in doc-pixels — a fixed rectangle drawn during composite
 // to give the user a visual anchor when zoomed/rotated. Optional;
@@ -1054,6 +1058,18 @@ struct Selection {
 
 std::mutex g_selectionMutex;
 Selection  g_selection;
+// Additional vector shapes selected via marquee. Empty = single-select
+// (only g_selection applies). Non-empty = multi-select (g_selection is
+// the "primary" + these are the rest). Move and delete iterate both;
+// transform handles (scale/rotate) only show when this is empty.
+std::vector<Selection> g_extraSelections;
+
+// Marquee-drag state: while the user drags on empty canvas with the
+// SELECT tool, these track the in-progress rectangle for previewing
+// + final hit-test on release. doc-coords; under g_selectionMutex.
+bool  g_marqueeActive = false;
+float g_marqueeX0 = 0.0f, g_marqueeY0 = 0.0f;
+float g_marqueeX1 = 0.0f, g_marqueeY1 = 0.0f;
 
 // Active drag interaction state (for SELECT-tool gestures). Only valid
 // when g_selection.kind != None and an interaction is in progress.
@@ -1063,6 +1079,7 @@ enum class DragMode : int {
     Move = 1,
     Scale = 2,
     Rotate = 3,
+    Marquee = 4,
 };
 struct DragState {
     DragMode mode = DragMode::None;
@@ -1129,6 +1146,8 @@ enum class UndoOp : int {
     MergeLayerDown,     // a raster layer was composited onto the layer
                         // below ("src over dst") and then deleted; the
                         // deleted layer is captured in srcSnapshot
+    VectorMutateGroup,  // multiple shapes transformed together (multi-
+                        // select Move). One entry, one undo step.
 };
 
 struct TileSnap {
@@ -1208,6 +1227,13 @@ struct UndoEntry {
     // MergeLayerDown: full snapshot of the deleted source layer.
     LayerSnapshot srcSnapshot;
 
+    // VectorMutateGroup: parallel arrays of selection + before/after
+    // shape data for each shape that moved together. One entry covers
+    // the entire multi-select drag so undo restores them all at once.
+    std::vector<Selection> mutateGroupSels;
+    std::vector<ShapeData> mutateGroupBefore;
+    std::vector<ShapeData> mutateGroupAfter;
+
     // MergeLayerDown: undo entries that were pinned to the source
     // layer at merge time (RasterStroke, RasterizeLayer, etc.).
     // Captured before the merge's deleteLayerImpl drops them; re-
@@ -1232,6 +1258,11 @@ size_t                g_redoTotalBytes = 0;
 // guarded by g_selectionMutex.
 Selection g_transformBeforeSel;
 ShapeData g_transformBeforeShape;
+// Pre-transform snapshots for the extras of a multi-select Move drag.
+// Parallel arrays — same length, same order. Captured at begin*; each
+// non-trivial change pushes its own VectorMutate entry at end-time.
+std::vector<Selection> g_transformBeforeExtraSels;
+std::vector<ShapeData> g_transformBeforeExtraShapes;
 
 // Floating raster selection ("marquee"). Lives across the SELECT_RECT
 // gesture: lift → translate (one or more drags) → commit/cancel.
@@ -1285,12 +1316,13 @@ struct RasterClipboard {
 std::mutex       g_rasterClipboardMutex;
 RasterClipboard  g_rasterClipboard;
 
-// Parallel clipboard for vector shapes — copy/cut/paste of a single
-// selected vector shape. Last-write-wins between this and the raster
-// clipboard via g_clipboardKind, so paste knows which one to drop.
+// Parallel clipboard for vector shapes — copy/cut/paste of one or
+// more selected vector shapes. Last-write-wins between this and the
+// raster clipboard via g_clipboardKind, so paste knows which one to
+// drop.
 struct VectorClipboard {
-    bool      present = false;
-    ShapeData shape;
+    bool                   present = false;
+    std::vector<ShapeData> shapes;
 };
 std::mutex      g_vectorClipboardMutex;
 VectorClipboard g_vectorClipboard;
@@ -1318,6 +1350,10 @@ size_t computeEntrySize(const UndoEntry& e) {
     for (const auto& nested : e.srcLayerUndoEntries) {
         s += computeEntrySize(nested);
     }
+    // VectorMutateGroup arrays — small structs, but count them.
+    s += e.mutateGroupSels.size()   * sizeof(Selection);
+    s += e.mutateGroupBefore.size() * sizeof(ShapeData);
+    s += e.mutateGroupAfter.size()  * sizeof(ShapeData);
     return s;
 }
 
@@ -1540,6 +1576,7 @@ void discardRasterSelectionImpl();
 void copyVectorSelectionImpl();
 void cutVectorSelectionImpl();
 bool pasteVectorSelectionImpl();
+void deleteAllSelectionsImpl();
 void copyRasterSelectionImpl();
 bool pasteRasterSelectionImpl();
 void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
@@ -2746,6 +2783,26 @@ bool remapEntryAfterDelete(UndoEntry& e, size_t deletedIdx) {
             }
         }
     }
+    if (e.op == UndoOp::VectorMutateGroup) {
+        // Drop any group members on the deleted layer; shift the rest.
+        size_t w = 0;
+        for (size_t r = 0; r < e.mutateGroupSels.size(); ++r) {
+            size_t mapped = mapLayerIdxAfterDelete(
+                e.mutateGroupSels[r].layerIdx, deletedIdx);
+            if (mapped == kInvalidLayerIdx) continue;
+            e.mutateGroupSels[r].layerIdx = mapped;
+            if (w != r) {
+                e.mutateGroupSels[w]   = std::move(e.mutateGroupSels[r]);
+                e.mutateGroupBefore[w] = std::move(e.mutateGroupBefore[r]);
+                e.mutateGroupAfter[w]  = std::move(e.mutateGroupAfter[r]);
+            }
+            ++w;
+        }
+        e.mutateGroupSels.resize(w);
+        e.mutateGroupBefore.resize(w);
+        e.mutateGroupAfter.resize(w);
+        if (w == 0) return false;   // nothing left to mutate
+    }
     return true;
 }
 
@@ -2765,6 +2822,11 @@ void remapEntryAfterMove(UndoEntry& e, size_t from, size_t to) {
     if (e.op == UndoOp::MergeLayerDown) {
         for (auto& nested : e.srcLayerUndoEntries) {
             remapEntryAfterMove(nested, from, to);
+        }
+    }
+    if (e.op == UndoOp::VectorMutateGroup) {
+        for (auto& s : e.mutateGroupSels) {
+            s.layerIdx = mapLayerIdxAfterMove(s.layerIdx, from, to);
         }
     }
 }
@@ -2821,6 +2883,18 @@ void deleteLayerImpl(size_t idx) {
             size_t newSel = mapLayerIdxAfterDelete(g_selection.layerIdx, idx);
             if (newSel == kInvalidLayerIdx) g_selection = Selection{};
             else                            g_selection.layerIdx = newSel;
+        }
+        // Same remap for multi-select extras: drop those on the
+        // deleted layer; shift the rest down by one.
+        for (auto it = g_extraSelections.begin();
+             it != g_extraSelections.end(); ) {
+            size_t newSel = mapLayerIdxAfterDelete(it->layerIdx, idx);
+            if (newSel == kInvalidLayerIdx) {
+                it = g_extraSelections.erase(it);
+            } else {
+                it->layerIdx = newSel;
+                ++it;
+            }
         }
     }
 
@@ -2891,6 +2965,9 @@ void moveLayerImpl(size_t from, size_t to) {
         if (g_selection.kind != ShapeKind::None) {
             g_selection.layerIdx =
                 mapLayerIdxAfterMove(g_selection.layerIdx, from, to);
+        }
+        for (auto& s : g_extraSelections) {
+            s.layerIdx = mapLayerIdxAfterMove(s.layerIdx, from, to);
         }
     }
 
@@ -5059,6 +5136,9 @@ bool hitTestActiveVectorLayer(float x, float y) {
     }
 
     std::lock_guard<std::mutex> lock(g_selectionMutex);
+    // Single-tap selection always replaces any prior multi-selection;
+    // marquee is the dedicated path for picking up multiple shapes.
+    g_extraSelections.clear();
     if (hitKind == ShapeKind::None) {
         g_selection = Selection{};
         return false;
@@ -5074,12 +5154,23 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     if (layer.lines.empty() && layer.rects.empty()
         && layer.ellipses.empty() && layer.circles.empty()) return;
 
-    // Snapshot selection for this composite pass.
+    // Snapshot selection for this composite pass. Includes both the
+    // primary single-select and any extra (marquee'd) selections so
+    // every selected shape gets a halo.
     Selection sel;
+    std::vector<Selection> extras;
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
-        sel = g_selection;
+        sel    = g_selection;
+        extras = g_extraSelections;
     }
+    auto inAnySel = [&](ShapeKind kind, size_t i) -> bool {
+        if (isShapeSelected(sel, layerIdx, kind, i)) return true;
+        for (const auto& e : extras) {
+            if (isShapeSelected(e, layerIdx, kind, i)) return true;
+        }
+        return false;
+    };
 
     glUseProgram(g_lineProg.program);
     glBindVertexArray(g_quadVao);
@@ -5102,7 +5193,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     // draws come from the same data.
     for (size_t i = 0; i < layer.lines.size(); ++i) {
         const Line l = layer.lines[i];
-        if (isShapeSelected(sel, layerIdx, ShapeKind::Line, i)) {
+        if (inAnySel(ShapeKind::Line, i)) {
             drawLineSegment(l.x0, l.y0, l.x1, l.y1,
                             kSelectionHaloColor, l.width + kSelectionHaloPad * 2.0f,
                             kSelectionHaloAlpha);
@@ -5111,7 +5202,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     }
     for (size_t i = 0; i < layer.rects.size(); ++i) {
         const Rect r = layer.rects[i];
-        if (isShapeSelected(sel, layerIdx, ShapeKind::Rect, i)) {
+        if (inAnySel(ShapeKind::Rect, i)) {
             drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation,
                                  kSelectionHaloColor, r.width + kSelectionHaloPad * 2.0f,
                                  kSelectionHaloAlpha);
@@ -5120,7 +5211,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     }
     for (size_t i = 0; i < layer.ellipses.size(); ++i) {
         const Ellipse e = layer.ellipses[i];
-        if (isShapeSelected(sel, layerIdx, ShapeKind::Ellipse, i)) {
+        if (inAnySel(ShapeKind::Ellipse, i)) {
             drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation,
                                kSelectionHaloColor, e.width + kSelectionHaloPad * 2.0f,
                                kSelectionHaloAlpha);
@@ -5129,7 +5220,7 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
     }
     for (size_t i = 0; i < layer.circles.size(); ++i) {
         const Circle c = layer.circles[i];
-        if (isShapeSelected(sel, layerIdx, ShapeKind::Circle, i)) {
+        if (inAnySel(ShapeKind::Circle, i)) {
             drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f,
                                kSelectionHaloColor, c.width + kSelectionHaloPad * 2.0f,
                                kSelectionHaloAlpha);
@@ -5296,14 +5387,21 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
     // Selection overlay (OBB + handles) — drawn on top of everything so
     // it's visible regardless of which layer the selected shape lives on.
     Selection sel;
+    bool  hasExtras  = false;
     bool  snapActive = false;
+    bool  marqueeActive = false;
     float snapMx = 0.0f, snapMy = 0.0f;
+    float mqx0 = 0, mqy0 = 0, mqx1 = 0, mqy1 = 0;
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         sel = g_selection;
+        hasExtras = !g_extraSelections.empty();
         snapActive = g_drag.snapActive;
         snapMx = g_drag.snapX;
         snapMy = g_drag.snapY;
+        marqueeActive = g_marqueeActive;
+        mqx0 = g_marqueeX0; mqy0 = g_marqueeY0;
+        mqx1 = g_marqueeX1; mqy1 = g_marqueeY1;
     }
     bool rasterSelActive = false;
     Obb  rasterSelObb{};
@@ -5314,7 +5412,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
             rasterSelObb = obbForRasterSelection(g_rasterSel);
         }
     }
-    if (sel.kind != ShapeKind::None || rasterSelActive) {
+    if (sel.kind != ShapeKind::None || rasterSelActive || marqueeActive) {
         glUseProgram(g_lineProg.program);
         glBindVertexArray(g_quadVao);
         uploadMat4(env, g_lineProg.uTransform, transform);
@@ -5324,7 +5422,10 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
                        g_lineProg.uPageActive,
                        PageClip{false, 0, 0, 0, 0});
-        if (sel.kind != ShapeKind::None) {
+        // Show transform handles only when a SINGLE shape is selected;
+        // multi-select v1 supports move + delete only, so per-shape
+        // OBB handles wouldn't make sense for the group.
+        if (sel.kind != ShapeKind::None && !hasExtras) {
             renderSelectionOverlay(sel);
         }
         if (rasterSelActive) {
@@ -5332,6 +5433,17 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         }
         if (snapActive) {
             drawSnapMarker(snapMx, snapMy);
+        }
+        if (marqueeActive) {
+            // Marquee rect — orange dashed-ish outline. Use the
+            // selection-handle color so it reads as a UI affordance.
+            float w = vpxToDoc(kSelectionOutlineWidthViewPx);
+            float lx = std::min(mqx0, mqx1), rx = std::max(mqx0, mqx1);
+            float ty = std::min(mqy0, mqy1), by = std::max(mqy0, mqy1);
+            drawLineSegment(lx, ty, rx, ty, kHandleColor, w, 1.0f);
+            drawLineSegment(rx, ty, rx, by, kHandleColor, w, 1.0f);
+            drawLineSegment(rx, by, lx, by, kHandleColor, w, 1.0f);
+            drawLineSegment(lx, by, lx, ty, kHandleColor, w, 1.0f);
         }
     }
 
@@ -5664,6 +5776,30 @@ void applyEntryReverse(UndoEntry& e) {
             saveVectorLayer(e.layerIdx, layer);
             break;
         }
+        case UndoOp::VectorMutateGroup: {
+            // Restore each shape's pre-drag state. Save once per
+            // affected layer at the end.
+            std::vector<size_t> affected;
+            for (size_t i = 0; i < e.mutateGroupSels.size()
+                            && i < e.mutateGroupBefore.size(); ++i) {
+                const Selection& s = e.mutateGroupSels[i];
+                if (s.layerIdx >= layers().size() || !layers()[s.layerIdx])
+                    continue;
+                Layer& layer = *layers()[s.layerIdx];
+                assignShapeAt(layer, e.mutateGroupBefore[i].kind,
+                              s.shapeIdx, e.mutateGroupBefore[i]);
+                if (std::find(affected.begin(), affected.end(),
+                              s.layerIdx) == affected.end()) {
+                    affected.push_back(s.layerIdx);
+                }
+            }
+            for (size_t idx : affected) {
+                if (idx < layers().size() && layers()[idx]) {
+                    saveVectorLayer(idx, *layers()[idx]);
+                }
+            }
+            break;
+        }
         case UndoOp::LayerClear: {
             if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) break;
             Layer& layer = *layers()[e.layerIdx];
@@ -5847,6 +5983,28 @@ void applyEntryForward(UndoEntry& e) {
             Layer& layer = *layers()[e.layerIdx];
             assignShapeAt(layer, e.afterShape.kind, e.shapeIdx, e.afterShape);
             saveVectorLayer(e.layerIdx, layer);
+            break;
+        }
+        case UndoOp::VectorMutateGroup: {
+            std::vector<size_t> affected;
+            for (size_t i = 0; i < e.mutateGroupSels.size()
+                            && i < e.mutateGroupAfter.size(); ++i) {
+                const Selection& s = e.mutateGroupSels[i];
+                if (s.layerIdx >= layers().size() || !layers()[s.layerIdx])
+                    continue;
+                Layer& layer = *layers()[s.layerIdx];
+                assignShapeAt(layer, e.mutateGroupAfter[i].kind,
+                              s.shapeIdx, e.mutateGroupAfter[i]);
+                if (std::find(affected.begin(), affected.end(),
+                              s.layerIdx) == affected.end()) {
+                    affected.push_back(s.layerIdx);
+                }
+            }
+            for (size_t idx : affected) {
+                if (idx < layers().size() && layers()[idx]) {
+                    saveVectorLayer(idx, *layers()[idx]);
+                }
+            }
             break;
         }
         case UndoOp::LayerClear: {
@@ -7238,151 +7396,207 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
 // anonymous namespace; defined here so they sit alongside the
 // matching JNI dispatchers below.
 
-// Snapshot the currently-selected vector shape into the vector
-// clipboard. No-op if there's no vector selection or the layer/shape
-// it points at is gone. Selection state is left unchanged. Sets
-// g_clipboardKind so a subsequent paste knows to drop a vector shape.
+// Snapshot every selected vector shape (primary + extras) into the
+// vector clipboard. No-op if nothing is selected or the layer/shape
+// pointers are stale. Selection state is left unchanged. Sets
+// g_clipboardKind so a subsequent paste knows to drop vector shapes.
 void copyVectorSelectionImpl() {
-    Selection sel;
+    Selection primary;
+    std::vector<Selection> extras;
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
-        sel = g_selection;
+        primary = g_selection;
+        extras  = g_extraSelections;
     }
-    if (sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
-    Layer& layer = *layers()[sel.layerIdx];
-    if (layer.type != LayerType::Vector) return;
+    if (primary.kind == ShapeKind::None) return;
 
-    ShapeData sd;
-    sd.kind = sel.kind;
-    switch (sel.kind) {
-        case ShapeKind::Line:
-            if (sel.shapeIdx >= layer.lines.size())    return;
-            sd.line    = layer.lines[sel.shapeIdx];
-            break;
-        case ShapeKind::Rect:
-            if (sel.shapeIdx >= layer.rects.size())    return;
-            sd.rect    = layer.rects[sel.shapeIdx];
-            break;
-        case ShapeKind::Ellipse:
-            if (sel.shapeIdx >= layer.ellipses.size()) return;
-            sd.ellipse = layer.ellipses[sel.shapeIdx];
-            break;
-        case ShapeKind::Circle:
-            if (sel.shapeIdx >= layer.circles.size())  return;
-            sd.circle  = layer.circles[sel.shapeIdx];
-            break;
-        default: return;
+    auto snapshot = [&](const Selection& s, ShapeData& out) -> bool {
+        if (s.layerIdx >= layers().size() || !layers()[s.layerIdx]) return false;
+        Layer& layer = *layers()[s.layerIdx];
+        if (layer.type != LayerType::Vector) return false;
+        out.kind = s.kind;
+        switch (s.kind) {
+            case ShapeKind::Line:
+                if (s.shapeIdx >= layer.lines.size())    return false;
+                out.line    = layer.lines[s.shapeIdx];    return true;
+            case ShapeKind::Rect:
+                if (s.shapeIdx >= layer.rects.size())    return false;
+                out.rect    = layer.rects[s.shapeIdx];    return true;
+            case ShapeKind::Ellipse:
+                if (s.shapeIdx >= layer.ellipses.size()) return false;
+                out.ellipse = layer.ellipses[s.shapeIdx]; return true;
+            case ShapeKind::Circle:
+                if (s.shapeIdx >= layer.circles.size())  return false;
+                out.circle  = layer.circles[s.shapeIdx];  return true;
+            default: return false;
+        }
+    };
+
+    std::vector<ShapeData> shapes;
+    ShapeData primarySD;
+    if (!snapshot(primary, primarySD)) return;
+    shapes.push_back(primarySD);
+    for (const auto& e : extras) {
+        ShapeData sd;
+        if (snapshot(e, sd)) shapes.push_back(sd);
     }
 
     {
         std::lock_guard<std::mutex> lock(g_vectorClipboardMutex);
         g_vectorClipboard.present = true;
-        g_vectorClipboard.shape   = sd;
+        g_vectorClipboard.shapes  = std::move(shapes);
     }
     g_clipboardKind.store(2, std::memory_order_release);   // 2 = Vector
 }
 
-// Cut for vectors: copy then erase the shape from its layer. Pushes a
-// VectorDelete undo entry so the cut is reversible (mirrors the
-// existing deleteSelection JNI's bookkeeping).
+// Forward decl to share delete logic with deleteSelection JNI.
+void deleteAllSelectionsImpl();
+
+// Cut for vectors: copy every selected shape then erase them all,
+// pushing a VectorDelete undo entry per shape (descending index order
+// per layer/kind so erases don't invalidate later targets).
 void cutVectorSelectionImpl() {
     copyVectorSelectionImpl();
     if (g_clipboardKind.load() != 2) return;   // copy didn't take
-
-    Selection sel;
-    {
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        sel = g_selection;
-        g_selection = Selection{};
-    }
-    if (sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
-    Layer& layer = *layers()[sel.layerIdx];
-    if (layer.type != LayerType::Vector) return;
-
-    UndoEntry entry;
-    entry.op       = UndoOp::VectorDelete;
-    entry.layerIdx = sel.layerIdx;
-    entry.shapeIdx = sel.shapeIdx;
-    entry.beforeShape.kind = sel.kind;
-    bool captured = false;
-    switch (sel.kind) {
-        case ShapeKind::Line:
-            if (sel.shapeIdx < layer.lines.size()) {
-                entry.beforeShape.line = layer.lines[sel.shapeIdx];
-                layer.lines.erase(layer.lines.begin() + sel.shapeIdx);
-                captured = true;
-            }
-            break;
-        case ShapeKind::Rect:
-            if (sel.shapeIdx < layer.rects.size()) {
-                entry.beforeShape.rect = layer.rects[sel.shapeIdx];
-                layer.rects.erase(layer.rects.begin() + sel.shapeIdx);
-                captured = true;
-            }
-            break;
-        case ShapeKind::Ellipse:
-            if (sel.shapeIdx < layer.ellipses.size()) {
-                entry.beforeShape.ellipse = layer.ellipses[sel.shapeIdx];
-                layer.ellipses.erase(layer.ellipses.begin() + sel.shapeIdx);
-                captured = true;
-            }
-            break;
-        case ShapeKind::Circle:
-            if (sel.shapeIdx < layer.circles.size()) {
-                entry.beforeShape.circle = layer.circles[sel.shapeIdx];
-                layer.circles.erase(layer.circles.begin() + sel.shapeIdx);
-                captured = true;
-            }
-            break;
-        case ShapeKind::None: break;
-    }
-    saveVectorLayer(sel.layerIdx, layer);
-    if (captured) pushUndoEntry(std::move(entry));
+    deleteAllSelectionsImpl();
 }
 
-// Paste from the vector clipboard: append the shape to the active
-// layer (which must be vector). Returns false if the clipboard is
-// empty or the active layer isn't vector. Pushes a VectorAdd entry.
+// Erase every currently-selected vector shape (primary + extras) and
+// push one VectorDelete entry per shape. Shared between the
+// deleteSelection JNI and cutVectorSelectionImpl.
+void deleteAllSelectionsImpl() {
+    std::vector<Selection> all;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        if (g_selection.kind != ShapeKind::None) all.push_back(g_selection);
+        for (const auto& e : g_extraSelections) all.push_back(e);
+        g_selection = Selection{};
+        g_extraSelections.clear();
+    }
+    if (all.empty()) return;
+
+    std::sort(all.begin(), all.end(),
+              [](const Selection& a, const Selection& b) {
+                  if (a.layerIdx != b.layerIdx) return a.layerIdx > b.layerIdx;
+                  if (a.kind != b.kind)
+                      return static_cast<int>(a.kind) > static_cast<int>(b.kind);
+                  return a.shapeIdx > b.shapeIdx;
+              });
+
+    std::vector<size_t> affectedLayers;
+    for (const auto& s : all) {
+        if (s.layerIdx >= layers().size() || !layers()[s.layerIdx]) continue;
+        Layer& layer = *layers()[s.layerIdx];
+        if (layer.type != LayerType::Vector) continue;
+
+        UndoEntry entry;
+        entry.op       = UndoOp::VectorDelete;
+        entry.layerIdx = s.layerIdx;
+        entry.shapeIdx = s.shapeIdx;
+        entry.beforeShape.kind = s.kind;
+        bool captured = false;
+        switch (s.kind) {
+            case ShapeKind::Line:
+                if (s.shapeIdx < layer.lines.size()) {
+                    entry.beforeShape.line = layer.lines[s.shapeIdx];
+                    layer.lines.erase(layer.lines.begin() + s.shapeIdx);
+                    captured = true;
+                }
+                break;
+            case ShapeKind::Rect:
+                if (s.shapeIdx < layer.rects.size()) {
+                    entry.beforeShape.rect = layer.rects[s.shapeIdx];
+                    layer.rects.erase(layer.rects.begin() + s.shapeIdx);
+                    captured = true;
+                }
+                break;
+            case ShapeKind::Ellipse:
+                if (s.shapeIdx < layer.ellipses.size()) {
+                    entry.beforeShape.ellipse = layer.ellipses[s.shapeIdx];
+                    layer.ellipses.erase(layer.ellipses.begin() + s.shapeIdx);
+                    captured = true;
+                }
+                break;
+            case ShapeKind::Circle:
+                if (s.shapeIdx < layer.circles.size()) {
+                    entry.beforeShape.circle = layer.circles[s.shapeIdx];
+                    layer.circles.erase(layer.circles.begin() + s.shapeIdx);
+                    captured = true;
+                }
+                break;
+            case ShapeKind::None: break;
+        }
+        if (captured) {
+            pushUndoEntry(std::move(entry));
+            if (std::find(affectedLayers.begin(), affectedLayers.end(),
+                          s.layerIdx) == affectedLayers.end()) {
+                affectedLayers.push_back(s.layerIdx);
+            }
+        }
+    }
+    for (size_t idx : affectedLayers) {
+        if (idx < layers().size() && layers()[idx]) {
+            saveVectorLayer(idx, *layers()[idx]);
+        }
+    }
+}
+
+// Paste from the vector clipboard: append every clipboard shape to
+// the active layer (which must be vector). Returns false if the
+// clipboard is empty or the active layer isn't vector. Pushes one
+// VectorAdd entry per shape. Sets the selection to the pasted shapes
+// (primary = first, extras = rest) so the user can immediately drag
+// the whole group.
 bool pasteVectorSelectionImpl() {
-    ShapeData sd;
+    std::vector<ShapeData> shapes;
     {
         std::lock_guard<std::mutex> lock(g_vectorClipboardMutex);
         if (!g_vectorClipboard.present) return false;
-        sd = g_vectorClipboard.shape;
+        shapes = g_vectorClipboard.shapes;
     }
+    if (shapes.empty()) return false;
     if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return false;
     Layer& layer = *layers()[activeLayer()];
     if (layer.type != LayerType::Vector) return false;
 
-    size_t idx = 0;
-    switch (sd.kind) {
-        case ShapeKind::Line:
-            idx = layer.lines.size();    layer.lines.push_back(sd.line);       break;
-        case ShapeKind::Rect:
-            idx = layer.rects.size();    layer.rects.push_back(sd.rect);       break;
-        case ShapeKind::Ellipse:
-            idx = layer.ellipses.size(); layer.ellipses.push_back(sd.ellipse); break;
-        case ShapeKind::Circle:
-            idx = layer.circles.size();  layer.circles.push_back(sd.circle);   break;
-        default: return false;
+    std::vector<Selection> pasted;
+    pasted.reserve(shapes.size());
+    for (const auto& sd : shapes) {
+        size_t idx = 0;
+        bool ok = true;
+        switch (sd.kind) {
+            case ShapeKind::Line:
+                idx = layer.lines.size();    layer.lines.push_back(sd.line);       break;
+            case ShapeKind::Rect:
+                idx = layer.rects.size();    layer.rects.push_back(sd.rect);       break;
+            case ShapeKind::Ellipse:
+                idx = layer.ellipses.size(); layer.ellipses.push_back(sd.ellipse); break;
+            case ShapeKind::Circle:
+                idx = layer.circles.size();  layer.circles.push_back(sd.circle);   break;
+            default: ok = false; break;
+        }
+        if (!ok) continue;
+
+        UndoEntry entry;
+        entry.op          = UndoOp::VectorAdd;
+        entry.layerIdx    = activeLayer();
+        entry.shapeIdx    = idx;
+        entry.afterShape  = sd;
+        pushUndoEntry(std::move(entry));
+
+        Selection s;
+        s.kind     = sd.kind;
+        s.layerIdx = activeLayer();
+        s.shapeIdx = idx;
+        pasted.push_back(s);
     }
+    if (pasted.empty()) return false;
     saveVectorLayer(activeLayer(), layer);
 
-    UndoEntry entry;
-    entry.op          = UndoOp::VectorAdd;
-    entry.layerIdx    = activeLayer();
-    entry.shapeIdx    = idx;
-    entry.afterShape  = sd;
-    pushUndoEntry(std::move(entry));
-
-    // Select the pasted shape so the user can immediately drag it.
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
-        g_selection.kind     = sd.kind;
-        g_selection.layerIdx = activeLayer();
-        g_selection.shapeIdx = idx;
+        g_selection = pasted.front();
+        g_extraSelections.assign(pasted.begin() + 1, pasted.end());
     }
     return true;
 }
@@ -8139,51 +8353,77 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
     }
 
     // No handle hit. Decide between "move existing selection if tap is
-    // inside its OBB" vs "re-hit-test for a new shape selection".
+    // inside ANY selected shape's OBB" vs "re-hit-test for a new shape
+    // selection". For multi-select, tapping any selected shape grabs
+    // the whole group; the move uses the primary's center as the
+    // offset reference (extras follow by the same delta).
     {
         Selection sel;
-        Obb obb;
+        std::vector<Selection> extras;
         {
             std::lock_guard<std::mutex> lock(g_selectionMutex);
-            sel = g_selection;
+            sel    = g_selection;
+            extras = g_extraSelections;
         }
-        if (sel.kind != ShapeKind::None
-            && obbForSelection(sel, obb)
-            && isPointInsideObb(obb, x, y)) {
+        Obb primaryObb;
+        bool tapInsidePrimary = (sel.kind != ShapeKind::None)
+            && obbForSelection(sel, primaryObb)
+            && isPointInsideObb(primaryObb, x, y);
+        bool tapInsideAnyExtra = false;
+        if (!tapInsidePrimary) {
+            for (const auto& e : extras) {
+                Obb eobb;
+                if (obbForSelection(e, eobb) && isPointInsideObb(eobb, x, y)) {
+                    tapInsideAnyExtra = true;
+                    break;
+                }
+            }
+        }
+        if (tapInsidePrimary || tapInsideAnyExtra) {
+            // Capture the primary's pre-move state for VectorMutate
+            // undo, plus each extra's so a multi-select drag is fully
+            // reversible.
+            std::vector<ShapeData> extraBefore;
+            extraBefore.reserve(extras.size());
+            for (const auto& e : extras) {
+                ShapeData sd;
+                snapshotSelectionShape(e, sd);
+                extraBefore.push_back(sd);
+            }
             std::lock_guard<std::mutex> lock(g_selectionMutex);
             g_drag.mode = DragMode::Move;
-            g_drag.moveOffsetX = x - obb.cx;
-            g_drag.moveOffsetY = y - obb.cy;
+            g_drag.moveOffsetX = x - primaryObb.cx;
+            g_drag.moveOffsetY = y - primaryObb.cy;
             g_transformBeforeSel = sel;
             snapshotSelectionShape(sel, g_transformBeforeShape);
+            g_transformBeforeExtraSels   = extras;
+            g_transformBeforeExtraShapes = std::move(extraBefore);
             return 1;
         }
     }
     if (hitTestActiveVectorLayer(x, y)) {
-        // Recover the new selection's center to capture the move offset.
-        Selection sel;
-        Obb obb;
-        {
-            std::lock_guard<std::mutex> lock(g_selectionMutex);
-            sel = g_selection;
-        }
+        // First tap on a not-yet-selected shape: select it but DON'T
+        // start a move drag. The user has to tap-and-drag inside the
+        // (now selected) OBB on a second gesture to translate. This
+        // prevents accidental nudges from a stylus that slides
+        // slightly during the initial selection tap. The earlier
+        // "tap inside existing selection's OBB" path above handles
+        // the move on the second gesture.
         std::lock_guard<std::mutex> lock(g_selectionMutex);
-        g_drag.mode = DragMode::Move;
-        if (obbForSelection(sel, obb)) {
-            g_drag.moveOffsetX = x - obb.cx;
-            g_drag.moveOffsetY = y - obb.cy;
-        } else {
-            g_drag.moveOffsetX = 0.0f;
-            g_drag.moveOffsetY = 0.0f;
-        }
-        g_transformBeforeSel = sel;
-        snapshotSelectionShape(sel, g_transformBeforeShape);
-        return 1;
+        g_drag.mode = DragMode::None;
+        return 0;
     }
-    // Empty tap — selection cleared by hitTestActiveVectorLayer.
+    // Empty tap on the canvas. hitTestActiveVectorLayer already cleared
+    // the prior selection; start a marquee at this point so a
+    // subsequent drag picks up multiple shapes. End-up on the same
+    // point (no drag) just lands as "deselect" — endInteraction sees
+    // the marquee rect with zero area and produces no selection.
     std::lock_guard<std::mutex> lock(g_selectionMutex);
-    g_drag.mode = DragMode::None;
-    return 0;
+    g_drag.mode = DragMode::Marquee;
+    g_marqueeActive = true;
+    g_marqueeX0 = x; g_marqueeY0 = y;
+    g_marqueeX1 = x; g_marqueeY1 = y;
+    return 4;
 }
 
 // Translate the given selection's shape by (dx, dy). Caller must hold
@@ -8274,6 +8514,18 @@ void applyMoveTo(float x, float y) {
     float dy = targetCy - obb.cy;
     translateShape(layer, sel, dx, dy);
 
+    // Multi-select: every other selected shape moves by the same
+    // delta. Snapshot extras under the lock.
+    std::vector<Selection> extras;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        extras = g_extraSelections;
+    }
+    for (const auto& e : extras) {
+        if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) continue;
+        translateShape(*layers()[e.layerIdx], e, dx, dy);
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         g_drag.snapActive = snap.found;
@@ -8320,6 +8572,26 @@ void applyScaleTo(float x, float y) {
     if (snap.found) {
         x = snap.x;
         y = snap.y;
+    }
+    // Line endpoint drag + angle snap → constrain the dragged endpoint
+    // to lie on a 15° ray from the anchor (other endpoint), preserving
+    // the cursor distance. Only applies when point-snap didn't already
+    // lock the endpoint (a vertex is a deliberate target). Other shape
+    // kinds use rotation-snap via applyRotateTo for orientation
+    // constraints; their scale stays free.
+    if (sel.kind == ShapeKind::Line
+        && g_angleSnapEnabled.load() != 0
+        && !snap.found) {
+        float dx = x - d.anchorX;
+        float dy = y - d.anchorY;
+        float dist = std::sqrt(dx * dx + dy * dy);
+        if (dist >= 1.0f) {
+            constexpr float kStep = 3.14159265358979323846f / 12.0f; // 15°
+            float ang        = std::atan2(dy, dx);
+            float snappedAng = std::round(ang / kStep) * kStep;
+            x = d.anchorX + std::cos(snappedAng) * dist;
+            y = d.anchorY + std::sin(snappedAng) * dist;
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
@@ -8408,18 +8680,21 @@ void applyRotateTo(float x, float y) {
     float delta = curAngle - d.initialPenAngle;
     float newRotation = d.initialRotation + delta;
 
-    // Snap to multiples of 15 deg within a 5 deg window when snap is on.
-    if (g_snapEnabled.load() != 0) {
-        constexpr float kStep = 3.14159265358979323846f / 12.0f;  // 15 deg
-        constexpr float kTol  = 5.0f * 3.14159265358979323846f / 180.0f;
+    // Angle-snap: when on, force rotation to the nearest 15° step.
+    // This is the same lock used by the LINE tool's drawing path, so
+    // toggling angle snap globally constrains both new lines and any
+    // rotation drag of an existing shape. Geometry snap (g_snapEnabled,
+    // a separate toggle) used to also fire a soft 5° tolerance snap
+    // here; angle snap subsumes that — the user can flip it on for the
+    // duration of the drag.
+    if (g_angleSnapEnabled.load() != 0) {
+        constexpr float kStep = 3.14159265358979323846f / 12.0f;  // 15°
         float k = std::round(newRotation / kStep);
         float snapped = k * kStep;
-        if (std::fabs(newRotation - snapped) <= kTol) {
-            // Re-derive delta so Line endpoints (which compute from
-            // initialLine + delta) match the snapped rotation exactly.
-            delta = snapped - d.initialRotation;
-            newRotation = snapped;
-        }
+        // Re-derive delta so Line endpoints (which compute from
+        // initialLine + delta) match the snapped rotation exactly.
+        delta = snapped - d.initialRotation;
+        newRotation = snapped;
     }
     // Rotate has no on-canvas marker target, so no snapActive flag here.
     {
@@ -8474,6 +8749,10 @@ Java_com_bk_drawing_NativeRenderer_updateInteractionAt(
         applyRotateTo(x, y);
     } else if (mode == DragMode::Move) {
         applyMoveTo(x, y);
+    } else if (mode == DragMode::Marquee) {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_marqueeX1 = x;
+        g_marqueeY1 = y;
     }
 }
 
@@ -8482,30 +8761,120 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
     DragMode  wasMode;
     Selection beforeSel;
     ShapeData beforeShape;
+    std::vector<Selection> beforeExtraSels;
+    std::vector<ShapeData> beforeExtraShapes;
+    float mx0 = 0, my0 = 0, mx1 = 0, my1 = 0;
     {
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         wasMode     = g_drag.mode;
         beforeSel   = g_transformBeforeSel;
         beforeShape = g_transformBeforeShape;
+        beforeExtraSels   = std::move(g_transformBeforeExtraSels);
+        beforeExtraShapes = std::move(g_transformBeforeExtraShapes);
+        mx0 = std::min(g_marqueeX0, g_marqueeX1);
+        my0 = std::min(g_marqueeY0, g_marqueeY1);
+        mx1 = std::max(g_marqueeX0, g_marqueeX1);
+        my1 = std::max(g_marqueeY0, g_marqueeY1);
         g_drag.mode = DragMode::None;
         g_drag.snapActive = false;
+        g_marqueeActive = false;
         g_transformBeforeSel   = Selection{};
         g_transformBeforeShape = ShapeData{};
+        g_transformBeforeExtraSels.clear();
+        g_transformBeforeExtraShapes.clear();
+    }
+    if (wasMode == DragMode::Marquee) {
+        // Finalize marquee selection: every shape on the active vector
+        // layer whose AABB intersects the rectangle joins the
+        // selection. Tap-with-no-drag (zero-area rect) leaves the
+        // selection empty — hitTestActiveVectorLayer in the begin
+        // path already cleared the prior selection.
+        if (mx1 - mx0 < 1.0f && my1 - my0 < 1.0f) return;
+        if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return;
+        Layer& layer = *layers()[activeLayer()];
+        if (layer.type != LayerType::Vector) return;
+
+        auto intersects = [&](const DocBbox& bb) {
+            return bb.maxX >= mx0 && bb.minX <= mx1
+                && bb.maxY >= my0 && bb.minY <= my1;
+        };
+        std::vector<Selection> hits;
+        auto add = [&](ShapeKind kind, size_t idx) {
+            Selection s;
+            s.kind     = kind;
+            s.layerIdx = activeLayer();
+            s.shapeIdx = idx;
+            hits.push_back(s);
+        };
+        for (size_t i = 0; i < layer.lines.size(); ++i) {
+            ShapeData sd; sd.kind = ShapeKind::Line; sd.line = layer.lines[i];
+            if (intersects(shapeAabb(sd))) add(ShapeKind::Line, i);
+        }
+        for (size_t i = 0; i < layer.rects.size(); ++i) {
+            ShapeData sd; sd.kind = ShapeKind::Rect; sd.rect = layer.rects[i];
+            if (intersects(shapeAabb(sd))) add(ShapeKind::Rect, i);
+        }
+        for (size_t i = 0; i < layer.ellipses.size(); ++i) {
+            ShapeData sd; sd.kind = ShapeKind::Ellipse; sd.ellipse = layer.ellipses[i];
+            if (intersects(shapeAabb(sd))) add(ShapeKind::Ellipse, i);
+        }
+        for (size_t i = 0; i < layer.circles.size(); ++i) {
+            ShapeData sd; sd.kind = ShapeKind::Circle; sd.circle = layer.circles[i];
+            if (intersects(shapeAabb(sd))) add(ShapeKind::Circle, i);
+        }
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        if (hits.empty()) {
+            g_selection = Selection{};
+            g_extraSelections.clear();
+        } else {
+            g_selection = hits.front();
+            g_extraSelections.assign(hits.begin() + 1, hits.end());
+        }
+        return;
     }
     if (wasMode == DragMode::None || beforeSel.kind == ShapeKind::None) return;
     if (beforeShape.kind == ShapeKind::None) return;
 
-    ShapeData afterShape;
-    if (!snapshotSelectionShape(beforeSel, afterShape)) return;
-    if (shapeDataEqual(beforeShape, afterShape)) return;
+    // Single-shape drag (no extras captured) → VectorMutate, same as
+    // before. Multi-shape drag → bundle every changed shape into a
+    // single VectorMutateGroup so one undo step reverses the whole
+    // group transform.
+    if (beforeExtraSels.empty()) {
+        ShapeData afterShape;
+        if (snapshotSelectionShape(beforeSel, afterShape)
+            && !shapeDataEqual(beforeShape, afterShape)) {
+            UndoEntry entry;
+            entry.op          = UndoOp::VectorMutate;
+            entry.layerIdx    = beforeSel.layerIdx;
+            entry.shapeIdx    = beforeSel.shapeIdx;
+            entry.beforeShape = beforeShape;
+            entry.afterShape  = afterShape;
+            pushUndoEntry(std::move(entry));
+        }
+        return;
+    }
 
     UndoEntry entry;
-    entry.op          = UndoOp::VectorMutate;
-    entry.layerIdx    = beforeSel.layerIdx;
-    entry.shapeIdx    = beforeSel.shapeIdx;
-    entry.beforeShape = beforeShape;
-    entry.afterShape  = afterShape;
-    pushUndoEntry(std::move(entry));
+    entry.op       = UndoOp::VectorMutateGroup;
+    entry.layerIdx = beforeSel.layerIdx;   // representative; not load-bearing
+
+    auto addToGroup = [&](const Selection& s, const ShapeData& before) {
+        if (s.kind == ShapeKind::None) return;
+        ShapeData after;
+        if (!snapshotSelectionShape(s, after)) return;
+        if (shapeDataEqual(before, after)) return;
+        entry.mutateGroupSels.push_back(s);
+        entry.mutateGroupBefore.push_back(before);
+        entry.mutateGroupAfter.push_back(after);
+    };
+    addToGroup(beforeSel, beforeShape);
+    for (size_t i = 0; i < beforeExtraSels.size()
+                    && i < beforeExtraShapes.size(); ++i) {
+        addToGroup(beforeExtraSels[i], beforeExtraShapes[i]);
+    }
+    if (!entry.mutateGroupSels.empty()) {
+        pushUndoEntry(std::move(entry));
+    }
 }
 
 // Raster floating selection: handle hit-test → mode dispatch. Returns:
@@ -8598,6 +8967,7 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_clearSelection(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(g_selectionMutex);
     g_selection = Selection{};
+    g_extraSelections.clear();
 }
 
 JNIEXPORT jboolean JNICALL
@@ -8636,62 +9006,7 @@ Java_com_bk_drawing_NativeRenderer_moveSelectionTo(
 // Remove the currently selected shape from its layer. Clears selection.
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
-    Selection sel;
-    {
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        sel = g_selection;
-        g_selection = Selection{};
-    }
-    if (sel.kind == ShapeKind::None) return;
-    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
-    Layer& layer = *layers()[sel.layerIdx];
-    if (layer.type != LayerType::Vector) return;
-
-    // Snapshot the shape before erase, for undo.
-    UndoEntry entry;
-    entry.op = UndoOp::VectorDelete;
-    entry.layerIdx = sel.layerIdx;
-    entry.shapeIdx = sel.shapeIdx;
-    bool captured = false;
-
-    switch (sel.kind) {
-        case ShapeKind::Line:
-            if (sel.shapeIdx < layer.lines.size()) {
-                entry.beforeShape.kind = ShapeKind::Line;
-                entry.beforeShape.line = layer.lines[sel.shapeIdx];
-                captured = true;
-                layer.lines.erase(layer.lines.begin() + sel.shapeIdx);
-            }
-            break;
-        case ShapeKind::Rect:
-            if (sel.shapeIdx < layer.rects.size()) {
-                entry.beforeShape.kind = ShapeKind::Rect;
-                entry.beforeShape.rect = layer.rects[sel.shapeIdx];
-                captured = true;
-                layer.rects.erase(layer.rects.begin() + sel.shapeIdx);
-            }
-            break;
-        case ShapeKind::Ellipse:
-            if (sel.shapeIdx < layer.ellipses.size()) {
-                entry.beforeShape.kind = ShapeKind::Ellipse;
-                entry.beforeShape.ellipse = layer.ellipses[sel.shapeIdx];
-                captured = true;
-                layer.ellipses.erase(layer.ellipses.begin() + sel.shapeIdx);
-            }
-            break;
-        case ShapeKind::Circle:
-            if (sel.shapeIdx < layer.circles.size()) {
-                entry.beforeShape.kind = ShapeKind::Circle;
-                entry.beforeShape.circle = layer.circles[sel.shapeIdx];
-                captured = true;
-                layer.circles.erase(layer.circles.begin() + sel.shapeIdx);
-            }
-            break;
-        case ShapeKind::None:
-            break;
-    }
-    saveVectorLayer(sel.layerIdx, layer);
-    if (captured) pushUndoEntry(std::move(entry));
+    deleteAllSelectionsImpl();
 }
 
 // Persist the active vector layer to disk. Used after a transform-drag
@@ -8778,6 +9093,15 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setSnapEnabled(
         JNIEnv*, jobject, jboolean enabled) {
     g_snapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
+}
+
+// Mirror of DrawingSurfaceView.angleSnapEnabled. When on, applyRotateTo
+// locks rotation to 15° increments and applyScaleTo on a Line locks
+// the dragged endpoint's direction from the anchor to 15° increments.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setAngleSnapEnabled(
+        JNIEnv*, jobject, jboolean enabled) {
+    g_angleSnapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
 }
 
 // Set the page bounds (in doc-pixels). Drawn during composite as a thin

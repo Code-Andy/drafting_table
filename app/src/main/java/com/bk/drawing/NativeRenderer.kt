@@ -175,6 +175,14 @@ object NativeRenderer {
     external fun setSnapEnabled(enabled: Boolean)
 
     /**
+     * Mirror of DrawingSurfaceView.angleSnapEnabled. When on,
+     * applyRotateTo locks rotation to 15° increments, and dragging a
+     * Line endpoint via the scale handle locks the line direction to
+     * 15° rays from the anchor (other endpoint).
+     */
+    external fun setAngleSnapEnabled(enabled: Boolean)
+
+    /**
      * Set the page-boundary rectangle (in doc-pixels). Drawn during
      * composite under the layers so user strokes locally occlude it but
      * the rest of the outline stays visible — useful as a visual anchor
