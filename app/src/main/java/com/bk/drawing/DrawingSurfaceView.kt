@@ -449,31 +449,22 @@ class DrawingSurfaceView @JvmOverloads constructor(
         forceRedraw()
     }
 
-    /** Drop the clipboard's content. Switches to whichever select tool
-     *  matches the clipboard kind so the user can immediately interact
-     *  with the pasted content:
-     *    raster pixels  → SELECT_RECT (floating sel handles)
-     *    vector shape   → SELECT (vector tap-to-select)
-     *  Auto-commits any existing floating raster sel first. Queued
-     *  onto the next multi-buffer pass since both paste paths need
-     *  GL state (texture allocation for raster; shape append for
-     *  vector). Empty-clipboard taps fall through as a no-op. */
+    /** Drop the clipboard's content. Switches to SELECT_RECT (the
+     *  unified marquee/select tool) so the user can immediately
+     *  interact with the pasted content. The tool dispatches by active
+     *  layer type, so the same selection on a vector layer does
+     *  tap-to-select / marquee multi-select, and on a raster layer
+     *  drives the floating-selection handles. Auto-commits any
+     *  existing floating raster sel first. Queued onto the next multi-
+     *  buffer pass since paste needs GL state. Empty-clipboard taps
+     *  fall through as a no-op. */
     fun queuePasteSelection() {
-        when (NativeRenderer.getClipboardKind()) {
-            2 -> {  // vector
-                if (currentTool != Tool.SELECT) {
-                    currentTool = Tool.SELECT
-                    onToolChanged?.invoke(currentTool)
-                }
+        if (NativeRenderer.getClipboardKind() != 0) {
+            if (currentTool != Tool.SELECT_RECT
+                && currentTool != Tool.SELECT_LASSO) {
+                currentTool = Tool.SELECT_RECT
+                onToolChanged?.invoke(currentTool)
             }
-            1 -> {  // raster
-                if (currentTool != Tool.SELECT_RECT
-                    && currentTool != Tool.SELECT_LASSO) {
-                    currentTool = Tool.SELECT_RECT
-                    onToolChanged?.invoke(currentTool)
-                }
-            }
-            // else: empty clipboard, paste will silently no-op
         }
         pendingPasteSel = true
         forceRedraw()
@@ -747,22 +738,23 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 renderer?.commit()
                 p1Snapped = false
             }
-            Tool.SELECT -> {
+            Tool.SELECT, Tool.SELECT_RECT, Tool.SELECT_LASSO -> {
+                // Vector-select side: end any in-flight transform/marquee
+                // drag so its mode flag doesn't carry over to the next
+                // gesture. Safe even when the active layer is raster
+                // (selectMode would just be 0).
                 if (selectMode != 0) {
                     NativeRenderer.endInteraction()
                     selectMode = 0
                     selectChanged = false
                 }
-            }
-            Tool.SELECT_RECT, Tool.SELECT_LASSO -> {
-                // If mid-define, cancel the marquee preview (rect or
-                // polyline); the floating selection (if any) survives.
+                // Raster-select side: cancel the marquee preview (rect
+                // or polyline) if mid-define; end any handle drag if
+                // mid-interact. The floating selection itself survives.
                 if (selRectMode == SelRectMode.DEFINE) {
                     lassoPathBuf.clear()
                     renderer?.commit()
                 }
-                // If mid-interact, end the drag cleanly so its mode flag
-                // doesn't carry into the next gesture.
                 if (selRectMode == SelRectMode.INTERACT) {
                     NativeRenderer.endRasterInteraction()
                 }
@@ -919,7 +911,17 @@ class DrawingSurfaceView @JvmOverloads constructor(
             Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
             Tool.BUCKET             -> handleBucketEvent(event)
             Tool.SELECT             -> handleSelectEvent(event)
-            Tool.SELECT_RECT        -> handleSelectRectEvent(r, event)
+            // The marquee/rectangle selection tool dispatches by active
+            // layer type: raster → lift pixels into a floating raster
+            // selection; vector → tap-to-select / marquee multi-select
+            // shapes. One icon, two behaviors — eliminates the prior
+            // "vector select" rail entry.
+            Tool.SELECT_RECT        -> {
+                val activeIsVector = NativeRenderer.getLayerType(
+                    NativeRenderer.getActiveLayer()) == 1
+                if (activeIsVector) handleSelectEvent(event)
+                else                handleSelectRectEvent(r, event)
+            }
             Tool.SELECT_LASSO       -> handleSelectLassoEvent(r, event)
             else                    -> handleShapeEvent(r, event, currentTool.shapeType)
         }

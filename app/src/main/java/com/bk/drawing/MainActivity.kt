@@ -492,8 +492,11 @@ class MainActivity : AppCompatActivity() {
 
         rail.addView(railRule())
         rail.addView(railSectionLabel("SELECT"))
-        rail.addView(makeRailToolTile(Tool.SELECT,      R.drawable.ic_vector_select, "vector select"))
-        rail.addView(makeRailToolTile(Tool.SELECT_RECT, R.drawable.ic_select,        "marquee"))
+        // The rect/marquee tile dispatches by active layer type:
+        // raster → floating-selection lift, vector → tap-to-select +
+        // marquee multi-select. The dedicated "vector select" tile was
+        // collapsed into this one to free up rail space.
+        rail.addView(makeRailToolTile(Tool.SELECT_RECT, R.drawable.ic_select,        "select"))
         rail.addView(makeRailToolTile(Tool.SELECT_LASSO,R.drawable.ic_lasso,         "lasso"))
 
         rail.addView(railRule())
@@ -617,7 +620,7 @@ class MainActivity : AppCompatActivity() {
             Tool.CIRCLE       -> "circle"
             Tool.ELLIPSE      -> "ellipse"
             Tool.SELECT       -> "select"
-            Tool.SELECT_RECT  -> "marquee"
+            Tool.SELECT_RECT  -> "select"   // unified raster + vector
             Tool.SELECT_LASSO -> "lasso"
         }
 
