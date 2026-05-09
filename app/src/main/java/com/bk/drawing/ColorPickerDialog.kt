@@ -220,18 +220,61 @@ class ColorPickerDialog(
 
         refreshFromHsv()  // seed every input + preview from the initial state
 
+        // ----- in-content button row --------------------------------------
+        // Cancel + Done styled to match the rest of the app (paper bg,
+        // monospace, sienna for the primary action). Replaces the
+        // default AlertDialog button bar so the dialog doesn't look
+        // like default Material.
+        val hot = context.getColor(R.color.hot)
+        val buttonRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        val cancelBtn = TextView(context).apply {
+            text = "Cancel"
+            typeface = mono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(ink)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            isClickable = true; isFocusable = true
+        }
+        val doneBtn = TextView(context).apply {
+            text = "Done"
+            typeface = monoSemibold ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(hot)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            isClickable = true; isFocusable = true
+        }
+        buttonRow.addView(cancelBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        buttonRow.addView(doneBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(buttonRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(12)
+            })
+
         // ----- show as dialog ---------------------------------------------
         // Negative button explicitly cancels; tapping outside / Back also
         // dismisses without calling onColorPicked. Only the positive
         // button commits.
-        AlertDialog.Builder(context)
+        val dialog = AlertDialog.Builder(context)
             .setView(root)
-            .setPositiveButton("Done") { _, _ ->
-                val rgb = Color.HSVToColor(hsv) and 0xFFFFFF
-                onColorPicked(rgb)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+            .create()
+        dialog.show()
+        dialog.window?.setBackgroundDrawable(
+            android.graphics.drawable.ColorDrawable(paper))
+
+        cancelBtn.setOnClickListener { dialog.dismiss() }
+        doneBtn.setOnClickListener {
+            val rgb = Color.HSVToColor(hsv) and 0xFFFFFF
+            dialog.dismiss()
+            onColorPicked(rgb)
+        }
     }
 
     /** One read-only cell: stacked label + value box. */

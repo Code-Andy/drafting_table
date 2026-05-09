@@ -2895,11 +2895,31 @@ class MainActivity : AppCompatActivity() {
                                                                   defaultW * 2, defaultH * 2)
         )
 
-        val pad = 16.dp
+        val ink     = getColor(R.color.ink)
+        val inkSoft = getColor(R.color.inkSoft)
+        val paper   = getColor(R.color.paper)
+        val hot     = getColor(R.color.hot)
+
+        val pad = 18.dp
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, 8.dp, pad, 8.dp)
+            setBackgroundColor(paper)
+            setPadding(pad, pad, pad, pad)
         }
+
+        // Title row, styled like the layer/brush/color section headers
+        // elsewhere in the app — small monospace caps with a hairline
+        // letter-space.
+        val title = TextView(this).apply {
+            text = "NEW DOCUMENT"
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 11f
+            letterSpacing = 0.08f
+            setTextColor(ink)
+        }
+        container.addView(title, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 14.dp })
 
         // Selected preset index (or null if Custom is being edited).
         var selectedIdx: Int? = 0
@@ -2911,7 +2931,8 @@ class MainActivity : AppCompatActivity() {
                 text = p.label
                 typeface = fontMono ?: Typeface.MONOSPACE
                 textSize = 12f
-                setTextColor(getColor(R.color.ink))
+                setTextColor(ink)
+                buttonTintList = android.content.res.ColorStateList.valueOf(ink)
                 isChecked = (i == 0)
                 radioGroup.addView(this, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2923,7 +2944,8 @@ class MainActivity : AppCompatActivity() {
             text = "Custom"
             typeface = fontMono ?: Typeface.MONOSPACE
             textSize = 12f
-            setTextColor(getColor(R.color.ink))
+            setTextColor(ink)
+            buttonTintList = android.content.res.ColorStateList.valueOf(ink)
             radioGroup.addView(this, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -2943,6 +2965,8 @@ class MainActivity : AppCompatActivity() {
             isSingleLine = true
             filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(5))
             typeface = fontMono ?: Typeface.MONOSPACE
+            setTextColor(ink)
+            backgroundTintList = android.content.res.ColorStateList.valueOf(inkSoft)
         }
         val heightEdit = android.widget.EditText(this).apply {
             setText(defaultH.toString())
@@ -2950,12 +2974,14 @@ class MainActivity : AppCompatActivity() {
             isSingleLine = true
             filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(5))
             typeface = fontMono ?: Typeface.MONOSPACE
+            setTextColor(ink)
+            backgroundTintList = android.content.res.ColorStateList.valueOf(inkSoft)
         }
         val xLabel = TextView(this).apply {
             text = " × "
             typeface = fontMono ?: Typeface.MONOSPACE
             textSize = 12f
-            setTextColor(getColor(R.color.inkSoft))
+            setTextColor(inkSoft)
         }
         customRow.addView(widthEdit,  LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -2991,30 +3017,72 @@ class MainActivity : AppCompatActivity() {
         widthEdit.addTextChangedListener(watcher)
         heightEdit.addTextChangedListener(watcher)
 
-        AlertDialog.Builder(this)
-            .setTitle("New document")
+        // In-content button row — replaces the default AlertDialog
+        // Cancel/Create chrome so the buttons inherit the same paper
+        // background + monospace typography as the rest of the dialog.
+        val buttonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        val cancelBtn = TextView(this).apply {
+            text = "Cancel"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(ink)
+            setPadding(16.dp, 10.dp, 16.dp, 10.dp)
+            isClickable = true; isFocusable = true
+        }
+        val createBtn = TextView(this).apply {
+            text = "Create"
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(hot)            // sienna accent — primary action
+            setPadding(16.dp, 10.dp, 16.dp, 10.dp)
+            isClickable = true; isFocusable = true
+        }
+        buttonRow.addView(cancelBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        buttonRow.addView(createBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        container.addView(buttonRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 12.dp })
+
+        // Build the dialog with ONLY the styled view; replace the
+        // window background so the dark default Material chrome around
+        // the content doesn't bleed through. setBackgroundDrawable has
+        // to happen after show() since the window isn't attached
+        // before that point.
+        val dialog = AlertDialog.Builder(this)
             .setView(container)
-            .setPositiveButton("Create") { _, _ ->
-                val sizeIdx = selectedIdx
-                val size = if (sizeIdx != null) {
-                    Pair(presets[sizeIdx].w, presets[sizeIdx].h)
-                } else {
-                    val w = widthEdit.text.toString().toIntOrNull()
-                        ?.coerceIn(64, 8192)
-                    val h = heightEdit.text.toString().toIntOrNull()
-                        ?.coerceIn(64, 8192)
-                    if (w == null || h == null) {
-                        android.widget.Toast.makeText(this,
-                            "Custom size must be 64–8192",
-                            android.widget.Toast.LENGTH_SHORT).show()
-                        return@setPositiveButton
-                    }
-                    Pair(w, h)
+            .create()
+        dialog.show()
+        dialog.window?.setBackgroundDrawable(
+            android.graphics.drawable.ColorDrawable(paper))
+
+        cancelBtn.setOnClickListener { dialog.dismiss() }
+        createBtn.setOnClickListener {
+            val sizeIdx = selectedIdx
+            val size = if (sizeIdx != null) {
+                Pair(presets[sizeIdx].w, presets[sizeIdx].h)
+            } else {
+                val w = widthEdit.text.toString().toIntOrNull()
+                    ?.coerceIn(64, 8192)
+                val h = heightEdit.text.toString().toIntOrNull()
+                    ?.coerceIn(64, 8192)
+                if (w == null || h == null) {
+                    android.widget.Toast.makeText(this,
+                        "Custom size must be 64–8192",
+                        android.widget.Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
                 }
-                onPick(size)
+                Pair(w, h)
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+            dialog.dismiss()
+            onPick(size)
+        }
     }
 
     private val kPageSizeFile = "page_size.txt"
