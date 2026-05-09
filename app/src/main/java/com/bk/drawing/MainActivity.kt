@@ -17,7 +17,6 @@ import android.widget.GridLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
@@ -915,34 +914,22 @@ class MainActivity : AppCompatActivity() {
      *  raster layers when there's a raster layer beneath; greyed-out
      *  otherwise so the menu shape stays stable. */
     private fun showLayerRowOverflow(anchor: View, idx: Int) {
-        val menu = PopupMenu(this, anchor, Gravity.END)
-        menu.menu.add(0, 0, 0, "Rename…")
         val isVector = NativeRenderer.getLayerType(idx) == 1
         val belowIsRaster = idx > 0 &&
             NativeRenderer.getLayerType(idx - 1) == 0
-        // Rasterize is only meaningful for vector layers; show it
-        // greyed-out for raster layers so the menu shape stays stable
-        // and the user knows the option exists.
-        val rasterize = menu.menu.add(0, 2, 2, "Rasterize layer")
-        rasterize.isEnabled = isVector
-        // Merge-with-below requires both source and target to be
-        // raster (V1: vector merge would need rasterizing the target,
-        // which is a separate feature). Greyed when source is vector,
-        // when there's no layer below, or when below is vector.
-        val mergeDown = menu.menu.add(0, 3, 3, "Merge with layer below")
-        mergeDown.isEnabled = !isVector && belowIsRaster
-        val delete = menu.menu.add(0, 1, 1, "Delete")
-        delete.isEnabled = layerCount > 1
-        menu.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                0 -> showRenameLayerDialog(idx)
-                1 -> confirmDeleteLayer(idx)
-                2 -> userRasterizeLayer(idx)
-                3 -> userMergeLayerWithBelow(idx)
-            }
-            true
-        }
-        menu.show()
+        showPaperPopupMenu(anchor, listOf(
+            PaperMenuItem("Rename…")              { showRenameLayerDialog(idx) },
+            // Rasterize is only meaningful for vector layers; greyed
+            // out otherwise so the menu shape stays stable.
+            PaperMenuItem("Rasterize layer", enabled = isVector)
+                                                  { userRasterizeLayer(idx) },
+            // Merge-with-below requires source AND target to be raster.
+            PaperMenuItem("Merge with layer below",
+                          enabled = !isVector && belowIsRaster)
+                                                  { userMergeLayerWithBelow(idx) },
+            PaperMenuItem("Delete", enabled = layerCount > 1)
+                                                  { confirmDeleteLayer(idx) },
+        ))
     }
 
     /** Composite the raster layer [idx] onto the raster layer below using
@@ -972,12 +959,11 @@ class MainActivity : AppCompatActivity() {
         val isVector = NativeRenderer.getLayerType(idx) == 1
         val displayName = if (customName.isNotEmpty()) customName
                           else (if (isVector) "vector ${idx + 1}" else "layer ${idx + 1}")
-        AlertDialog.Builder(this)
-            .setTitle("Delete layer")
-            .setMessage("Delete “$displayName”? This can't be undone.")
-            .setPositiveButton("Delete") { _, _ -> userDeleteLayer(idx) }
-            .setNegativeButton("Cancel", null)
-            .show()
+        showPaperConfirmDialog(
+            title = "Delete layer",
+            message = "Delete “$displayName”? This can't be undone.",
+            confirmLabel = "Delete",
+        ) { userDeleteLayer(idx) }
     }
 
     private fun userDeleteLayer(idx: Int) {
@@ -1128,32 +1114,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** AlertDialog with an EditText prepopulated with the current layer
+    /** Paper-styled rename dialog prepopulated with the current layer
      *  name (or empty if none was set). Empty input clears the custom
      *  name and reverts to the "layer N" / "vector N" default. */
     private fun showRenameLayerDialog(idx: Int) {
         val current = NativeRenderer.getLayerName(idx)
-        val input = android.widget.EditText(this).apply {
-            setText(current)
-            setSelection(current.length)
-            hint = "layer name"
+        showPaperInputDialog(
+            title = "Rename layer",
+            initial = current,
+            hint = "layer name",
+        ) { name ->
+            NativeRenderer.setLayerName(idx, name)
+            rebuildLayerList()
         }
-        val container = FrameLayout(this).apply {
-            val pad = 16.dp
-            setPadding(pad, 8.dp, pad, 0)
-            addView(input, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Rename layer")
-            .setView(container)
-            .setPositiveButton("OK") { _, _ ->
-                NativeRenderer.setLayerName(idx, input.text.toString().trim())
-                rebuildLayerList()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     /** "α" slider that always edits the active layer's opacity. The
@@ -2293,33 +2266,250 @@ class MainActivity : AppCompatActivity() {
     // Overflow menus
     // ====================================================================
 
-    private fun showOverflowMenu(anchor: View) {
-        val menu = PopupMenu(this, anchor, Gravity.END)
-        menu.menu.add("Import image…")
-        menu.menu.add("Export canvas as PNG…")
-        menu.menu.add("Export document as PDF…")
-        menu.menu.add("Stylus only: ${if (stylusOnly) "on" else "off"}")
-        menu.menu.add("Delete selection")
-        menu.menu.add("Rasterize selection to layer below")
-        menu.menu.add("Cut")
-        menu.menu.add("Copy")
-        menu.menu.add("Paste")
-        menu.setOnMenuItemClickListener { item ->
-            val title = item.title.toString()
-            when {
-                title == "Import image…"                       -> launchImageImport()
-                title == "Export canvas as PNG…"               -> launchCanvasPngExport()
-                title == "Export document as PDF…"             -> launchDocumentPdfExport()
-                title == "Delete selection"                    -> userDeleteSelection()
-                title == "Rasterize selection to layer below"  -> userRasterizeSelectionBelow()
-                title == "Cut"                                 -> drawingView?.queueCutSelection()
-                title == "Copy"                                -> drawingView?.queueCopySelection()
-                title == "Paste"                               -> drawingView?.queuePasteSelection()
-                title.startsWith("Stylus only:")               -> toggleStylusOnly()
-            }
-            true
+    /** One row in a paper-styled popup menu. */
+    private data class PaperMenuItem(
+        val title: String,
+        val enabled: Boolean = true,
+        val onClick: () -> Unit,
+    )
+
+    /** Paper-themed replacement for android.widget.PopupMenu. Builds a
+     *  PopupWindow whose content is a vertical column of monospace
+     *  TextView rows on a paper background, with hairline dividers and
+     *  ink/inkSoft for enabled/disabled. Anchored to [anchor] with
+     *  end-gravity (matches the PopupMenu calls being replaced). */
+    private fun showPaperPopupMenu(anchor: View, items: List<PaperMenuItem>) {
+        val ink     = getColor(R.color.ink)
+        val inkSoft = getColor(R.color.inkSoft)
+        val paper   = getColor(R.color.paper)
+        val rule    = getColor(R.color.rule)
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(paper)
         }
-        menu.show()
+
+        val popup = android.widget.PopupWindow(
+            container,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            /*focusable=*/ true,
+        )
+        // Required so taps outside the popup dismiss it; ColorDrawable
+        // also gives the elevation shadow something to clip against.
+        popup.setBackgroundDrawable(
+            android.graphics.drawable.ColorDrawable(paper))
+        popup.isOutsideTouchable = true
+        popup.elevation = 8.dp.toFloat()
+
+        for ((idx, item) in items.withIndex()) {
+            val tv = TextView(this).apply {
+                text = item.title
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 13f
+                setTextColor(if (item.enabled) ink else inkSoft)
+                setPadding(14.dp, 9.dp, 14.dp, 9.dp)
+                if (item.enabled) {
+                    isClickable = true; isFocusable = true
+                    setOnClickListener {
+                        popup.dismiss()
+                        item.onClick()
+                    }
+                }
+            }
+            container.addView(tv, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT))
+            if (idx < items.size - 1) {
+                container.addView(View(this).apply {
+                    setBackgroundColor(rule)
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 1.dp))
+            }
+        }
+
+        // Default PopupWindow width on this OS theme is much wider
+        // than the longest item — measure the container's natural
+        // width and pin the popup to it so the items hug their text.
+        container.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+        )
+        popup.width = container.measuredWidth
+
+        popup.showAsDropDown(anchor, 0, 0, Gravity.END)
+    }
+
+    /** Build a horizontal Cancel/<confirm> button row styled like the
+     *  rest of the app — mono ink Cancel, mono semibold sienna primary
+     *  action, end-aligned. Returns the row + the two TextViews so the
+     *  caller can wire click handlers. */
+    private fun makePaperDialogButtons(
+        confirmLabel: String,
+    ): Triple<LinearLayout, TextView, TextView> {
+        val ink = getColor(R.color.ink)
+        val hot = getColor(R.color.hot)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        val cancel = TextView(this).apply {
+            text = "Cancel"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(ink)
+            setPadding(16.dp, 10.dp, 16.dp, 10.dp)
+            isClickable = true; isFocusable = true
+        }
+        val confirm = TextView(this).apply {
+            text = confirmLabel
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(hot)
+            setPadding(16.dp, 10.dp, 16.dp, 10.dp)
+            isClickable = true; isFocusable = true
+        }
+        row.addView(cancel, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(confirm, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        return Triple(row, cancel, confirm)
+    }
+
+    /** Build a paper-themed dialog title — small monospace caps with a
+     *  hairline letter-space, matching the LAYERS / BRUSH / COLOR
+     *  section headers in the side panel. */
+    private fun makePaperDialogTitle(text: String): TextView =
+        TextView(this).apply {
+            this.text = text.uppercase()
+            typeface = fontMonoSemibold ?: Typeface.MONOSPACE
+            textSize = 11f
+            letterSpacing = 0.08f
+            setTextColor(getColor(R.color.ink))
+        }
+
+    /** Wrap [content] in an AlertDialog whose window is paper-colored.
+     *  Returns the dialog so the caller can dismiss it from button
+     *  click handlers. */
+    private fun showPaperDialog(content: View): android.app.AlertDialog {
+        val dialog = AlertDialog.Builder(this)
+            .setView(content)
+            .create()
+        dialog.show()
+        dialog.window?.setBackgroundDrawable(
+            android.graphics.drawable.ColorDrawable(getColor(R.color.paper)))
+        return dialog
+    }
+
+    /** Paper-styled replacement for AlertDialog with title + message +
+     *  Cancel/<confirmLabel>. */
+    private fun showPaperConfirmDialog(
+        title: String,
+        message: String,
+        confirmLabel: String = "OK",
+        onConfirm: () -> Unit,
+    ) {
+        val pad = 18.dp
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.paper))
+            setPadding(pad, pad, pad, pad)
+        }
+        container.addView(makePaperDialogTitle(title),
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 12.dp })
+        container.addView(TextView(this).apply {
+            text = message
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(getColor(R.color.ink))
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 14.dp })
+
+        val (buttons, cancelBtn, confirmBtn) = makePaperDialogButtons(confirmLabel)
+        container.addView(buttons, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val dialog = showPaperDialog(container)
+        cancelBtn.setOnClickListener  { dialog.dismiss() }
+        confirmBtn.setOnClickListener { dialog.dismiss(); onConfirm() }
+    }
+
+    /** Paper-styled replacement for AlertDialog-with-EditText. The
+     *  [onConfirm] callback receives the trimmed text; the dialog is
+     *  dismissed before [onConfirm] runs (matches the legacy
+     *  AlertDialog flow). */
+    private fun showPaperInputDialog(
+        title: String,
+        initial: String,
+        hint: String? = null,
+        confirmLabel: String = "OK",
+        onConfirm: (String) -> Unit,
+    ) {
+        val pad = 18.dp
+        val ink     = getColor(R.color.ink)
+        val inkSoft = getColor(R.color.inkSoft)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.paper))
+            setPadding(pad, pad, pad, pad)
+        }
+        container.addView(makePaperDialogTitle(title),
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 12.dp })
+
+        val input = android.widget.EditText(this).apply {
+            setText(initial)
+            setSelection(initial.length)
+            if (hint != null) this.hint = hint
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 13f
+            setTextColor(ink)
+            backgroundTintList =
+                android.content.res.ColorStateList.valueOf(inkSoft)
+            isSingleLine = true
+        }
+        container.addView(input, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 14.dp })
+
+        val (buttons, cancelBtn, confirmBtn) = makePaperDialogButtons(confirmLabel)
+        container.addView(buttons, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val dialog = showPaperDialog(container)
+        cancelBtn.setOnClickListener  { dialog.dismiss() }
+        confirmBtn.setOnClickListener {
+            val text = input.text.toString().trim()
+            dialog.dismiss()
+            onConfirm(text)
+        }
+    }
+
+    private fun showOverflowMenu(anchor: View) {
+        showPaperPopupMenu(anchor, listOf(
+            PaperMenuItem("Import image…")                      { launchImageImport() },
+            PaperMenuItem("Export canvas as PNG…")              { launchCanvasPngExport() },
+            PaperMenuItem("Export document as PDF…")            { launchDocumentPdfExport() },
+            PaperMenuItem("Stylus only: ${if (stylusOnly) "on" else "off"}")
+                                                                { toggleStylusOnly() },
+            PaperMenuItem("Delete selection")                   { userDeleteSelection() },
+            PaperMenuItem("Rasterize selection to layer below") { userRasterizeSelectionBelow() },
+            PaperMenuItem("Cut")                                { drawingView?.queueCutSelection() },
+            PaperMenuItem("Copy")                               { drawingView?.queueCopySelection() },
+            PaperMenuItem("Paste")                              { drawingView?.queuePasteSelection() },
+        ))
     }
 
     private fun userRasterizeSelectionBelow() {
@@ -2525,42 +2715,25 @@ class MainActivity : AppCompatActivity() {
     private val kImportMaxDim = 2048
 
     private fun showLayerOverflow(anchor: View) {
-        val menu = PopupMenu(this, anchor, Gravity.END)
-        menu.menu.add("+ Vector layer")
-        menu.menu.add("Clear active layer")
-        menu.setOnMenuItemClickListener { item ->
-            when (item.title.toString()) {
-                "+ Vector layer"     -> userAddVectorLayer()
-                "Clear active layer" -> userClearLayer()
-            }
-            true
-        }
-        menu.show()
+        showPaperPopupMenu(anchor, listOf(
+            PaperMenuItem("+ Vector layer")     { userAddVectorLayer() },
+            PaperMenuItem("Clear active layer") { userClearLayer() },
+        ))
     }
 
     private fun showDocsMenu(anchor: View) {
-        val menu = PopupMenu(this, anchor, Gravity.END)
+        val items = mutableListOf<PaperMenuItem>()
         // Prefix the active doc with • so the user sees what's open.
         for (name in listDocumentNames()) {
-            menu.menu.add(if (name == currentDocName) "• $name" else "  $name")
-        }
-        menu.menu.add("+ New document")
-        menu.menu.add("Rename current…")
-        menu.menu.add("Delete current")
-        menu.setOnMenuItemClickListener { item ->
-            val title = item.title.toString()
-            when {
-                title == "+ New document"   -> userNewDocument()
-                title == "Rename current…"  -> showRenameDocDialog()
-                title == "Delete current"   -> userDeleteCurrentDocument()
-                else -> {
-                    val name = title.removePrefix("• ").removePrefix("  ").trim()
-                    if (name != currentDocName) switchToDocument(name)
-                }
+            val label = if (name == currentDocName) "• $name" else "  $name"
+            items += PaperMenuItem(label) {
+                if (name != currentDocName) switchToDocument(name)
             }
-            true
         }
-        menu.show()
+        items += PaperMenuItem("+ New document")  { userNewDocument() }
+        items += PaperMenuItem("Rename current…") { showRenameDocDialog() }
+        items += PaperMenuItem("Delete current")  { userDeleteCurrentDocument() }
+        showPaperPopupMenu(anchor, items)
     }
 
     /** Rename the currently-open document. Validates non-empty, no
@@ -2570,34 +2743,20 @@ class MainActivity : AppCompatActivity() {
      *  refreshes the status bar / sidebar mirrors. */
     private fun showRenameDocDialog() {
         val current = currentDocName
-        val input = android.widget.EditText(this).apply {
-            setText(current)
-            setSelection(current.length)
-            hint = "document name"
-        }
-        val container = FrameLayout(this).apply {
-            val pad = 16.dp
-            setPadding(pad, 8.dp, pad, 0)
-            addView(input, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Rename document")
-            .setView(container)
-            .setPositiveButton("OK") { _, _ ->
-                val raw = input.text.toString().trim()
-                if (raw.isEmpty() || raw == current) return@setPositiveButton
-                if (raw in listDocumentNames()) {
-                    android.widget.Toast.makeText(this,
-                        "A document named “$raw” already exists",
-                        android.widget.Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-                renameCurrentDocument(raw)
+        showPaperInputDialog(
+            title = "Rename document",
+            initial = current,
+            hint = "document name",
+        ) { raw ->
+            if (raw.isEmpty() || raw == current) return@showPaperInputDialog
+            if (raw in listDocumentNames()) {
+                android.widget.Toast.makeText(this,
+                    "A document named “$raw” already exists",
+                    android.widget.Toast.LENGTH_SHORT).show()
+                return@showPaperInputDialog
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+            renameCurrentDocument(raw)
+        }
     }
 
     private fun renameCurrentDocument(newName: String) {
@@ -3050,18 +3209,7 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 12.dp })
 
-        // Build the dialog with ONLY the styled view; replace the
-        // window background so the dark default Material chrome around
-        // the content doesn't bleed through. setBackgroundDrawable has
-        // to happen after show() since the window isn't attached
-        // before that point.
-        val dialog = AlertDialog.Builder(this)
-            .setView(container)
-            .create()
-        dialog.show()
-        dialog.window?.setBackgroundDrawable(
-            android.graphics.drawable.ColorDrawable(paper))
-
+        val dialog = showPaperDialog(container)
         cancelBtn.setOnClickListener { dialog.dismiss() }
         createBtn.setOnClickListener {
             val sizeIdx = selectedIdx
@@ -3128,12 +3276,11 @@ class MainActivity : AppCompatActivity() {
     private fun userDeleteCurrentDocument() {
         val toDelete = currentDocName
         if (toDelete.isEmpty()) return
-        AlertDialog.Builder(this)
-            .setTitle("Delete document")
-            .setMessage("Delete “$toDelete”? This can't be undone.")
-            .setPositiveButton("Delete") { _, _ -> performDelete(toDelete) }
-            .setNegativeButton("Cancel", null)
-            .show()
+        showPaperConfirmDialog(
+            title = "Delete document",
+            message = "Delete “$toDelete”? This can't be undone.",
+            confirmLabel = "Delete",
+        ) { performDelete(toDelete) }
     }
 
     private fun performDelete(name: String) {
@@ -3154,25 +3301,19 @@ class MainActivity : AppCompatActivity() {
     /** Per-thumbnail overflow menu: just Delete for now. Disabled when
      *  there's only one page (the document needs at least one). */
     private fun showPageOverflow(anchor: View, idx: Int) {
-        val menu = PopupMenu(this, anchor, Gravity.END)
-        val delete = menu.menu.add(0, 0, 0, "Delete page")
-        delete.isEnabled = NativeRenderer.getPageCount() > 1
-        menu.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                0 -> confirmDeletePage(idx)
-            }
-            true
-        }
-        menu.show()
+        showPaperPopupMenu(anchor, listOf(
+            PaperMenuItem("Delete page",
+                          enabled = NativeRenderer.getPageCount() > 1)
+                { confirmDeletePage(idx) },
+        ))
     }
 
     private fun confirmDeletePage(idx: Int) {
-        AlertDialog.Builder(this)
-            .setTitle("Delete page")
-            .setMessage("Delete page ${idx + 1}? This can't be undone.")
-            .setPositiveButton("Delete") { _, _ -> userDeletePage(idx) }
-            .setNegativeButton("Cancel", null)
-            .show()
+        showPaperConfirmDialog(
+            title = "Delete page",
+            message = "Delete page ${idx + 1}? This can't be undone.",
+            confirmLabel = "Delete",
+        ) { userDeletePage(idx) }
     }
 
     private fun userDeletePage(idx: Int) {
