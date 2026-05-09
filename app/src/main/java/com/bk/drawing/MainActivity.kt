@@ -102,9 +102,10 @@ class MainActivity : AppCompatActivity() {
     // ---- Status bar -----------------------------------------------------
     private lateinit var statusToolText:  TextView
     private lateinit var statusDocText:   TextView
-    private lateinit var statusGridText:  TextView
-    private lateinit var statusSnapText:  TextView
-    private lateinit var statusAngleText: TextView
+    private lateinit var statusGridText:    TextView
+    private lateinit var statusSnapText:    TextView
+    private lateinit var statusAngleText:   TextView
+    private lateinit var statusPreviewText: TextView
     private lateinit var statusPageText:  TextView
 
     // ---- Page sidebar (restyled to 84dp) -------------------------------
@@ -147,6 +148,8 @@ class MainActivity : AppCompatActivity() {
 
     // ---- Brush + vector width (single slider routes to the right one) --
     private var brushSizeScale = 1.0f
+    private var brushPreviewEnabled = false
+    private lateinit var brushPreviewView: BrushPreviewView
     private var vectorLineWidth = 2.0f
     private var brushAlpha = 1.0f
     private var brushHardness = 1.0f
@@ -160,6 +163,11 @@ class MainActivity : AppCompatActivity() {
     private val kPrefBucketBleed   = "bucket_bleed"
     private val kBrushSizeMin = 0.25f
     private val kBrushSizeMax = 4.0f
+    // Mirror of renderer.cpp's kMaxRadius (the brush's max dab radius
+    // at full pressure, in doc-px). Used by the brush-preview overlay
+    // to compute its on-screen circle. Keep in sync if the native
+    // value changes.
+    private val kBrushMaxRadiusDoc = 18.0f
     private val kVectorWidthMin = 0.5f
     private val kVectorWidthMax = 16.0f
     // Brush-alpha mapping: invert the dab-accumulation curve so the
@@ -323,6 +331,8 @@ class MainActivity : AppCompatActivity() {
             v.onSnapToggleRequested = { toggleSnap() }
             v.onAngleSnapChanged = { refreshAngleSnapStatus() }
             v.onLineAngleChanged = { deg -> showLineAngle(deg) }
+            v.onPenPosition = { x, y, _ -> updateBrushPreview(x, y) }
+            v.onPenLeft     = { brushPreviewView.hide() }
             bodyContainer.addView(
                 v,
                 FrameLayout.LayoutParams(
@@ -332,6 +342,19 @@ class MainActivity : AppCompatActivity() {
             )
         }
         drawingView = canvas
+
+        // Brush preview overlay — sits ON TOP of the SurfaceView in
+        // bodyContainer so its circle outline draws above the canvas.
+        // isClickable/isFocusable are false in BrushPreviewView so
+        // touches fall through to the SurfaceView underneath.
+        brushPreviewView = BrushPreviewView(this)
+        bodyContainer.addView(
+            brushPreviewView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
 
         // panelsRow itself is NOT clickable — instead each child (sidebar,
         // layer panel) consumes touches inside its own bounds. That way
@@ -606,6 +629,13 @@ class MainActivity : AppCompatActivity() {
         }
         if (::sizeSliderLabel.isInitialized) {
             updateSizeSliderForTool()
+        }
+        // Brush preview only makes sense for raster stroke tools; hide
+        // immediately on switch so a stale circle doesn't linger until
+        // the next pen event.
+        if (::brushPreviewView.isInitialized
+            && tool != Tool.BRUSH && tool != Tool.ERASER) {
+            brushPreviewView.hide()
         }
     }
 
@@ -2227,13 +2257,24 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (angleOn) R.color.hot else R.color.inkSoft))
         }
+        // Brush preview — thin outline circle on hover/while drawing
+        // shows the brush's effective dab radius. Off by default.
+        statusPreviewText = makeStatusText(
+            if (brushPreviewEnabled) "preview: on" else "preview: off"
+        ).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { toggleBrushPreview() }
+            setTextColor(getColor(
+                if (brushPreviewEnabled) R.color.hot else R.color.inkSoft))
+        }
         statusPageText = makeStatusText("page —")
 
-        bar.addView(statusDocText,  statusItemLp())
-        bar.addView(statusToolText, statusItemLp())
-        bar.addView(statusGridText, statusItemLp())
-        bar.addView(statusSnapText, statusItemLp())
-        bar.addView(statusAngleText, statusItemLp())
+        bar.addView(statusDocText,    statusItemLp())
+        bar.addView(statusToolText,   statusItemLp())
+        bar.addView(statusGridText,   statusItemLp())
+        bar.addView(statusSnapText,   statusItemLp())
+        bar.addView(statusAngleText,  statusItemLp())
+        bar.addView(statusPreviewText, statusItemLp())
         // Spacer pushes pageText to the right edge.
         bar.addView(View(this), LinearLayout.LayoutParams(
             0, 0, 1.0f))
@@ -2850,6 +2891,39 @@ class MainActivity : AppCompatActivity() {
         val on = drawingView?.angleSnapEnabled == true
         statusAngleText.text = if (on) "angle: on" else "angle: off"
         statusAngleText.setTextColor(getColor(
+            if (on) R.color.hot else R.color.inkSoft))
+    }
+
+    /** Push the latest pen position to the brush-preview overlay. Hides
+     *  the overlay when the preview is disabled or the current tool
+     *  isn't a raster stroke tool. Radius = max-pressure dab size in
+     *  view-px (kBrushMaxRadiusDoc * brushSizeScale * viewScale). */
+    private fun updateBrushPreview(viewPxX: Float, viewPxY: Float) {
+        if (!::brushPreviewView.isInitialized) return
+        if (!brushPreviewEnabled
+            || (currentToolMirror != Tool.BRUSH
+                && currentToolMirror != Tool.ERASER)) {
+            brushPreviewView.hide()
+            return
+        }
+        val viewScale = drawingView?.currentViewScale ?: 1.0f
+        val radiusViewPx = kBrushMaxRadiusDoc * brushSizeScale * viewScale
+        brushPreviewView.show(viewPxX, viewPxY, radiusViewPx)
+    }
+
+    private fun toggleBrushPreview() {
+        brushPreviewEnabled = !brushPreviewEnabled
+        if (!brushPreviewEnabled && ::brushPreviewView.isInitialized) {
+            brushPreviewView.hide()
+        }
+        refreshBrushPreviewStatus()
+    }
+
+    private fun refreshBrushPreviewStatus() {
+        if (!::statusPreviewText.isInitialized) return
+        val on = brushPreviewEnabled
+        statusPreviewText.text = if (on) "preview: on" else "preview: off"
+        statusPreviewText.setTextColor(getColor(
             if (on) R.color.hot else R.color.inkSoft))
     }
 

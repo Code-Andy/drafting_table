@@ -306,6 +306,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var viewRotation = 0.0f
     private var viewPanX = 0.0f
     private var viewPanY = 0.0f
+    /** Public read-only mirror — UI overlays (brush preview) need it
+     *  to convert doc-px brush radii to on-screen pixels. */
+    val currentViewScale: Float get() = viewScale
 
     // Reused scratch buffers; touch handling runs at high rate, avoid alloc.
     private val tmpDoc = FloatArray(2)
@@ -609,6 +612,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  e.g. "angle: 45°" so the user knows what they're locking to. */
     var onLineAngleChanged: ((Float?) -> Unit)? = null
 
+    /** Fired on every stylus event so an overlay (e.g. brush preview)
+     *  can track the pen. xy in view-px, hovering=true for hover-only
+     *  events (pen near surface, not in contact). Null = pen has left
+     *  the surface and any overlay should hide. */
+    var onPenPosition: ((x: Float, y: Float, hovering: Boolean) -> Unit)? = null
+    var onPenLeft: (() -> Unit)? = null
+
     private fun handleStylusButton(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
             val ab = event.actionButton
@@ -685,6 +695,18 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
     override fun onHoverEvent(event: MotionEvent): Boolean {
         if (handleStylusButton(event)) return true
+        // Push the hover position to any overlay (brush preview).
+        // EXIT means the pen has lifted clear of the surface, so the
+        // overlay should hide.
+        when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE -> {
+                onPenPosition?.invoke(event.x, event.y, true)
+            }
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                onPenLeft?.invoke()
+            }
+        }
         return super.onHoverEvent(event)
     }
 
@@ -834,6 +856,23 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 MotionEvent.ACTION_DOWN   -> penInContact = true
                 MotionEvent.ACTION_UP,
                 MotionEvent.ACTION_CANCEL -> penInContact = false
+            }
+        }
+
+        // Push the pen position to any overlay. During contact the pen
+        // is "drawing"; on UP/CANCEL it's lifted (any overlay should
+        // hide). ACTION_POINTER_* events ignored — the overlay tracks
+        // the primary pointer only.
+        if (event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) {
+            when (action) {
+                MotionEvent.ACTION_DOWN,
+                MotionEvent.ACTION_MOVE -> {
+                    onPenPosition?.invoke(event.x, event.y, false)
+                }
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> {
+                    onPenLeft?.invoke()
+                }
             }
         }
 
