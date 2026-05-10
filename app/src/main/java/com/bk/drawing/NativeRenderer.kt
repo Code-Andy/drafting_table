@@ -47,6 +47,22 @@ object NativeRenderer {
     )
 
     /**
+     * Batched stroke extension. xyp packs `[x,y,p, x,y,p, ...]` in
+     * doc-pixels; the first `realCount` triples are real samples
+     * (persisted for the bake and used to update the coverage mirror)
+     * and the remainder are predicted (rendered to the front-buffer
+     * preview only and reverted at the next batch). Replaces the
+     * per-sample extendStroke / extendStrokePredicted JNIs in the hot
+     * path: one mirror blit and one preview-overlay render per batch
+     * regardless of sample count.
+     */
+    external fun extendStrokeBatch(
+        width: Int, height: Int,
+        transform: FloatArray,
+        xyp: FloatArray, realCount: Int
+    )
+
+    /**
      * Bake the in-progress stroke into the tiles its bbox touches, then drop
      * the stroke samples. The tiles ARE the document state from now on.
      */
@@ -181,6 +197,16 @@ object NativeRenderer {
      * 15° rays from the anchor (other endpoint).
      */
     external fun setAngleSnapEnabled(enabled: Boolean)
+
+    /**
+     * Runtime toggle for motion-predicted dabs in the front-buffer
+     * preview. When off, the Kotlin side stops dispatching predicted
+     * batches; when on, predicted dabs render via extendStrokePredicted
+     * and are reverted from the live preview before the next real dab
+     * is applied.
+     */
+    external fun setPredictionEnabled(enabled: Boolean)
+    external fun isPredictionEnabled(): Boolean
 
     /**
      * Set the page-boundary rectangle (in doc-pixels). Drawn during

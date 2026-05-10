@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
+import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -106,6 +107,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusSnapText:    TextView
     private lateinit var statusAngleText:   TextView
     private lateinit var statusPreviewText: TextView
+    private lateinit var statusPredictText: TextView
     private lateinit var statusPageText:  TextView
 
     // ---- Page sidebar (restyled to 84dp) -------------------------------
@@ -150,6 +152,9 @@ class MainActivity : AppCompatActivity() {
     private var brushSizeScale = 1.0f
     private var brushPreviewEnabled = false
     private lateinit var brushPreviewView: BrushPreviewView
+    // Motion-prediction toggle. Off by default; not persisted across
+    // launches (debug knob for camera-based latency A/B tests).
+    private var predictionEnabled = false
     private var vectorLineWidth = 2.0f
     private var brushAlpha = 1.0f
     private var brushHardness = 1.0f
@@ -427,6 +432,17 @@ class MainActivity : AppCompatActivity() {
             val attrs = window.attributes
             attrs.preferredDisplayModeId = highest.modeId
             window.attributes = attrs
+        }
+        // One-shot log of available refresh modes + the one we asked for.
+        // Useful for the latency probe — confirms whether we're actually
+        // running at 90 Hz on this device (frame time ≈ 11.1 ms vs the
+        // 16.7 ms 60 Hz fallback).
+        display?.let { d ->
+            val modes = d.supportedModes.joinToString(", ") {
+                "${it.modeId}:${it.physicalWidth}x${it.physicalHeight}@${it.refreshRate}"
+            }
+            Log.i("DrawingApp",
+                "DISPLAY currentRate=${d.refreshRate}  preferred=${highest?.modeId}  modes=[$modes]")
         }
 
         // Apply initial selection state to the brush tile.
@@ -2310,6 +2326,16 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (brushPreviewEnabled) R.color.hot else R.color.inkSoft))
         }
+        // Motion-prediction toggle. Forwards to drawingView, which
+        // mirrors the flag to native.
+        statusPredictText = makeStatusText(
+            if (predictionEnabled) "predict: on" else "predict: off"
+        ).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { togglePrediction() }
+            setTextColor(getColor(
+                if (predictionEnabled) R.color.hot else R.color.inkSoft))
+        }
         statusPageText = makeStatusText("page —")
 
         bar.addView(statusDocText,    statusItemLp())
@@ -2318,6 +2344,7 @@ class MainActivity : AppCompatActivity() {
         bar.addView(statusSnapText,   statusItemLp())
         bar.addView(statusAngleText,  statusItemLp())
         bar.addView(statusPreviewText, statusItemLp())
+        bar.addView(statusPredictText, statusItemLp())
         // Spacer pushes pageText to the right edge.
         bar.addView(View(this), LinearLayout.LayoutParams(
             0, 0, 1.0f))
@@ -2967,6 +2994,20 @@ class MainActivity : AppCompatActivity() {
         val on = brushPreviewEnabled
         statusPreviewText.text = if (on) "preview: on" else "preview: off"
         statusPreviewText.setTextColor(getColor(
+            if (on) R.color.hot else R.color.inkSoft))
+    }
+
+    private fun togglePrediction() {
+        predictionEnabled = !predictionEnabled
+        drawingView?.predictionEnabled = predictionEnabled
+        refreshPredictionStatus()
+    }
+
+    private fun refreshPredictionStatus() {
+        if (!::statusPredictText.isInitialized) return
+        val on = predictionEnabled
+        statusPredictText.text = if (on) "predict: on" else "predict: off"
+        statusPredictText.setTextColor(getColor(
             if (on) R.color.hot else R.color.inkSoft))
     }
 

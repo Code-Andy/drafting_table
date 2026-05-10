@@ -2,6 +2,7 @@ package com.bk.drawing
 
 import android.content.Context
 import android.opengl.Matrix
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.Log
 import android.view.MotionEvent
@@ -9,6 +10,7 @@ import android.view.SurfaceView
 import androidx.graphics.lowlatency.BufferInfo
 import androidx.graphics.lowlatency.GLFrontBufferedRenderer
 import androidx.graphics.opengl.egl.EGLManager
+import androidx.input.motionprediction.MotionEventPredictor
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -25,8 +27,53 @@ sealed class StrokeAction {
         // Predicted samples render into the front buffer to mask input
         // latency but are never baked into the doc on commit (so the
         // committed stroke matches the actual pen path, not the guesses).
-        val predicted: Boolean = false
+        val predicted: Boolean = false,
+        // Latency-probe instrumentation. inputAgeMs = ms between the
+        // input event timestamp (sensor-side) and our onTouchEvent
+        // receive; receivedNs = System.nanoTime() at receive (used to
+        // compute app-prep delta when the GL thread renders this
+        // sample). 0L means "not measured" (predicted samples / older
+        // construction sites).
+        val inputAgeMs: Long = 0L,
+        val receivedNs:  Long = 0L,
     ) : StrokeAction()
+
+    /** All stroke samples coming out of one `MotionEvent` (historical
+     *  rows + the current one) bundled into a single front-buffer
+     *  dispatch. One renderFrontBufferedLayer call → one GL callback →
+     *  one extendStroke loop, instead of N separate framework
+     *  dispatches. xyp is [x0,y0,p0, x1,y1,p1, ...] in doc-coords;
+     *  isNewStroke applies to the first sample only. inputAgeMs is the
+     *  age of the *latest* sample in the batch (the freshest input);
+     *  receivedNs is when this MotionEvent reached us. */
+    class BatchSamples(
+        val xyp: FloatArray,
+        // First realCount triples are real samples (pushed to
+        // g_current.samples and baked at commit). Triples after are
+        // predicted, rendered into the front-buffer preview only and
+        // reverted from g_coverage at the start of the next real batch.
+        // Packing real + predicted into one BatchSamples means one
+        // renderFrontBufferedLayer call per MotionEvent regardless of
+        // whether prediction is on — preserves the appPrep win from
+        // batching.
+        val realCount: Int,
+        val isNewStroke: Boolean,
+        val inputAgeMs: Long = 0L,
+        val receivedNs:  Long = 0L,
+    ) : StrokeAction() {
+        val count: Int get() = xyp.size / 3
+        override fun equals(other: Any?): Boolean =
+            other is BatchSamples
+                && isNewStroke == other.isNewStroke
+                && realCount   == other.realCount
+                && xyp.contentEquals(other.xyp)
+        override fun hashCode(): Int {
+            var h = xyp.contentHashCode()
+            h = 31 * h + isNewStroke.hashCode()
+            h = 31 * h + realCount.hashCode()
+            return h
+        }
+    }
 
     data class ShapePreview(
         val shapeType: Int,             // matches NativeRenderer.renderShapePreview
@@ -48,6 +95,53 @@ sealed class StrokeAction {
                 && points.contentEquals(other.points)
         override fun hashCode(): Int =
             31 * points.contentHashCode() + closed.hashCode()
+    }
+}
+
+// Pen-to-render latency aggregator. Records three deltas per stroke
+// sample on the GL thread:
+//   inputAgeMs — sensor timestamp → app onTouchEvent receive (kernel
+//                + InputDispatcher).
+//   appPrepUs  — onTouchEvent receive → onDrawFrontBufferedLayer
+//                start (queue onto GL thread + framework callback).
+//   nativeUs   — duration of the extendStroke JNI call.
+// Logs a p50/p95/max summary once we have kBucket samples and
+// resets, so a continuous stroke produces periodic summaries in
+// logcat under the DrawingApp tag. This is for measurement only —
+// the cost per record is a few longs.
+internal object LatencyProbe {
+    private const val kBucket = 50
+    private val inputAgeMs = LongArray(kBucket)
+    private val appPrepUs  = LongArray(kBucket)
+    private val nativeUs   = LongArray(kBucket)
+    private var n = 0
+
+    @Synchronized
+    fun record(inputAgeMsVal: Long, appPrepNs: Long, nativeNs: Long) {
+        if (n >= kBucket) return
+        inputAgeMs[n] = inputAgeMsVal
+        appPrepUs[n]  = appPrepNs / 1000
+        nativeUs[n]   = nativeNs  / 1000
+        n++
+        if (n >= kBucket) dumpLocked()
+    }
+
+    private fun dumpLocked() {
+        if (n == 0) return
+        val ia = inputAgeMs.copyOf(n).also { it.sort() }
+        val ap = appPrepUs.copyOf(n).also { it.sort() }
+        val nv = nativeUs.copyOf(n).also { it.sort() }
+        val p50 = n / 2
+        val p95 = (n * 95) / 100
+        val mx  = n - 1
+        Log.i("DrawingApp", String.format(
+            "LATENCY n=%d  input(ms) p50=%d p95=%d max=%d  appPrep(us) p50=%d p95=%d max=%d  native(us) p50=%d p95=%d max=%d",
+            n,
+            ia[p50], ia[p95], ia[mx],
+            ap[p50], ap[p95], ap[mx],
+            nv[p50], nv[p95], nv[mx],
+        ))
+        n = 0
     }
 }
 
@@ -105,6 +199,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     if (param.isNewStroke) {
                         NativeRenderer.beginStroke()
                     }
+                    val measure = !param.predicted && param.receivedNs != 0L
+                    val enterNs = if (measure) System.nanoTime() else 0L
                     if (param.predicted) {
                         NativeRenderer.extendStrokePredicted(
                             bufferInfo.width, bufferInfo.height,
@@ -116,6 +212,34 @@ class DrawingSurfaceView @JvmOverloads constructor(
                             bufferInfo.width, bufferInfo.height,
                             composed,
                             param.x, param.y, param.pressure
+                        )
+                    }
+                    if (measure) {
+                        val afterNs = System.nanoTime()
+                        LatencyProbe.record(
+                            param.inputAgeMs,
+                            enterNs - param.receivedNs,
+                            afterNs - enterNs,
+                        )
+                    }
+                }
+                is StrokeAction.BatchSamples -> {
+                    if (param.isNewStroke) {
+                        NativeRenderer.beginStroke()
+                    }
+                    val measure = param.receivedNs != 0L
+                    val enterNs = if (measure) System.nanoTime() else 0L
+                    NativeRenderer.extendStrokeBatch(
+                        bufferInfo.width, bufferInfo.height,
+                        composed,
+                        param.xyp, param.realCount
+                    )
+                    if (measure) {
+                        val afterNs = System.nanoTime()
+                        LatencyProbe.record(
+                            param.inputAgeMs,
+                            enterNs - param.receivedNs,
+                            afterNs - enterNs,
                         )
                     }
                 }
@@ -153,7 +277,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
             // mustn't bake an empty stroke in that case. cancelNextCommit
             // (set when a 2-finger gesture interrupts a stroke) suppresses
             // the bake entirely so the in-progress stroke is discarded.
-            val hadStrokeSamples = params.any { it is StrokeAction.Sample }
+            val hadStrokeSamples = params.any {
+                it is StrokeAction.Sample || it is StrokeAction.BatchSamples
+            }
             if (hadStrokeSamples && !cancelNextCommit) {
                 NativeRenderer.commitStroke()
             }
@@ -292,6 +418,23 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
     private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
         GLFrontBufferedRenderer(this, callback)
+
+    // Motion-prediction support. Lazily created on first stroke event.
+    // When enabled, every real MotionEvent is fed to the predictor and a
+    // predicted MotionEvent is dispatched as a separate BatchSamples
+    // (predicted=true) so its dabs render into the front buffer ahead
+    // of where the pen actually is. Native side reverts the predicted
+    // dabs from g_coverage before applying the next real dab.
+    private var motionPredictor: MotionEventPredictor? = null
+
+    /** Runtime toggle. MainActivity flips this from a status-bar item.
+     *  Mirrors to native so a session can be A/B'd against the camera
+     *  without rebuilding. */
+    var predictionEnabled: Boolean = false
+        set(value) {
+            field = value
+            NativeRenderer.setPredictionEnabled(value)
+        }
 
     // -------------------------------------------------------------------
     // View transform: doc-pixel → view-pixel, parameterized as scale,
@@ -1298,31 +1441,94 @@ class DrawingSurfaceView @JvmOverloads constructor(
         r: GLFrontBufferedRenderer<StrokeAction>,
         event: MotionEvent
     ): Boolean {
+        // Sensor → handler delta is computed against the ms-resolution
+        // event.eventTime (same epoch as SystemClock.uptimeMillis).
+        // recvNs is the System.nanoTime() at this dispatch and is used
+        // by the GL thread to compute app-prep delta.
+        val recvNs = System.nanoTime()
+        val recvMs = SystemClock.uptimeMillis()
+
+        // Motion predictor lifecycle: lazy init on first event, fed
+        // every real touch (DOWN + MOVE) so it can build a velocity
+        // model. We don't tear it down between strokes — it self-resets
+        // when the gap between events exceeds its internal threshold.
+        if (predictionEnabled && motionPredictor == null) {
+            motionPredictor = MotionEventPredictor.newInstance(this)
+        }
+        motionPredictor?.record(event)
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 viewToDoc(event.x, event.y, tmpDoc)
-                r.renderFrontBufferedLayer(
-                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1],
-                                        mapPressure(event.pressure),
-                                        isNewStroke = true)
+                val xyp = floatArrayOf(
+                    tmpDoc[0], tmpDoc[1], mapPressure(event.pressure)
                 )
+                r.renderFrontBufferedLayer(
+                    StrokeAction.BatchSamples(
+                        xyp, realCount = 1, isNewStroke = true,
+                        inputAgeMs = recvMs - event.eventTime,
+                        receivedNs = recvNs,
+                    )
+                )
+                // No prediction on DOWN — the predictor needs at least
+                // one move's worth of history before its output is
+                // useful, and predicting from a single point can
+                // overshoot wildly.
             }
             MotionEvent.ACTION_MOVE -> {
+                val realN = event.historySize + 1
+                // Pull predicted samples first so we know the final array
+                // size up front. dispatchPredictedSamples() returns the
+                // predictor's MotionEvent (caller-recycled) or null if
+                // prediction is off / unavailable.
+                val pe = pullPrediction()
+                val predN = pe?.let { it.historySize + 1 } ?: 0
+                val xyp = FloatArray((realN + predN) * 3)
+
+                // Real region: historical (oldest first) then current.
                 for (i in 0 until event.historySize) {
-                    viewToDoc(event.getHistoricalX(i), event.getHistoricalY(i), tmpDoc)
-                    r.renderFrontBufferedLayer(
-                        StrokeAction.Sample(
-                            tmpDoc[0], tmpDoc[1],
-                            mapPressure(event.getHistoricalPressure(i)),
-                            isNewStroke = false
-                        )
+                    viewToDoc(
+                        event.getHistoricalX(i), event.getHistoricalY(i), tmpDoc
                     )
+                    val k = i * 3
+                    xyp[k]     = tmpDoc[0]
+                    xyp[k + 1] = tmpDoc[1]
+                    xyp[k + 2] = mapPressure(event.getHistoricalPressure(i))
                 }
                 viewToDoc(event.x, event.y, tmpDoc)
+                val curK = event.historySize * 3
+                xyp[curK]     = tmpDoc[0]
+                xyp[curK + 1] = tmpDoc[1]
+                xyp[curK + 2] = mapPressure(event.pressure)
+
+                // Predicted tail (if any). Recycled below in finally.
+                if (pe != null) {
+                    try {
+                        for (i in 0 until pe.historySize) {
+                            viewToDoc(
+                                pe.getHistoricalX(i), pe.getHistoricalY(i), tmpDoc
+                            )
+                            val k = (realN + i) * 3
+                            xyp[k]     = tmpDoc[0]
+                            xyp[k + 1] = tmpDoc[1]
+                            xyp[k + 2] = mapPressure(pe.getHistoricalPressure(i))
+                        }
+                        viewToDoc(pe.x, pe.y, tmpDoc)
+                        val k = (realN + pe.historySize) * 3
+                        xyp[k]     = tmpDoc[0]
+                        xyp[k + 1] = tmpDoc[1]
+                        xyp[k + 2] = mapPressure(pe.pressure)
+                    } finally {
+                        pe.recycle()
+                    }
+                }
+
                 r.renderFrontBufferedLayer(
-                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1],
-                                        mapPressure(event.pressure),
-                                        isNewStroke = false)
+                    StrokeAction.BatchSamples(
+                        xyp, realCount = realN, isNewStroke = false,
+                        inputAgeMs = recvMs - event.eventTime,
+                        receivedNs = recvNs,
+                    )
                 )
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -1330,6 +1536,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
         }
         return true
+    }
+
+    /** Return the predictor's next MotionEvent, or null if prediction is
+     *  off / unavailable. Caller must recycle the returned event. */
+    private fun pullPrediction(): MotionEvent? {
+        if (!predictionEnabled) return null
+        return motionPredictor?.predict()
     }
 
     // Reused output buffer for NativeRenderer.snapPoint — avoids

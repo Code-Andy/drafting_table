@@ -93,9 +93,23 @@ constexpr size_t kTileBytes = static_cast<size_t>(kTileSize) * kTileSize * 4;
 constexpr int   kApron       = 1;
 constexpr int   kTileTexSize = kTileSize + 2 * kApron;
 
-constexpr float kSpacing   = 0.18f;
-constexpr float kMinRadius = 2.0f;
-constexpr float kMaxRadius = 18.0f;
+constexpr float kSpacing    = 0.18f;
+// Pressure → dab-radius range. kMinRadius = 0 lets the lightest pen
+// contact taper to nothing, so the brush has dynamic range across the
+// pen's full pressure curve. The bake/emit path floors spacing
+// independently below (kMinSpacing) so a near-zero radius can't
+// degenerate the dab loop.
+constexpr float kMinRadius  = 0.0f;
+constexpr float kMaxRadius  = 18.0f;
+// Dab spacing floor in doc-px. Ordinary spacing is kSpacing * radius;
+// at very low pressure that product approaches zero, which would emit
+// thousands of redundant sub-pixel dabs and (at exactly zero) infinite
+// loop the extend(). 0.5 doc-px is below human-perceptible resolution
+// at all sane zooms.
+constexpr float kMinSpacing = 0.5f;
+// Dabs whose radius is below this are skipped — they'd contribute no
+// visible coverage at any zoom and the GL rasterizer has nothing to do.
+constexpr float kMinDabRadius = 0.05f;
 
 // Brush dabs render with a runtime-settable color and alpha. The
 // dab's per-fragment alpha (g_strokeBrushAlpha * radial falloff)
@@ -825,7 +839,22 @@ constexpr float kGridMajorColor[4] = { 0.40f, 0.45f, 0.55f, 0.70f };
 ViewFbo g_belowFbo;
 ViewFbo g_aboveFbo;
 ViewFbo g_coverage;
+// Mirror of g_coverage AFTER the most recent real-sample dab (i.e. real
+// dabs only, no predicted). Used to revert g_coverage when a new real
+// sample arrives after one or more predicted samples — otherwise the
+// predicted dabs persist in the live preview and visibly thicken the
+// stroke as real samples catch up. Allocated lazily alongside g_coverage.
+ViewFbo g_coverageReal;
 bool    g_needsPreviewPrep = false;  // set at beginStroke; cleared on first extendStroke
+// Set when one or more extendStrokePredicted calls have run since the
+// last real extendStroke. Triggers a coverage + emitter restore at the
+// start of the next real extendStroke.
+bool    g_predictionInFlight = false;
+// Snapshot of g_predictionEnabled taken at beginStroke and held for the
+// life of the stroke. The mirror blit and the predicted-dab path are
+// gated on this — when off, no mirror cost is paid. Toggling mid-stroke
+// is a no-op so the coverage mirror can't desync.
+bool    g_strokePredictionActive = false;
 
 std::vector<std::unique_ptr<Page>> g_pages;
 size_t g_activePageIdx = 0;
@@ -1488,6 +1517,7 @@ struct DabEmitter {
     }
 
     void emit(float x, float y, float radius) {
+        if (radius < kMinDabRadius) return;
         if (x + radius < clipMinX || x - radius > clipMaxX ||
             y + radius < clipMinY || y - radius > clipMaxY) {
             return;
@@ -1495,12 +1525,16 @@ struct DabEmitter {
         drawDab(x, y, radius);
     }
 
+    static inline float spacingOf(float pressure) {
+        return std::max(kSpacing * radiusOf(pressure), kMinSpacing);
+    }
+
     void extend(float x, float y, float p) {
         if (!active) {
             emit(x, y, radiusOf(p));
             active = true;
             lastX = x; lastY = y; lastP = p;
-            distToNextDab = kSpacing * radiusOf(p);
+            distToNextDab = spacingOf(p);
             return;
         }
         float dx = x - lastX, dy = y - lastY;
@@ -1516,7 +1550,7 @@ struct DabEmitter {
             float dabY = lastY + uy * traveled;
             float dabP = lastP + (p - lastP) * t;
             emit(dabX, dabY, radiusOf(dabP));
-            distToNextDab = kSpacing * radiusOf(dabP);
+            distToNextDab = spacingOf(dabP);
         }
         distToNextDab -= (dist - traveled);
         lastX = x; lastY = y; lastP = p;
@@ -1524,6 +1558,14 @@ struct DabEmitter {
 };
 
 DabEmitter g_liveEmitter;
+// Snapshot of g_liveEmitter taken after the most recent real-sample
+// dab. Restored before the next real dab if any predicted samples have
+// been emitted in between, so the predicted dabs don't pollute the
+// emitter's last-position state and bend the next real dab interpolation.
+DabEmitter g_liveEmitterReal;
+// Runtime toggle for motion prediction. Off by default until we've
+// validated visual quality on the tablet.
+std::atomic<bool> g_predictionEnabled{false};
 
 // Forward declarations; defined down with the persistence and composite
 // helpers.
@@ -2307,6 +2349,15 @@ void preparePreviewBuffers(JNIEnv* env, int width, int height,
     glViewport(0, 0, width, height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    // Mirror coverage. Same dimensions; cleared so the first real dab's
+    // restore (if a prediction sneaks in before any real sample, which
+    // shouldn't happen but defensively) reads zero.
+    ensureViewFbo(g_coverageReal, width, height);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_coverageReal.fbo);
+    glViewport(0, 0, width, height);
+    glClear(GL_COLOR_BUFFER_BIT);
+    g_predictionInFlight = false;
+    g_liveEmitterReal = g_liveEmitter;   // both freshly reset()
 }
 
 // ---- Tile management ------------------------------------------------------
@@ -9104,6 +9155,22 @@ Java_com_bk_drawing_NativeRenderer_setAngleSnapEnabled(
     g_angleSnapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
 }
 
+// Runtime toggle for motion prediction. The Kotlin side reads this
+// (via isPredictionEnabled) to decide whether to dispatch predicted
+// samples; native code only consults g_predictionInFlight, which is
+// implicitly off if the Kotlin side never sends predicted batches.
+// Exposing both directions makes A/B'ing trivial without rebuilding.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setPredictionEnabled(
+        JNIEnv*, jobject, jboolean enabled) {
+    g_predictionEnabled.store(enabled == JNI_TRUE);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_isPredictionEnabled(JNIEnv*, jobject) {
+    return g_predictionEnabled.load() ? JNI_TRUE : JNI_FALSE;
+}
+
 // Set the page bounds (in doc-pixels). Drawn during composite as a thin
 // outlined rectangle so the user can see where the page edges are when
 // zoomed/rotated. Pass any zero-size rect to disable the outline.
@@ -9586,6 +9653,12 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     g_needsPreviewPrep = true;
     g_current.samples.clear();
     g_liveEmitter.reset();
+    // Lock prediction's active state for the duration of this stroke.
+    // Mid-stroke toggles don't take effect until the next stroke so the
+    // coverage mirror can't desync (a toggle on→off mid-stroke would
+    // strand a predictionInFlight; off→on would force the next revert
+    // to read a stale g_coverageReal).
+    g_strokePredictionActive = g_predictionEnabled.load();
 }
 
 // Shared body for extendStroke / extendStrokePredicted. `persist=true`
@@ -9597,6 +9670,12 @@ static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
                              jfloat x, jfloat y, jfloat pressure,
                              bool persist) {
     ensureInited();
+    // Predicted dabs that arrive when the stroke isn't prediction-active
+    // (mid-stroke toggle, or simply prediction off) are silently
+    // dropped. The Kotlin side normally won't dispatch them, but this
+    // keeps the coverage mirror coherent if the runtime flag flipped
+    // after beginStroke.
+    if (!persist && !g_strokePredictionActive) return;
     if (persist) g_current.samples.push_back({x, y, pressure});
 
     // Both brush and eraser run through the same WYSIWYG preview pipeline:
@@ -9613,6 +9692,22 @@ static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
     if (g_needsPreviewPrep) {
         preparePreviewBuffers(env, width, height, transform);
         g_needsPreviewPrep = false;
+    }
+
+    // Real dabs after a run of predicted dabs: revert g_coverage to
+    // the mirrored real-only state and restore the emitter so the
+    // upcoming dab interpolates from the previous *real* position.
+    // Without this the predicted ink stays in g_coverage (visibly
+    // thickening the preview tip) and the next real dab interpolates
+    // from the predicted position (drift).
+    if (persist && g_predictionInFlight) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_coverageReal.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_coverage.fbo);
+        glBlitFramebuffer(0, 0, width, height,
+                          0, 0, width, height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        g_liveEmitter = g_liveEmitterReal;
+        g_predictionInFlight = false;
     }
 
     // Step 1: accumulate this dab's coverage into g_coverage. RGB is
@@ -9642,6 +9737,23 @@ static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
     }
     g_liveEmitter.extend(x, y, pressure);
     glBindVertexArray(0);
+
+    // After a real dab, mirror coverage + emitter so the next predicted
+    // run can be reverted cleanly. Only paid when prediction is active
+    // for this stroke — otherwise the blit is wasted GPU time. After a
+    // predicted dab, flag that a revert is owed.
+    if (persist) {
+        if (g_strokePredictionActive) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, g_coverage.fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_coverageReal.fbo);
+            glBlitFramebuffer(0, 0, width, height,
+                              0, 0, width, height,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            g_liveEmitterReal = g_liveEmitter;
+        }
+    } else {
+        g_predictionInFlight = true;
+    }
 
     // Step 2: re-render the front-buffer overlay using the unified
     // preview shader. The mode uniform selects brush vs. eraser fullColor
@@ -9695,6 +9807,144 @@ Java_com_bk_drawing_NativeRenderer_extendStrokePredicted(
         jfloat x, jfloat y, jfloat pressure) {
     extendStrokeImpl(env, width, height, transform, x, y, pressure,
                      /*persist=*/false);
+}
+
+// Batched stroke extension. xyp is [x,y,p, x,y,p, ...]; the first
+// realCount triples are real samples (push to g_current.samples and
+// mirror coverage afterwards); the rest are predicted (live preview
+// only, reverted at the next batch). The batch does its dab work
+// inline but the expensive coverage mirror and front-buffer overlay
+// run ONCE at the appropriate boundaries, regardless of sample count
+// — the per-sample versions of these would otherwise dominate GL
+// thread time inside a single MotionEvent and build queue
+// backpressure on long strokes.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
+        JNIEnv* env, jobject,
+        jint width, jint height,
+        jfloatArray transform,
+        jfloatArray xypArr, jint realCount) {
+    ensureInited();
+
+    jsize len = env->GetArrayLength(xypArr);
+    if (len <= 0 || (len % 3) != 0) return;
+    int total = len / 3;
+    if (realCount < 0)     realCount = 0;
+    if (realCount > total) realCount = total;
+    int predCount = total - realCount;
+
+    // Copy out once. Dab loops below want random access without per-
+    // element JNI overhead; the array is small (typically <30 floats).
+    std::vector<float> xyp(static_cast<size_t>(len));
+    env->GetFloatArrayRegion(xypArr, 0, len, xyp.data());
+
+    // Persist real samples for the eventual bake.
+    for (int i = 0; i < realCount; ++i) {
+        g_current.samples.push_back(
+            { xyp[i * 3], xyp[i * 3 + 1], xyp[i * 3 + 2] });
+    }
+
+    // Drop predicted dabs entirely if the stroke didn't begin with
+    // prediction active — keeps coverage mirror coherent across
+    // mid-stroke toggles (the snapshot taken at beginStroke wins).
+    if (!g_strokePredictionActive) predCount = 0;
+
+    GLint frontFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &frontFbo);
+
+    if (g_needsPreviewPrep) {
+        preparePreviewBuffers(env, width, height, transform);
+        g_needsPreviewPrep = false;
+    }
+
+    // Revert any predictions left over from the previous batch before
+    // applying new real dabs. Only reaches here if g_strokePredictionActive
+    // (the only path that sets predictionInFlight).
+    if (realCount > 0 && g_predictionInFlight) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_coverageReal.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_coverage.fbo);
+        glBlitFramebuffer(0, 0, width, height,
+                          0, 0, width, height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        g_liveEmitter = g_liveEmitterReal;
+        g_predictionInFlight = false;
+    }
+
+    // Bind coverage + dab program ONCE for the whole batch.
+    float coverageRgba[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
+    glBindFramebuffer(GL_FRAMEBUFFER, g_coverage.fbo);
+    glViewport(0, 0, width, height);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_dab.program);
+    glBindVertexArray(g_quadVao);
+    uploadMat4(env, g_dab.uTransform, transform);
+    glUniform2f(g_dab.uScreen, (float)width, (float)height);
+    glUniform4fv(g_dab.uColor, 1, coverageRgba);
+    glUniform1f(g_dab.uHardness, g_strokeBrushHardness);
+    {
+        PageClip pageClip = readPageClip();
+        uploadPageClip(g_dab.uPageMin, g_dab.uPageMax,
+                       g_dab.uPageActive, pageClip);
+    }
+
+    // Real dabs first.
+    for (int i = 0; i < realCount; ++i) {
+        g_liveEmitter.extend(
+            xyp[i * 3], xyp[i * 3 + 1], xyp[i * 3 + 2]);
+    }
+
+    // Single mirror at the end of the real region — captures the
+    // post-real coverage and emitter state for the next revert.
+    if (realCount > 0 && g_strokePredictionActive) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_coverage.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_coverageReal.fbo);
+        glBlitFramebuffer(0, 0, width, height,
+                          0, 0, width, height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        g_liveEmitterReal = g_liveEmitter;
+        // Re-bind coverage as the draw target for predicted dabs.
+        glBindFramebuffer(GL_FRAMEBUFFER, g_coverage.fbo);
+    }
+
+    // Predicted dabs.
+    if (predCount > 0) {
+        for (int i = realCount; i < total; ++i) {
+            g_liveEmitter.extend(
+                xyp[i * 3], xyp[i * 3 + 1], xyp[i * 3 + 2]);
+        }
+        g_predictionInFlight = true;
+    }
+
+    glBindVertexArray(0);
+
+    // Single front-buffer overlay render — the only thing the user
+    // actually sees from this batch. Same shader setup as the
+    // per-sample path used to do, just done once.
+    glBindFramebuffer(GL_FRAMEBUFFER, frontFbo);
+    glViewport(0, 0, width, height);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_preview.program);
+    glBindVertexArray(g_quadVao);
+    glUniform1i(g_preview.uBelow,    0);
+    glUniform1i(g_preview.uAbove,    1);
+    glUniform1i(g_preview.uCoverage, 2);
+    glUniform1i(g_preview.uMode,     g_strokeTool);
+    glUniform3fv(g_preview.uBrushRgb, 1, g_strokeBrushColor);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_belowFbo.texture);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_aboveFbo.texture);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, g_coverage.texture);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
 }
 
 JNIEXPORT void JNICALL
