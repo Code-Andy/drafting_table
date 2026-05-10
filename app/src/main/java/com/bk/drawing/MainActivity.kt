@@ -153,6 +153,11 @@ class MainActivity : AppCompatActivity() {
     private var vectorLineWidth = 2.0f
     private var brushAlpha = 1.0f
     private var brushHardness = 1.0f
+    // Pressure saturation in (0, 1]. Slider value / 100 — see
+    // DrawingSurfaceView.brushPressureSaturation for the mapping
+    // semantics. 1.0 = full pen range (default), 0.5 = pen maxes out
+    // at half its raw range, etc.
+    private var brushPressureSaturation = 1.0f
     private var bucketBleed = 2
     private val kBucketBleedMax = 16
     private val kPrefBrushSize     = "brush_size_scale"
@@ -160,6 +165,7 @@ class MainActivity : AppCompatActivity() {
     private val kPrefStylusOnly    = "stylus_only"
     private val kPrefBrushAlpha    = "brush_alpha"
     private val kPrefBrushHardness = "brush_hardness"
+    private val kPrefBrushPressure = "brush_pressure_sat"
     private val kPrefBucketBleed   = "bucket_bleed"
     private val kBrushSizeMin = 0.25f
     private val kBrushSizeMax = 4.0f
@@ -277,6 +283,8 @@ class MainActivity : AppCompatActivity() {
             .coerceIn(0.0f, 1.0f)
         brushHardness = prefs().getFloat(kPrefBrushHardness, 1.0f)
             .coerceIn(0.0f, 1.0f)
+        brushPressureSaturation = prefs().getFloat(kPrefBrushPressure, 1.0f)
+            .coerceIn(0.0f, 1.0f)
         bucketBleed = prefs().getInt(kPrefBucketBleed, 2)
             .coerceIn(0, kBucketBleedMax)
         NativeRenderer.setBrushSize(brushSizeScale)
@@ -333,6 +341,7 @@ class MainActivity : AppCompatActivity() {
             v.onLineAngleChanged = { deg -> showLineAngle(deg) }
             v.onPenPosition = { x, y, _ -> updateBrushPreview(x, y) }
             v.onPenLeft     = { brushPreviewView.hide() }
+            v.brushPressureSaturation = brushPressureSaturation
             bodyContainer.addView(
                 v,
                 FrameLayout.LayoutParams(
@@ -1286,12 +1295,11 @@ class MainActivity : AppCompatActivity() {
         brushHardRow = buildBrushHardnessRow()
         container.addView(brushHardRow)
 
-        // Disabled stub — placeholder for future pressure curve.
-        brushPressRow = buildSliderRow(
-            makeStubSliderLabel("press"),
-            makeStubSlider(),
-            makeStubValueLabel("—")
-        )
+        // press slider — pen-pressure saturation point. 100 = full pen
+        // range; lower values make the pen reach max effective pressure
+        // sooner (e.g. 50 = max at half the raw pen output). 0 = always
+        // full pressure (pressure-insensitive).
+        brushPressRow = buildBrushPressureRow()
         container.addView(brushPressRow)
 
         // Bucket-only bleed slider. Hidden by default; shown when the
@@ -1372,6 +1380,41 @@ class MainActivity : AppCompatActivity() {
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     prefs().edit().putInt(kPrefBucketBleed, bucketBleed).apply()
+                }
+            })
+        }
+        return buildSliderRow(label, slider, valueLabel)
+    }
+
+    private fun buildBrushPressureRow(): View {
+        val label = TextView(this).apply {
+            text = "press"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        val valueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.ink))
+            gravity = Gravity.END
+            text = (brushPressureSaturation * 100).toInt().toString()
+        }
+        val slider = SeekBar(this).apply {
+            max = 100
+            progress = (brushPressureSaturation * 100).toInt().coerceIn(0, 100)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    valueLabel.text = p.toString()
+                    if (!fromUser) return
+                    brushPressureSaturation = p / 100f
+                    drawingView?.brushPressureSaturation = brushPressureSaturation
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    prefs().edit()
+                        .putFloat(kPrefBrushPressure, brushPressureSaturation)
+                        .apply()
                 }
             })
         }

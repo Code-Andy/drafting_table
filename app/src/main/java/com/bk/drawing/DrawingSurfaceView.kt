@@ -619,6 +619,25 @@ class DrawingSurfaceView @JvmOverloads constructor(
     var onPenPosition: ((x: Float, y: Float, hovering: Boolean) -> Unit)? = null
     var onPenLeft: (() -> Unit)? = null
 
+    /** Pen-pressure saturation point in (0, 1]. Raw pen pressure is
+     *  divided by this and clamped to [0, 1] before being baked into a
+     *  dab's radius/alpha — so 1.0 leaves the full pen range intact,
+     *  0.5 makes the pen "max out" at half its raw range, etc. 0.0 is
+     *  treated as "always full pressure" (pressure-insensitive mode).
+     *  Set from MainActivity's brush-press slider. */
+    var brushPressureSaturation: Float = 1.0f
+
+    private fun mapPressure(raw: Float): Float {
+        val sat = brushPressureSaturation
+        if (sat <= 0f) return 1f
+        val v = raw / sat
+        return when {
+            v < 0f -> 0f
+            v > 1f -> 1f
+            else   -> v
+        }
+    }
+
     private fun handleStylusButton(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) {
             val ab = event.actionButton
@@ -1283,7 +1302,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
             MotionEvent.ACTION_DOWN -> {
                 viewToDoc(event.x, event.y, tmpDoc)
                 r.renderFrontBufferedLayer(
-                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1], event.pressure,
+                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1],
+                                        mapPressure(event.pressure),
                                         isNewStroke = true)
                 )
             }
@@ -1293,14 +1313,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     r.renderFrontBufferedLayer(
                         StrokeAction.Sample(
                             tmpDoc[0], tmpDoc[1],
-                            event.getHistoricalPressure(i),
+                            mapPressure(event.getHistoricalPressure(i)),
                             isNewStroke = false
                         )
                     )
                 }
                 viewToDoc(event.x, event.y, tmpDoc)
                 r.renderFrontBufferedLayer(
-                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1], event.pressure,
+                    StrokeAction.Sample(tmpDoc[0], tmpDoc[1],
+                                        mapPressure(event.pressure),
                                         isNewStroke = false)
                 )
             }
