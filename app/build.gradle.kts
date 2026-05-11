@@ -23,6 +23,8 @@ android {
                 cppFlags += "-std=c++20"
             }
         }
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     externalNativeBuild {
@@ -58,4 +60,11 @@ dependencies {
 
     // Stylus input prediction — used in Spike 2.
     implementation("androidx.input:input-motionprediction:1.0.0-beta04")
+
+    // Instrumented (on-device) test harness for renderer fidelity tests.
+    // Runs against the connected tablet with a private EGL pbuffer
+    // context — no UI, no SurfaceView. See app/src/androidTest/.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }

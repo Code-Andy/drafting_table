@@ -56,6 +56,7 @@
 #include <GLES3/gl3.h>
 #include <android/bitmap.h>
 #include <android/log.h>
+#include <android/trace.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -79,6 +80,22 @@
 #define LOG_TAG "DrawingApp"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// RAII wrapper for ATrace sections. Sections nest naturally with C++
+// scopes, and the destructor closes them so early returns don't leak
+// an unmatched begin. ATrace events show up alongside the rest of the
+// system in perfetto / systrace captures, time-correlated with vsync,
+// SurfaceFlinger transactions, scheduler events, etc. Cost when
+// tracing is OFF: one branch (ATrace_isEnabled is cheap).
+struct ATraceScope {
+    explicit ATraceScope(const char* name) {
+        if (ATrace_isEnabled()) ATrace_beginSection(name);
+    }
+    ~ATraceScope() {
+        if (ATrace_isEnabled()) ATrace_endSection();
+    }
+};
+#define ATRACE_SCOPE(name) ATraceScope _atrace_scope_##__LINE__(name)
 
 namespace {
 
@@ -1309,11 +1326,34 @@ struct UndoEntry {
     UndoOp op = UndoOp::RasterStroke;
     size_t layerIdx = 0;
 
-    // RasterStroke: tile state before / after the bake (snapshots cover
-    //   the same tx,ty grid in both arrays in the same order).
-    // LayerClear:   beforeTiles holds the pre-clear tile state (raster).
+    // RasterStroke: tile state before the bake. Redo doesn't need an
+    //   afterTiles snapshot — it re-bakes from rebakeSamples instead,
+    //   which is orders of magnitude cheaper in memory (samples + a
+    //   brush snapshot are ~tens to hundreds of bytes vs kTileBytes
+    //   per tile for full pixel storage).
+    // LayerClear / RasterizeShapeBelow / MergeLayerDown still use
+    //   beforeTiles + afterTiles in the classic before/after style.
     std::vector<TileSnap> beforeTiles;
     std::vector<TileSnap> afterTiles;
+
+    // RasterStroke: inputs needed to reproduce the bake on redo. The
+    // bake is deterministic given these + the pre-stroke tile state
+    // restored by beforeTiles, so redo runs bakeCurrentStrokeIntoTiles
+    // against the freshly-undone tiles to recreate the post-stroke
+    // pixels bit-identically.
+    std::vector<Sample> rebakeSamples;
+    float rebakeBrushColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float rebakeBrushAlpha    = 1.0f;
+    float rebakeBrushSize     = 1.0f;
+    float rebakeBrushHardness = 1.0f;
+    int   rebakeTool          = 0;
+    // Page-clip snapshot — the bake's edge clipping depends on the
+    // page bounds at bake time, so we capture and restore them.
+    bool  rebakePageActive    = false;
+    float rebakePageX0        = 0.0f;
+    float rebakePageY0        = 0.0f;
+    float rebakePageX1        = 0.0f;
+    float rebakePageY1        = 0.0f;
 
     // VectorAdd:    afterShape  = pushed shape; shapeIdx = its index.
     // VectorDelete: beforeShape = removed shape; shapeIdx = original index.
@@ -1458,12 +1498,15 @@ std::atomic<int> g_clipboardKind{0};
 size_t computeEntrySize(const UndoEntry& e) {
     size_t s = sizeof(UndoEntry);
     // TileSnap.bytes is a shared_ptr — over-counts when buffers are
-    // shared across snaps (e.g. BEFORE of stroke N+1 shares with
-    // AFTER of stroke N), which means the undo budget evicts a bit
+    // shared across snaps (e.g. a BEFORE that shares storage with a
+    // sibling op's AFTER), which means the undo budget evicts a bit
     // more aggressively than physical memory dictates. Acceptable;
     // accurate accounting would require pointer-set bookkeeping.
     for (const auto& t : e.beforeTiles) s += t.bytes ? t.bytes->size() : 0;
     for (const auto& t : e.afterTiles)  s += t.bytes ? t.bytes->size() : 0;
+    // Rebake inputs (RasterStroke). Tiny compared to tile pixels —
+    // a stroke of N samples costs ~12 N bytes.
+    s += e.rebakeSamples.size() * sizeof(Sample);
     s += e.beforeLines.size()    * sizeof(Line);
     s += e.beforeRects.size()    * sizeof(Rect);
     s += e.beforeEllipses.size() * sizeof(Ellipse);
@@ -4829,6 +4872,88 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 }
 
+// Replay a raster stroke's bake using inputs captured in the undo
+// entry. Called from applyEntryForward (redo) on RasterStroke entries
+// in place of the older "memcpy afterTiles back" path. The bake is
+// deterministic given these inputs, so the result is bit-identical to
+// the original commit (this is the property the BakeFidelityTest
+// suite verifies). Saves the per-stroke brush + page-clip state,
+// installs the entry's snapshot, bakes, persists dirty tiles to disk,
+// then restores the prior state so subsequent strokes / live preview
+// resume with the user's current brush.
+static void rebakeStroke(const UndoEntry& e) {
+    if (e.rebakeSamples.empty()) return;
+    if (e.layerIdx >= layers().size() || !layers()[e.layerIdx]) return;
+
+    // Snapshot brush + sample + page-clip state we're about to
+    // overwrite. These are all GL-thread globals so no locking
+    // required beyond the page-bounds mutex.
+    float saveColor[4] = {
+        g_strokeBrushColor[0], g_strokeBrushColor[1],
+        g_strokeBrushColor[2], g_strokeBrushColor[3]
+    };
+    float saveAlpha = g_strokeBrushAlpha;
+    float saveSize  = g_strokeBrushSizeScale;
+    float saveHard  = g_strokeBrushHardness;
+    int   saveTool  = g_strokeTool;
+    std::vector<Sample> saveSamples = std::move(g_current.samples);
+    g_current.samples.clear();
+    float savePageX0, savePageY0, savePageX1, savePageY1;
+    {
+        std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
+        savePageX0 = g_pageX0; savePageY0 = g_pageY0;
+        savePageX1 = g_pageX1; savePageY1 = g_pageY1;
+    }
+
+    // Install the entry's snapshot.
+    g_strokeBrushColor[0] = e.rebakeBrushColor[0];
+    g_strokeBrushColor[1] = e.rebakeBrushColor[1];
+    g_strokeBrushColor[2] = e.rebakeBrushColor[2];
+    g_strokeBrushColor[3] = e.rebakeBrushColor[3];
+    g_strokeBrushAlpha     = e.rebakeBrushAlpha;
+    g_strokeBrushSizeScale = e.rebakeBrushSize;
+    g_strokeBrushHardness  = e.rebakeBrushHardness;
+    g_strokeTool           = e.rebakeTool;
+    g_current.samples      = e.rebakeSamples;     // copy (re-bakeable)
+    {
+        std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
+        if (e.rebakePageActive) {
+            g_pageX0 = e.rebakePageX0; g_pageY0 = e.rebakePageY0;
+            g_pageX1 = e.rebakePageX1; g_pageY1 = e.rebakePageY1;
+        } else {
+            // Inactive snapshot — leave bounds as a zero-size rect so
+            // readPageClip returns inactive.
+            g_pageX0 = 0; g_pageY0 = 0; g_pageX1 = 0; g_pageY1 = 0;
+        }
+    }
+
+    // Bake + persist. bakeCurrentStrokeIntoTiles clears g_current.samples
+    // at the end (matching the production commit flow); the disk save
+    // mirrors the post-bake bytes into each tile's cachedBytes so any
+    // future BEFORE snapshot reads from the cache rather than glReadPixels.
+    std::vector<int64_t> dirty;
+    bakeCurrentStrokeIntoTiles(&dirty, e.layerIdx);
+    for (int64_t k : dirty) {
+        saveTileToDisk(e.layerIdx, k);
+    }
+
+    // Restore.
+    g_strokeBrushColor[0] = saveColor[0];
+    g_strokeBrushColor[1] = saveColor[1];
+    g_strokeBrushColor[2] = saveColor[2];
+    g_strokeBrushColor[3] = saveColor[3];
+    g_strokeBrushAlpha     = saveAlpha;
+    g_strokeBrushSizeScale = saveSize;
+    g_strokeBrushHardness  = saveHard;
+    g_strokeTool           = saveTool;
+    g_current.samples      = std::move(saveSamples);
+    {
+        std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
+        g_pageX0 = savePageX0; g_pageY0 = savePageY0;
+        g_pageX1 = savePageX1; g_pageY1 = savePageY1;
+    }
+}
+
 // ---- Compose --------------------------------------------------------------
 
 // Helper: bind the raster compositing pipeline (program + uniforms).
@@ -6258,7 +6383,11 @@ void applyEntryReverse(UndoEntry& e) {
 void applyEntryForward(UndoEntry& e) {
     switch (e.op) {
         case UndoOp::RasterStroke: {
-            for (const auto& s : e.afterTiles) applyTileSnap(e.layerIdx, s);
+            // Replay the bake from stored samples + brush state rather
+            // than memcpy'ing afterTiles back. Deterministic given the
+            // pre-stroke tile state that reverse() restored — see
+            // rebakeStroke + BakeFidelityTest.
+            rebakeStroke(e);
             break;
         }
         case UndoOp::VectorAdd: {
@@ -6826,8 +6955,14 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
             liftedTiles.push_back(std::move(snap));
 
             // (b) Copy the tile's intersection into the content texture.
-            // Source coords are in tile-local doc-coord space; the
-            // apron offset translates them to FBO coords.
+            // glCopyTexSubImage2D reads from GL_READ_FRAMEBUFFER, so
+            // bind the tile FBO explicitly. The cache-hit path in
+            // step (a) skips the bind that the old (always-readback)
+            // code relied on, so without this we'd copy from
+            // whatever framebuffer was bound before — usually the
+            // previous iteration's tile, which produces the "lift
+            // shows a shifted region of the canvas" bug.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
             int srcX = ix0 - tileX0;
             int srcY = iy0 - tileY0;
             int dstX = ix0 - rectIX0;
@@ -10021,6 +10156,7 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
         jint width, jint height,
         jfloatArray transform,
         jfloatArray xypArr, jint realCount) {
+    ATRACE_SCOPE("DrawingApp.extendStrokeBatch");
     ensureInited();
 
     jsize len = env->GetArrayLength(xypArr);
@@ -10140,6 +10276,7 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
 
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
+    ATRACE_SCOPE("DrawingApp.commitStroke");
     ensureInited();
 
     GLint prevFbo = 0;
@@ -10165,6 +10302,26 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
         entry.op = UndoOp::RasterStroke;
         entry.layerIdx = layerIdx;
         snapshotTilesInBbox(layerIdx, tx0, tx1, ty0, ty1, entry.beforeTiles);
+
+        // Capture the rebake inputs while g_current.samples is still
+        // populated and the brush snapshot is still the one the bake
+        // is about to run with. Copy (not move) so the bake below can
+        // still walk g_current.samples.
+        entry.rebakeSamples       = g_current.samples;
+        entry.rebakeBrushColor[0] = g_strokeBrushColor[0];
+        entry.rebakeBrushColor[1] = g_strokeBrushColor[1];
+        entry.rebakeBrushColor[2] = g_strokeBrushColor[2];
+        entry.rebakeBrushColor[3] = g_strokeBrushColor[3];
+        entry.rebakeBrushAlpha    = g_strokeBrushAlpha;
+        entry.rebakeBrushSize     = g_strokeBrushSizeScale;
+        entry.rebakeBrushHardness = g_strokeBrushHardness;
+        entry.rebakeTool          = g_strokeTool;
+        PageClip pc = readPageClip();
+        entry.rebakePageActive    = pc.active;
+        entry.rebakePageX0        = pc.minX;
+        entry.rebakePageY0        = pc.minY;
+        entry.rebakePageX1        = pc.maxX;
+        entry.rebakePageY1        = pc.maxY;
     } else {
         snapForUndo = false;
     }
@@ -10172,72 +10329,19 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     std::vector<int64_t> dirty;
     bakeCurrentStrokeIntoTiles(&dirty, layerIdx);
 
-    if (snapForUndo) {
-        // Combined pass: readback each bbox tile once and reuse the bytes
-        // for both the undo's after-snapshot AND the on-disk save. This
-        // avoids reading every dirty tile twice (once for save, once for
-        // snapshot) — important because glReadPixels stalls the pipeline
-        // and the front-buffered renderer's commit can otherwise overrun
-        // a vsync, briefly double-rendering the stroke during the swap.
-        Layer& layer = *layers()[layerIdx];
-        size_t cellCount = static_cast<size_t>((tx1 - tx0 + 1))
-                         * static_cast<size_t>((ty1 - ty0 + 1));
-        entry.afterTiles.reserve(cellCount);
-        GLint prevFboInner = 0;
-        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFboInner);
-        for (int ty = ty0; ty <= ty1; ++ty) {
-            for (int tx = tx0; tx <= tx1; ++tx) {
-                TileSnap snap;
-                snap.tx = tx; snap.ty = ty;
-                auto it = layer.tiles.find(tileKey(tx, ty));
-                if (it != layer.tiles.end()) {
-                    snap.existed = true;
-                    auto fresh = tilePool().acquire();
-                    glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-                    glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
-                    // Mirror the post-bake bytes into the BEFORE-
-                    // snapshot cache so the NEXT stroke's commit
-                    // doesn't need to glReadPixels for the BEFORE
-                    // pass — it reads straight from the cache.
-                    it->second.cachedBytes = fresh;
-                    snap.bytes = fresh;
-                    writeTileBytesToDisk(layerIdx, tx, ty, fresh->data());
-                }
-                entry.afterTiles.push_back(std::move(snap));
-            }
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, prevFboInner);
+    // Persist each dirty tile and refresh its cache. saveTileToDisk
+    // does the glReadPixels + queue + cache update in one pass.
+    for (int64_t k : dirty) {
+        saveTileToDisk(layerIdx, k);
+    }
 
-        bool changed = entry.beforeTiles.size() == entry.afterTiles.size();
-        if (changed) {
-            // Confirm at least one tile differs (avoids a useless entry
-            // when, e.g., the stroke missed every pixel of every tile).
-            // shared_ptr equality is a fast pointer compare; differ via
-            // memcmp only when the pointers point at different buffers.
-            changed = false;
-            for (size_t i = 0; i < entry.beforeTiles.size(); ++i) {
-                const auto& b = entry.beforeTiles[i];
-                const auto& a = entry.afterTiles[i];
-                if (b.existed != a.existed) {
-                    changed = true; break;
-                }
-                if (!b.existed) continue;
-                if (b.bytes == a.bytes) continue;            // same buffer = no change
-                if (!b.bytes || !a.bytes) { changed = true; break; }
-                if (b.bytes->size() != a.bytes->size()
-                    || std::memcmp(b.bytes->data(),
-                                   a.bytes->data(),
-                                   b.bytes->size()) != 0) {
-                    changed = true; break;
-                }
-            }
-        }
-        if (changed) pushUndoEntry(std::move(entry));
-    } else {
-        for (int64_t k : dirty) {
-            saveTileToDisk(layerIdx, k);
-        }
+    // Push the undo entry if anything was actually drawn. We don't
+    // need a memcmp diff vs an after-snapshot anymore — a non-empty
+    // dirty list means the bake touched real pixels, and redo will
+    // reproduce the same result by re-baking from the captured
+    // samples.
+    if (snapForUndo && !dirty.empty()) {
+        pushUndoEntry(std::move(entry));
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
@@ -10249,11 +10353,96 @@ Java_com_bk_drawing_NativeRenderer_renderDocument(
         JNIEnv* env, jobject,
         jint width, jint height,
         jfloatArray transform) {
+    ATRACE_SCOPE("DrawingApp.renderDocument");
     ensureInited();
     ensureLoaded();
     applyPendingLayerActions();
     applyPendingShapes();
     compositeAllLayers(env, width, height, transform);
+}
+
+// ---- Test-only JNI access ------------------------------------------------
+//
+// Used by the androidTest fidelity suite to read tile state and apply
+// pending undo/redo without going through compositeAllLayers (which
+// would require an output FBO). Not called from production code.
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_flushPendingActions(JNIEnv*, jobject) {
+    ensureInited();
+    ensureLoaded();
+    applyPendingLayerActions();
+    applyPendingShapes();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getLayerTileCount(
+        JNIEnv*, jobject, jint layerIdx) {
+    ensureInited();
+    ensureLoaded();
+    if (layerIdx < 0 || static_cast<size_t>(layerIdx) >= layers().size()
+        || !layers()[layerIdx]) return 0;
+    return static_cast<jint>(layers()[layerIdx]->tiles.size());
+}
+
+// Flat [tx, ty, tx, ty, …] of every existing tile in the layer.
+// Order is insertion-order from the underlying map; tests should sort
+// before comparing if they care.
+JNIEXPORT jintArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getLayerTileCoords(
+        JNIEnv* env, jobject, jint layerIdx) {
+    ensureInited();
+    ensureLoaded();
+    if (layerIdx < 0 || static_cast<size_t>(layerIdx) >= layers().size()
+        || !layers()[layerIdx]) return env->NewIntArray(0);
+    const auto& tiles = layers()[layerIdx]->tiles;
+    std::vector<jint> coords;
+    coords.reserve(tiles.size() * 2);
+    for (const auto& kv : tiles) {
+        int tx, ty;
+        unpackTileKey(kv.first, tx, ty);
+        coords.push_back(tx);
+        coords.push_back(ty);
+    }
+    jintArray out = env->NewIntArray(static_cast<jsize>(coords.size()));
+    env->SetIntArrayRegion(out, 0, static_cast<jsize>(coords.size()),
+                           coords.data());
+    return out;
+}
+
+// Returns the kTileBytes interior pixels of a tile, or null if the
+// tile doesn't exist. Reads from the CPU-side cache when populated
+// (zero-cost) and falls back to glReadPixels otherwise.
+JNIEXPORT jbyteArray JNICALL
+Java_com_bk_drawing_NativeRenderer_readTileBytes(
+        JNIEnv* env, jobject, jint layerIdx, jint tx, jint ty) {
+    ensureInited();
+    ensureLoaded();
+    if (layerIdx < 0 || static_cast<size_t>(layerIdx) >= layers().size()
+        || !layers()[layerIdx]) return nullptr;
+    auto& tiles = layers()[layerIdx]->tiles;
+    auto it = tiles.find(tileKey(tx, ty));
+    if (it == tiles.end()) return nullptr;
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(kTileBytes));
+    if (!out) return nullptr;
+    if (it->second.cachedBytes
+        && it->second.cachedBytes->size() == kTileBytes) {
+        env->SetByteArrayRegion(
+            out, 0, static_cast<jsize>(kTileBytes),
+            reinterpret_cast<const jbyte*>(it->second.cachedBytes->data()));
+    } else {
+        std::vector<uint8_t> buf(kTileBytes);
+        GLint prev = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev);
+        glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+        glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                     GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+        glBindFramebuffer(GL_FRAMEBUFFER, prev);
+        env->SetByteArrayRegion(
+            out, 0, static_cast<jsize>(kTileBytes),
+            reinterpret_cast<const jbyte*>(buf.data()));
+    }
+    return out;
 }
 
 }  // extern "C"

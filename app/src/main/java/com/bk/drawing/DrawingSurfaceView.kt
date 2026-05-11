@@ -179,6 +179,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
             transform: FloatArray,
             param: StrokeAction
         ) {
+            android.os.Trace.beginSection("DrawingApp.onDrawFrontBufferedLayer")
+            try {
             // Native shaders expect `transform` to be doc-pixel →
             // buffer-pixel; compose the framework's view→buffer with our
             // current doc→view here.
@@ -221,6 +223,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     )
                 }
             }
+            } finally {
+                android.os.Trace.endSection()
+            }
         }
 
         override fun onDrawMultiBufferedLayer(
@@ -231,6 +236,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
             transform: FloatArray,
             params: Collection<StrokeAction>
         ) {
+            android.os.Trace.beginSection("DrawingApp.onDrawMultiBufferedLayer")
+            try {
             val composed = composedTransform(transform)
             // Only commit a brush/eraser stroke if this batch actually
             // contained Sample entries. Line previews go through here too
@@ -330,6 +337,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     }
                 }
                 post { exportReq.onComplete() }
+            }
+            } finally {
+                android.os.Trace.endSection()
             }
         }
     }

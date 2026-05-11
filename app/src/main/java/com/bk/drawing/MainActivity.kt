@@ -145,7 +145,19 @@ class MainActivity : AppCompatActivity() {
     private var currentToolMirror: Tool = Tool.BRUSH
     private val kPrefsName = "drawing_app_prefs"
     private val kPrefLastDoc = "last_doc"
-    private val kDocumentsRootName = "documents"
+    // Top-level folder name on shared storage. Visible in the Files
+    // app and through USB; matches the "AppName/" convention other
+    // drawing apps use (Clip Studio Paint/, Wacom Canvas/, etc.).
+    private val kDocumentsRootName = "Drafting Table"
+    // Set true once setDocumentDir has been called with a real path.
+    // The whole document-init flow (migration + initial doc choice
+    // + sidebar rebuild) waits for the MANAGE_EXTERNAL_STORAGE
+    // permission to be granted; if the user grants from the settings
+    // screen and returns, onResume retries.
+    private var docsInitialized = false
+    // Modal "permission required" dialog. Held so onResume can dismiss
+    // it once permission is granted.
+    private var storagePermissionDialog: android.app.AlertDialog? = null
     private var currentDocName: String = ""
 
     // ---- Brush + vector width (single slider routes to the right one) --
@@ -268,18 +280,9 @@ class MainActivity : AppCompatActivity() {
         }
         loadFonts()
 
-        // Migrate the legacy single-doc layout, then pick which document
-        // to open: last-used (if it still exists), the only doc on disk,
-        // or a fresh "Untitled 1".
-        migrateLegacyDocumentIfNeeded()
-        val available = listDocumentNames()
-        val initialDoc = lastOpenedDocName()?.takeIf { it in available }
-            ?: available.firstOrNull()
-            ?: nextUntitledName()
-        currentDocName = initialDoc
-        rememberDocName(initialDoc)
-        val docDir = docDirFor(initialDoc).apply { mkdirs() }
-        NativeRenderer.setDocumentDir(docDir.absolutePath)
+        // Document init is deferred to ensureStoragePermissionThenInitDocs()
+        // at the end of onCreate — documents live in /sdcard/Drafting Table/
+        // now, which requires the MANAGE_EXTERNAL_STORAGE permission.
 
         // Restore brush size + vector width + opacity and push to native.
         brushSizeScale = prefs().getFloat(kPrefBrushSize, 1.0f)
@@ -452,13 +455,24 @@ class MainActivity : AppCompatActivity() {
         // Push the persisted color into native and reflect it in the chip.
         NativeRenderer.setBrushColor(currentColorRgb)
         updateColorChip()
-        // Pull real layer/page state. setDocumentDir already populated
-        // metadata synchronously, so this can run as soon as the layout
-        // is up — no need to race the GL thread's lazy ensureLoaded.
-        canvas.post {
-            syncLayerStateFromNative()
-            rebuildSidebar()
-            rebuildLayerList()
+
+        // Gate the rest of the document init on the
+        // MANAGE_EXTERNAL_STORAGE permission. If granted, picks the
+        // initial doc and rebuilds the sidebar; otherwise shows a
+        // modal dialog and retries from onResume after the user comes
+        // back from settings.
+        ensureStoragePermissionThenInitDocs()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // User may have just returned from the system settings page
+        // after granting "All files access". Retry doc init.
+        if (!docsInitialized
+            && android.os.Environment.isExternalStorageManager()) {
+            storagePermissionDialog?.dismiss()
+            storagePermissionDialog = null
+            initializeDocuments()
         }
     }
 
@@ -2621,6 +2635,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showOverflowMenu(anchor: View) {
         showPaperPopupMenu(anchor, listOf(
+            PaperMenuItem("Backup all documents…")              { backupAllDocuments() },
             PaperMenuItem("Import image…")                      { launchImageImport() },
             PaperMenuItem("Export canvas as PNG…")              { launchCanvasPngExport() },
             PaperMenuItem("Export document as PDF…")            { launchDocumentPdfExport() },
@@ -2666,6 +2681,109 @@ class MainActivity : AppCompatActivity() {
 
     private fun launchDocumentPdfExport() {
         documentPdfLauncher.launch(defaultPdfFilename())
+    }
+
+    /**
+     * Zip every document under documentsRoot() and write the archive
+     * to the public Downloads folder. Survives uninstall of the app —
+     * a safety net against accidental data loss from rebuild/reinstall
+     * cycles (see the painful 2026-05-10 incident). Runs on a
+     * background thread; UI is notified via Toast on completion.
+     */
+    private fun backupAllDocuments() {
+        Thread {
+            val docsRoot = documentsRoot()
+            val message: String = try {
+                // Make sure any in-flight tile saves have hit disk
+                // before we snapshot the documents tree.
+                NativeRenderer.flushTileWrites()
+
+                if (!docsRoot.exists() ||
+                    docsRoot.listFiles()?.isEmpty() != false) {
+                    "No documents to back up."
+                } else {
+                    val ts = java.text.SimpleDateFormat(
+                        "yyyy-MM-dd-HHmmss", java.util.Locale.US
+                    ).format(java.util.Date())
+                    val filename = "drawing-backup-$ts.zip"
+                    val bytes = writeDocumentsZipToDownloads(docsRoot, filename)
+                    "Saved Downloads/$filename (${humanBytes(bytes)})"
+                }
+            } catch (t: Throwable) {
+                Log.e("DrawingApp", "backup failed", t)
+                "Backup failed: ${t.message}"
+            }
+            runOnUiThread {
+                android.widget.Toast.makeText(
+                    this, message, android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+        }.start()
+    }
+
+    /** Stream [docsRoot]'s tree into a zip in the system Downloads
+     *  collection. Returns the total uncompressed byte count for the
+     *  result toast. */
+    private fun writeDocumentsZipToDownloads(
+        docsRoot: File, filename: String
+    ): Long {
+        val values = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, filename)
+            put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/zip")
+            put(android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                android.os.Environment.DIRECTORY_DOWNLOADS)
+            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val collection = android.provider.MediaStore.Downloads.getContentUri(
+            android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY
+        )
+        val uri = contentResolver.insert(collection, values)
+            ?: throw java.io.IOException("could not create Downloads entry")
+        var totalBytes = 0L
+        try {
+            contentResolver.openOutputStream(uri).use { rawOut ->
+                if (rawOut == null) throw java.io.IOException(
+                    "could not open output stream for $uri")
+                java.util.zip.ZipOutputStream(rawOut).use { zip ->
+                    val basePath = docsRoot.absolutePath
+                    docsRoot.walkTopDown()
+                        .filter { it.isFile }
+                        .forEach { file ->
+                            val rel = file.absolutePath
+                                .removePrefix(basePath)
+                                .removePrefix(File.separator)
+                                .replace(File.separatorChar, '/')
+                            val entry = java.util.zip.ZipEntry("documents/$rel")
+                            entry.time = file.lastModified()
+                            zip.putNextEntry(entry)
+                            java.io.FileInputStream(file).use { fin ->
+                                totalBytes += fin.copyTo(zip)
+                            }
+                            zip.closeEntry()
+                        }
+                }
+            }
+            // Drop the pending flag so the file becomes visible to
+            // the user in the Files app.
+            val done = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+            }
+            contentResolver.update(uri, done, null, null)
+        } catch (t: Throwable) {
+            // Tear down the half-written file so the user doesn't end
+            // up with a corrupt zip in Downloads.
+            try { contentResolver.delete(uri, null, null) } catch (_: Throwable) {}
+            throw t
+        }
+        return totalBytes
+    }
+
+    private fun humanBytes(n: Long): String {
+        if (n < 1024) return "$n B"
+        val kb = n / 1024.0
+        if (kb < 1024) return String.format(java.util.Locale.US, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        return String.format(java.util.Locale.US, "%.1f MB", mb)
     }
 
     /** Compute the natural export resolution. Falls back to the SurfaceView
@@ -3121,8 +3239,19 @@ class MainActivity : AppCompatActivity() {
 
     // ---- Document I/O ---------------------------------------------------
 
+    /** Top-level folder on the device's shared storage, browsable from
+     *  the system Files app. Survives app uninstall. Requires the
+     *  MANAGE_EXTERNAL_STORAGE permission to access — see
+     *  ensureStoragePermissionThenInitDocs. */
     private fun documentsRoot(): File =
-        File(filesDir, kDocumentsRootName).apply { mkdirs() }
+        File(android.os.Environment.getExternalStorageDirectory(),
+             kDocumentsRootName).apply { mkdirs() }
+
+    /** Legacy private location used before the shared-storage move.
+     *  Read on first launch with the new build so existing documents
+     *  migrate forward; written only by migration. */
+    private fun legacyDocumentsRoot(): File =
+        File(filesDir, "documents")
 
     private fun docDirFor(name: String): File = File(documentsRoot(), name)
 
@@ -3139,16 +3268,164 @@ class MainActivity : AppCompatActivity() {
         return "Untitled $n"
     }
 
-    /** Move filesDir/document/ → filesDir/documents/document/ on first run. */
+    /** Move filesDir/document/ → documentsRoot()/document/ on first run.
+     *  Inherited from the original single-doc layout. */
     private fun migrateLegacyDocumentIfNeeded() {
         val legacy = File(filesDir, "document")
         if (!legacy.isDirectory) return
         val target = docDirFor("document")
         if (target.exists()) return
         if (!documentsRoot().exists()) documentsRoot().mkdirs()
-        if (!legacy.renameTo(target)) {
-            android.util.Log.e("DrawingApp", "failed to migrate legacy document/")
+        // Cross-volume rename usually fails — copy + delete is the
+        // robust path.
+        try {
+            legacy.copyRecursively(target, overwrite = false)
+            legacy.deleteRecursively()
+        } catch (t: Throwable) {
+            Log.e("DrawingApp", "failed to migrate legacy document/", t)
         }
+    }
+
+    /** Move docs from the old private filesDir/documents/ location to
+     *  the new shared-storage location at /sdcard/Drafting Table/.
+     *  Runs once on first launch after the relocation; subsequent runs
+     *  find an empty legacy dir and no-op. Verifies the file count
+     *  matches before deleting the source so a partial copy leaves
+     *  both copies intact. */
+    private fun migrateToExternalStorageIfNeeded() {
+        val legacy = legacyDocumentsRoot()
+        if (!legacy.isDirectory) return
+        val newRoot = documentsRoot()
+        val srcDocs = legacy.listFiles { f -> f.isDirectory } ?: return
+        if (srcDocs.isEmpty()) return
+        var migrated = 0
+        for (srcDoc in srcDocs) {
+            val targetDoc = File(newRoot, srcDoc.name)
+            if (targetDoc.exists()) continue        // name collision; skip
+            try {
+                srcDoc.copyRecursively(targetDoc, overwrite = false)
+                val srcCount = srcDoc.walkTopDown().count { it.isFile }
+                val dstCount = targetDoc.walkTopDown().count { it.isFile }
+                if (srcCount > 0 && srcCount == dstCount) {
+                    srcDoc.deleteRecursively()
+                    migrated++
+                } else {
+                    Log.e("DrawingApp",
+                        "migration verify failed for ${srcDoc.name}: " +
+                        "$srcCount → $dstCount; leaving both copies")
+                }
+            } catch (t: Throwable) {
+                Log.e("DrawingApp", "migration failed for ${srcDoc.name}", t)
+            }
+        }
+        if (migrated > 0) {
+            Log.i("DrawingApp",
+                "migrated $migrated document(s) to ${newRoot.absolutePath}")
+        }
+    }
+
+    /** First-launch (and post-grant) doc-init entry point. Gated on
+     *  the MANAGE_EXTERNAL_STORAGE permission — if it isn't granted,
+     *  shows the permission dialog and returns; onResume retries
+     *  after the user comes back from settings. */
+    private fun ensureStoragePermissionThenInitDocs() {
+        if (android.os.Environment.isExternalStorageManager()) {
+            initializeDocuments()
+        } else {
+            showStorageAccessRequiredDialog()
+        }
+    }
+
+    /** Run migrations, pick the initial doc, point native at it, and
+     *  refresh the doc/layer sidebar. Idempotent — second invocation
+     *  (e.g. if onResume races a partial first call) is a no-op. */
+    private fun initializeDocuments() {
+        if (docsInitialized) return
+        docsInitialized = true
+
+        migrateLegacyDocumentIfNeeded()
+        migrateToExternalStorageIfNeeded()
+
+        val available = listDocumentNames()
+        val initialDoc = lastOpenedDocName()?.takeIf { it in available }
+            ?: available.firstOrNull()
+            ?: nextUntitledName()
+        currentDocName = initialDoc
+        rememberDocName(initialDoc)
+        val docDir = docDirFor(initialDoc).apply { mkdirs() }
+        NativeRenderer.setDocumentDir(docDir.absolutePath)
+
+        drawingView?.post {
+            syncLayerStateFromNative()
+            rebuildSidebar()
+            rebuildLayerList()
+        }
+    }
+
+    /** Paper-styled modal dialog explaining the storage permission
+     *  requirement and linking to the system "All files access"
+     *  settings page. Not cancellable by tapping outside; the only
+     *  ways out are "Open Settings" (deep-links to the granting page)
+     *  or "Quit" (closes the app). */
+    private fun showStorageAccessRequiredDialog() {
+        if (storagePermissionDialog?.isShowing == true) return
+        val pad = 18.dp
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.paper))
+            setPadding(pad, pad, pad, pad)
+        }
+        container.addView(makePaperDialogTitle("Storage permission required"),
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 12.dp })
+        container.addView(TextView(this).apply {
+            text = "Documents live in /sdcard/$kDocumentsRootName/ so " +
+                "they survive uninstalling the app and are browsable " +
+                "from the Files app over USB.\n\n" +
+                "Tap \"Open Settings\" and turn on \"Allow access to " +
+                "manage all files\". Return here when done."
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(getColor(R.color.ink))
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 14.dp })
+
+        val (buttons, cancelBtn, confirmBtn) =
+            makePaperDialogButtons("Open Settings")
+        cancelBtn.text = "Quit"
+        container.addView(buttons, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val dialog = showPaperDialog(container)
+        dialog.setCancelable(false)
+        dialog.setCanceledOnTouchOutside(false)
+        cancelBtn.setOnClickListener {
+            dialog.dismiss()
+            finish()
+        }
+        confirmBtn.setOnClickListener {
+            // Don't dismiss; the user comes back via Recents/back
+            // after granting, and onResume picks up from there.
+            val pkgUri = android.net.Uri.parse("package:$packageName")
+            try {
+                startActivity(android.content.Intent(
+                    android.provider.Settings
+                        .ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    pkgUri))
+            } catch (_: android.content.ActivityNotFoundException) {
+                // Some OEM builds don't deep-link to the per-app
+                // toggle; fall back to the global settings page.
+                startActivity(android.content.Intent(
+                    android.provider.Settings
+                        .ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
+        }
+        storagePermissionDialog = dialog
     }
 
     private fun prefs() = getSharedPreferences(kPrefsName, Context.MODE_PRIVATE)

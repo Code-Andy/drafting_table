@@ -1,0 +1,60 @@
+# Perfetto trace config for the drawing app — captures vsync,
+# SurfaceFlinger transactions, our GL callbacks (via atrace), and
+# the scheduler so we can correlate commit cost with the visible
+# flash on fast handwriting.
+#
+# Usage: see tools/capture-trace.ps1.
+
+buffers: {
+    size_kb: 131072
+    fill_policy: DISCARD
+}
+
+# Most of the value comes from atrace (Android's user-space trace API)
+# wired into the kernel ftrace ring. Categories chosen for graphics
+# pipeline visibility:
+#   gfx        - SurfaceFlinger composition, layer updates, fences
+#   view       - View.draw() and HWUI render thread
+#   input      - input dispatcher events (touch/stylus)
+#   sched      - scheduler context switches (correlate GL thread vs
+#                disk writer thread vs UI thread)
+#   binder_driver - IPC between our app and SurfaceFlinger / system
+#                services (request → response timing)
+#   freq       - CPU frequency changes (rules out throttling)
+# Plus our own atrace_apps entries — emits the DrawingApp.* sections
+# we instrument in renderer.cpp (ATraceScope) and DrawingSurfaceView
+# (android.os.Trace.beginSection / endSection).
+data_sources: {
+    config {
+        name: "linux.ftrace"
+        ftrace_config {
+            ftrace_events: "sched/sched_switch"
+            ftrace_events: "sched/sched_wakeup"
+            ftrace_events: "sched/sched_wakeup_new"
+            ftrace_events: "sched/sched_waking"
+            ftrace_events: "power/cpu_idle"
+            ftrace_events: "power/cpu_frequency"
+            atrace_categories: "gfx"
+            atrace_categories: "view"
+            atrace_categories: "input"
+            atrace_categories: "sched"
+            atrace_categories: "freq"
+            atrace_categories: "binder_driver"
+            atrace_apps: "com.bk.drawing"
+        }
+    }
+}
+
+data_sources: {
+    config {
+        name: "linux.process_stats"
+        target_buffer: 0
+        process_stats_config {
+            scan_all_processes_on_start: true
+        }
+    }
+}
+
+# 10 seconds is plenty to capture a few strokes worth of activity.
+# Bump if needed for longer reproduction sessions.
+duration_ms: 10000

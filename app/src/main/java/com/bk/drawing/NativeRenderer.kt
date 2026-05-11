@@ -593,4 +593,25 @@ object NativeRenderer {
     external fun redo()
     external fun canUndo(): Boolean
     external fun canRedo(): Boolean
+
+    // ---- Test-only access ------------------------------------------------
+    //
+    // Exposed for the androidTest fidelity suite. Driving the renderer
+    // from tests instead of from real input lets us verify that the
+    // bake is deterministic across implementation changes — same
+    // inputs in, same pixels out. Not used by production code.
+
+    /** Drain queued undo/redo/layer ops without doing a composite pass. */
+    external fun flushPendingActions()
+
+    /** Number of existing tiles in the layer (after any pending drain). */
+    external fun getLayerTileCount(layerIdx: Int): Int
+
+    /** Flat `[tx, ty, tx, ty, …]` of every existing tile in the layer.
+     *  Insertion-ordered; sort before comparing if order matters. */
+    external fun getLayerTileCoords(layerIdx: Int): IntArray
+
+    /** kTileBytes (256×256×4) interior pixels of a tile, or null if the
+     *  tile doesn't exist. */
+    external fun readTileBytes(layerIdx: Int, tx: Int, ty: Int): ByteArray?
 }
