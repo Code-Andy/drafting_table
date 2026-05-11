@@ -21,31 +21,15 @@ import kotlin.math.sin
 // circle, ellipse) flow through ShapePreview (one entry per pen position
 // during the drag), with shapeType selecting which shape to render.
 sealed class StrokeAction {
-    data class Sample(
-        val x: Float, val y: Float, val pressure: Float,
-        val isNewStroke: Boolean,
-        // Predicted samples render into the front buffer to mask input
-        // latency but are never baked into the doc on commit (so the
-        // committed stroke matches the actual pen path, not the guesses).
-        val predicted: Boolean = false,
-        // Latency-probe instrumentation. inputAgeMs = ms between the
-        // input event timestamp (sensor-side) and our onTouchEvent
-        // receive; receivedNs = System.nanoTime() at receive (used to
-        // compute app-prep delta when the GL thread renders this
-        // sample). 0L means "not measured" (predicted samples / older
-        // construction sites).
-        val inputAgeMs: Long = 0L,
-        val receivedNs:  Long = 0L,
-    ) : StrokeAction()
-
     /** All stroke samples coming out of one `MotionEvent` (historical
      *  rows + the current one) bundled into a single front-buffer
-     *  dispatch. One renderFrontBufferedLayer call → one GL callback →
-     *  one extendStroke loop, instead of N separate framework
-     *  dispatches. xyp is [x0,y0,p0, x1,y1,p1, ...] in doc-coords;
-     *  isNewStroke applies to the first sample only. inputAgeMs is the
-     *  age of the *latest* sample in the batch (the freshest input);
-     *  receivedNs is when this MotionEvent reached us. */
+     *  dispatch. One renderFrontBufferedLayer call → one
+     *  extendStrokeBatch JNI → one mirror blit + one preview overlay
+     *  render, regardless of sample count. xyp is [x0,y0,p0, ...] in
+     *  doc-coords; isNewStroke applies to the first sample only.
+     *  inputAgeMs is the age of the *latest* sample in the batch
+     *  (the freshest input); receivedNs is when this MotionEvent
+     *  reached us. */
     class BatchSamples(
         val xyp: FloatArray,
         // First realCount triples are real samples (pushed to
@@ -99,17 +83,21 @@ sealed class StrokeAction {
 }
 
 // Pen-to-render latency aggregator. Records three deltas per stroke
-// sample on the GL thread:
+// batch on the GL thread:
 //   inputAgeMs — sensor timestamp → app onTouchEvent receive (kernel
 //                + InputDispatcher).
 //   appPrepUs  — onTouchEvent receive → onDrawFrontBufferedLayer
 //                start (queue onto GL thread + framework callback).
-//   nativeUs   — duration of the extendStroke JNI call.
-// Logs a p50/p95/max summary once we have kBucket samples and
-// resets, so a continuous stroke produces periodic summaries in
-// logcat under the DrawingApp tag. This is for measurement only —
-// the cost per record is a few longs.
+//   nativeUs   — duration of the extendStrokeBatch JNI call.
+// When `enabled` is true, logs a p50/p95/max summary once kBucket
+// samples are recorded, then resets. Off by default — flip this flag
+// in code (not from UI) when investigating a regression. The hot-path
+// nanoTime captures in the GL callback are cheap enough to leave in.
 internal object LatencyProbe {
+    /** Flip to `true` in source when investigating latency. Off in
+     *  shipped builds so a long drawing session doesn't spam logcat. */
+    var enabled: Boolean = false
+
     private const val kBucket = 50
     private val inputAgeMs = LongArray(kBucket)
     private val appPrepUs  = LongArray(kBucket)
@@ -118,6 +106,7 @@ internal object LatencyProbe {
 
     @Synchronized
     fun record(inputAgeMsVal: Long, appPrepNs: Long, nativeNs: Long) {
+        if (!enabled) return
         if (n >= kBucket) return
         inputAgeMs[n] = inputAgeMsVal
         appPrepUs[n]  = appPrepNs / 1000
@@ -146,7 +135,7 @@ internal object LatencyProbe {
 }
 
 // Only BRUSH and ERASER correspond to native "stroke tools" (running
-// through beginStroke / extendStroke / commitStroke). The shape tools
+// through beginStroke / extendStrokeBatch / commitStroke). The shape tools
 // have their own gesture path and don't update the native stroke tool.
 // BUCKET is a click-to-act tool with its own native entrypoint; nativeId
 // is unused for it.
@@ -195,34 +184,6 @@ class DrawingSurfaceView @JvmOverloads constructor(
             // current doc→view here.
             val composed = composedTransform(transform)
             when (param) {
-                is StrokeAction.Sample -> {
-                    if (param.isNewStroke) {
-                        NativeRenderer.beginStroke()
-                    }
-                    val measure = !param.predicted && param.receivedNs != 0L
-                    val enterNs = if (measure) System.nanoTime() else 0L
-                    if (param.predicted) {
-                        NativeRenderer.extendStrokePredicted(
-                            bufferInfo.width, bufferInfo.height,
-                            composed,
-                            param.x, param.y, param.pressure
-                        )
-                    } else {
-                        NativeRenderer.extendStroke(
-                            bufferInfo.width, bufferInfo.height,
-                            composed,
-                            param.x, param.y, param.pressure
-                        )
-                    }
-                    if (measure) {
-                        val afterNs = System.nanoTime()
-                        LatencyProbe.record(
-                            param.inputAgeMs,
-                            enterNs - param.receivedNs,
-                            afterNs - enterNs,
-                        )
-                    }
-                }
                 is StrokeAction.BatchSamples -> {
                     if (param.isNewStroke) {
                         NativeRenderer.beginStroke()
@@ -277,9 +238,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
             // mustn't bake an empty stroke in that case. cancelNextCommit
             // (set when a 2-finger gesture interrupts a stroke) suppresses
             // the bake entirely so the in-progress stroke is discarded.
-            val hadStrokeSamples = params.any {
-                it is StrokeAction.Sample || it is StrokeAction.BatchSamples
-            }
+            val hadStrokeSamples = params.any { it is StrokeAction.BatchSamples }
             if (hadStrokeSamples && !cancelNextCommit) {
                 NativeRenderer.commitStroke()
             }
@@ -428,9 +387,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var motionPredictor: MotionEventPredictor? = null
 
     /** Runtime toggle. MainActivity flips this from a status-bar item.
-     *  Mirrors to native so a session can be A/B'd against the camera
-     *  without rebuilding. */
-    var predictionEnabled: Boolean = false
+     *  Default on — prediction has been validated as a clear win and
+     *  the toggle remains so we can drop back to raw pen tracking if a
+     *  corner case appears. Setter mirrors to native. */
+    var predictionEnabled: Boolean = true
         set(value) {
             field = value
             NativeRenderer.setPredictionEnabled(value)

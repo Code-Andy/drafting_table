@@ -68,20 +68,50 @@ class BrushPreviewView(context: Context) : View(context) {
         var px = x
         var py = y
         if (history.size >= 2) {
-            val first = history.first()
-            val last  = history.last()
-            val dtMs  = (last.tNs - first.tNs) / 1_000_000.0f
+            // Velocity from the latest step only — averaging across
+            // the whole history lags behind both direction reversals
+            // and decelerations, so prediction overshoots when the
+            // pen turns or stops. Latest-step velocity tracks current
+            // motion directly; the deceleration scale below handles
+            // the one case it can't catch on its own (the pen still
+            // appears to be moving fast on the very last sample
+            // before a sharp stop).
+            val prev = history.elementAt(history.size - 2)
+            val cur  = history.last()
+            val dtMs = (cur.tNs - prev.tNs) / 1_000_000.0f
             if (dtMs > 0.5f) {
-                var vx = (last.x - first.x) / dtMs
-                var vy = (last.y - first.y) / dtMs
-                // Clamp magnitude.
+                var vx = (cur.x - prev.x) / dtMs
+                var vy = (cur.y - prev.y) / dtMs
+
+                // Deceleration-aware scale: compare the latest step's
+                // speed to the previous step's speed. If we're
+                // slowing down, scale prediction toward zero (the
+                // pen is likely about to stop, so projecting ahead
+                // would overshoot). Constant or accelerating motion
+                // gets full prediction.
+                var scale = 1.0f
+                if (history.size >= 3) {
+                    val prev2 = history.elementAt(history.size - 3)
+                    val pdtMs = (prev.tNs - prev2.tNs) / 1_000_000.0f
+                    if (pdtMs > 0.5f) {
+                        val pvx = (prev.x - prev2.x) / pdtMs
+                        val pvy = (prev.y - prev2.y) / pdtMs
+                        val curSpeed  = kotlin.math.sqrt(vx * vx + vy * vy)
+                        val prevSpeed = kotlin.math.sqrt(pvx * pvx + pvy * pvy)
+                        if (prevSpeed > 1e-3f && curSpeed < prevSpeed) {
+                            scale = curSpeed / prevSpeed
+                        }
+                    }
+                }
+
+                // Clamp magnitude (safety net against bad samples).
                 val mag = kotlin.math.sqrt(vx * vx + vy * vy)
                 if (mag > kMaxVelocityViewPxPerMs) {
                     val s = kMaxVelocityViewPxPerMs / mag
                     vx *= s; vy *= s
                 }
-                px = x + vx * kLookAheadMs
-                py = y + vy * kLookAheadMs
+                px = x + vx * kLookAheadMs * scale
+                py = y + vy * kLookAheadMs * scale
             }
         }
         centerX = px

@@ -152,9 +152,11 @@ class MainActivity : AppCompatActivity() {
     private var brushSizeScale = 1.0f
     private var brushPreviewEnabled = false
     private lateinit var brushPreviewView: BrushPreviewView
-    // Motion-prediction toggle. Off by default; not persisted across
-    // launches (debug knob for camera-based latency A/B tests).
-    private var predictionEnabled = false
+    // Motion-prediction toggle. On by default — prediction is the
+    // validated low-latency path; the toggle is kept so we can drop
+    // back to raw pen tracking if an edge case appears. Not persisted
+    // across launches (intentional — every session starts on).
+    private var predictionEnabled = true
     private var vectorLineWidth = 2.0f
     private var brushAlpha = 1.0f
     private var brushHardness = 1.0f
@@ -458,6 +460,15 @@ class MainActivity : AppCompatActivity() {
             rebuildSidebar()
             rebuildLayerList()
         }
+    }
+
+    override fun onPause() {
+        // Tile writes are queued onto a background thread for the
+        // duration of a session; force them to disk before we hand
+        // control back to the system so a process kill (low-memory
+        // reaper, user task swipe) doesn't lose the last few strokes.
+        NativeRenderer.flushTileWrites()
+        super.onPause()
     }
 
     override fun onDestroy() {

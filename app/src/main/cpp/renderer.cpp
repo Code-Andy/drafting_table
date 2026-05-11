@@ -25,11 +25,12 @@
 //   refactor are migrated into layer_0/ on first load.
 //
 // Stroke lifecycle:
-//   beginStroke      - reset emitter, snapshot active layer as stroke target
-//   extendStroke     - append a sample, emit dabs additively into the
-//                      front-buffered layer
-//   commitStroke     - bake the stroke into the snapshotted target layer's
-//                      tiles, save those tiles to disk, drop samples
+//   beginStroke        - reset emitter, snapshot active layer as stroke target
+//   extendStrokeBatch  - append a batch of samples (real + optional predicted
+//                        tail), emit dabs additively into the front-buffered
+//                        layer; one preview-overlay render per batch
+//   commitStroke       - bake the stroke into the snapshotted target layer's
+//                        tiles, save those tiles to disk, drop samples
 //   renderDocument   - clear the multi-buffer to white, composite every
 //                      tile of every layer in z-order
 //
@@ -59,6 +60,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -69,6 +71,7 @@
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -530,6 +533,15 @@ void main() {
 struct Sample { float x, y, p; };
 struct Stroke { std::vector<Sample> samples; };
 
+// Reference-counted, kTileBytes-sized byte buffer. Used as the
+// immutable carrier for a tile's interior pixels in both the per-tile
+// cache and the undo system's TileSnap. Sharing is a refcount inc;
+// new buffers are allocated only on tile mutation (bake, paste, etc.)
+// — without sharing, allocating + zero-filling kTileBytes per snap
+// took ~4 ms each and dominated commitStroke. Convention: treat the
+// vector as immutable once it's been stored anywhere shared.
+using TileBytes = std::shared_ptr<std::vector<uint8_t>>;
+
 struct Tile {
     GLuint texture = 0;
     GLuint fbo     = 0;
@@ -537,7 +549,87 @@ struct Tile {
     // changes. The composite path lazy-syncs the apron from neighbors
     // on the next composite pass when this is true.
     bool   apronStale = true;
+    // CPU-side mirror of the FBO interior. Populated on
+    // creation/load and replaced on every mutation (bake, paste,
+    // selection lift, bucket fill, undo restore). The undo system's
+    // BEFORE snapshot points at this exact shared_ptr instead of
+    // copying — see snapshotTilesInBbox.
+    TileBytes cachedBytes;
 };
+
+// ---- Tile-bytes buffer pool ---------------------------------------------
+//
+// commitStroke's AFTER pass allocates one kTileBytes-sized vector per
+// touched tile. On this device, that single allocation costs ~4 ms
+// (jemalloc's mmap path + 256 KB zero-init), and a 4-tile commit
+// spends 16 ms just on allocations. By recycling vectors that the
+// undo system has finished with (via shared_ptr custom deleter), the
+// allocation cost is paid once and amortizes to zero after steady
+// state. Capped at kMaxPoolSize buffers (~16 MB) to bound memory.
+//
+// Thread-safe — eviction can race against commit on the GL thread
+// because the disk writer thread may be the one releasing the last
+// shared_ptr reference (DiskTask owns a vector<uint8_t> copy, not
+// the shared TileBytes, so this is conservative; cheap lock-take
+// anyway).
+class TileBufferPool {
+    std::mutex mu_;
+    std::vector<std::vector<uint8_t>*> free_;
+    static constexpr size_t kMaxPoolSize = 64;
+    // Pre-warmed at first acquire so the early commits (before any
+    // undo eviction recycles buffers) pay zero allocation cost.
+    static constexpr size_t kPrewarmCount = 32;
+    bool warmed_ = false;
+    void prewarmLocked_() {
+        warmed_ = true;
+        free_.reserve(kPrewarmCount);
+        for (size_t i = 0; i < kPrewarmCount; ++i) {
+            free_.push_back(new std::vector<uint8_t>(kTileBytes));
+        }
+    }
+public:
+    ~TileBufferPool() {
+        for (auto* p : free_) delete p;
+    }
+    TileBytes acquire() {
+        std::vector<uint8_t>* raw = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!warmed_) prewarmLocked_();
+            if (!free_.empty()) {
+                raw = free_.back();
+                free_.pop_back();
+            }
+        }
+        if (!raw) raw = new std::vector<uint8_t>(kTileBytes);
+        return std::shared_ptr<std::vector<uint8_t>>(
+            raw,
+            [this](std::vector<uint8_t>* p) {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (free_.size() < kMaxPoolSize) free_.push_back(p);
+                else delete p;
+            });
+    }
+};
+
+inline TileBufferPool& tilePool() {
+    static TileBufferPool p;
+    return p;
+}
+
+// Convenience: acquire a buffer pre-filled with kTileBytes from src.
+inline TileBytes acquireTileBytesFrom(const uint8_t* src) {
+    auto b = tilePool().acquire();
+    std::memcpy(b->data(), src, kTileBytes);
+    return b;
+}
+
+// Convenience: acquire a buffer zeroed (for freshly-cleared tiles).
+inline TileBytes acquireZeroedTileBytes() {
+    auto b = tilePool().acquire();
+    std::memset(b->data(), 0, kTileBytes);
+    return b;
+}
 
 // Vector-layer primitives. All coordinates are in document pixels. Each
 // struct is plain-old-data so we can fwrite it byte-for-byte during
@@ -845,10 +937,10 @@ ViewFbo g_coverage;
 // predicted dabs persist in the live preview and visibly thicken the
 // stroke as real samples catch up. Allocated lazily alongside g_coverage.
 ViewFbo g_coverageReal;
-bool    g_needsPreviewPrep = false;  // set at beginStroke; cleared on first extendStroke
-// Set when one or more extendStrokePredicted calls have run since the
-// last real extendStroke. Triggers a coverage + emitter restore at the
-// start of the next real extendStroke.
+bool    g_needsPreviewPrep = false;  // set at beginStroke; cleared on first extendStrokeBatch
+// Set after a batch whose predicted tail produced any dabs. Triggers
+// a coverage + emitter restore at the start of the next batch's real
+// region, before any new real dabs are applied.
 bool    g_predictionInFlight = false;
 // Snapshot of g_predictionEnabled taken at beginStroke and held for the
 // life of the stroke. The mirror blit and the predicted-dab path are
@@ -1181,8 +1273,12 @@ enum class UndoOp : int {
 
 struct TileSnap {
     int  tx = 0, ty = 0;
-    bool existed = false;            // tile present at snapshot time
-    std::vector<uint8_t> bytes;      // size = kTileBytes when existed; else empty
+    bool existed = false;             // tile present at snapshot time
+    // Reference-counted; null when `existed` is false. See TileBytes
+    // declaration for the sharing convention. Reads via `bytes->data()`
+    // / `bytes->size()`. Allocate via `tilePool().acquire()` (or
+    // `acquireTileBytesFrom` for a pre-filled buffer).
+    TileBytes bytes;
 };
 
 struct ShapeData {
@@ -1361,15 +1457,20 @@ std::atomic<int> g_clipboardKind{0};
 
 size_t computeEntrySize(const UndoEntry& e) {
     size_t s = sizeof(UndoEntry);
-    for (const auto& t : e.beforeTiles) s += t.bytes.size();
-    for (const auto& t : e.afterTiles)  s += t.bytes.size();
+    // TileSnap.bytes is a shared_ptr — over-counts when buffers are
+    // shared across snaps (e.g. BEFORE of stroke N+1 shares with
+    // AFTER of stroke N), which means the undo budget evicts a bit
+    // more aggressively than physical memory dictates. Acceptable;
+    // accurate accounting would require pointer-set bookkeeping.
+    for (const auto& t : e.beforeTiles) s += t.bytes ? t.bytes->size() : 0;
+    for (const auto& t : e.afterTiles)  s += t.bytes ? t.bytes->size() : 0;
     s += e.beforeLines.size()    * sizeof(Line);
     s += e.beforeRects.size()    * sizeof(Rect);
     s += e.beforeEllipses.size() * sizeof(Ellipse);
     s += e.beforeCircles.size()  * sizeof(Circle);
     // srcSnapshot — used by MergeLayerDown (and any future op that
     // captures a full layer for re-creation on undo).
-    for (const auto& t : e.srcSnapshot.tiles) s += t.bytes.size();
+    for (const auto& t : e.srcSnapshot.tiles) s += t.bytes ? t.bytes->size() : 0;
     s += e.srcSnapshot.lines.size()    * sizeof(Line);
     s += e.srcSnapshot.rects.size()    * sizeof(Rect);
     s += e.srcSnapshot.ellipses.size() * sizeof(Ellipse);
@@ -1563,9 +1664,10 @@ DabEmitter g_liveEmitter;
 // been emitted in between, so the predicted dabs don't pollute the
 // emitter's last-position state and bend the next real dab interpolation.
 DabEmitter g_liveEmitterReal;
-// Runtime toggle for motion prediction. Off by default until we've
-// validated visual quality on the tablet.
-std::atomic<bool> g_predictionEnabled{false};
+// Runtime toggle for motion prediction. On by default — validated as
+// a clear win; the toggle remains for the rare case of needing raw
+// pen tracking.
+std::atomic<bool> g_predictionEnabled{true};
 
 // Forward declarations; defined down with the persistence and composite
 // helpers.
@@ -1574,6 +1676,7 @@ void loadVectorLayerShapes(Layer& layer, const std::string& dir);
 void saveTileToDisk(size_t layerIdx, int64_t tileK);
 void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
                           const uint8_t* bytes);
+static void flushDiskWriter();
 void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out);
 void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
                          std::vector<TileSnap>& out);
@@ -1776,6 +1879,13 @@ void applyPendingLayerActions() {
                 g_pendingDocPath.clear();
             }
             if (newPath.empty()) continue;
+            // Make sure all pending tile writes for the OLD doc reach
+            // disk before we drop its GL state. The queued tasks hold
+            // absolute paths captured at enqueue time, so they'd land
+            // correctly even without this flush — but flushing here
+            // guarantees the user's last strokes are persisted before
+            // the doc switch is observable.
+            flushDiskWriter();
             closeCurrentDocument();
             g_docDir = newPath;
             // The render entry point already called ensureLoaded() before
@@ -2400,6 +2510,15 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
         glTexSubImage2D(GL_TEXTURE_2D, 0, kApron, kApron,
                         kTileSize, kTileSize,
                         GL_RGBA, GL_UNSIGNED_BYTE, initial);
+        // Mirror the upload into the BEFORE-snapshot cache. Shared
+        // refcounted buffer (from the pool), see TileBytes.
+        t.cachedBytes = acquireTileBytesFrom(initial);
+    } else {
+        // Freshly cleared (interior is all zero). Allocate the cache
+        // to a zeroed buffer — same memory cost as if it had been
+        // populated and the eventual mutation will replace it. Pool
+        // returns a buffer with undefined contents, so zero-fill.
+        t.cachedBytes = acquireZeroedTileBytes();
     }
 
     layer.tiles[k] = t;
@@ -2515,10 +2634,22 @@ void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
             auto it = layer.tiles.find(tileKey(tx, ty));
             if (it != layer.tiles.end()) {
                 snap.existed = true;
-                snap.bytes.resize(kTileBytes);
-                glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-                glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
-                             snap.bytes.data());
+                if (it->second.cachedBytes) {
+                    // Fast path: share the cache's buffer by refcount.
+                    // No allocation, no copy.
+                    snap.bytes = it->second.cachedBytes;
+                } else {
+                    // Defensive fallback — cache should be populated
+                    // post-load and after every mutation. Allocate
+                    // fresh, read back, and seed the cache.
+                    auto fresh = tilePool().acquire();
+                    glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                    glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                                 GL_RGBA, GL_UNSIGNED_BYTE,
+                                 fresh->data());
+                    it->second.cachedBytes = fresh;
+                    snap.bytes = fresh;
+                }
             }
             out.push_back(std::move(snap));
         }
@@ -2639,14 +2770,20 @@ void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out) {
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     out.reserve(layer.tiles.size());
-    for (const auto& kv : layer.tiles) {
+    for (auto& kv : layer.tiles) {
         TileSnap snap;
         unpackTileKey(kv.first, snap.tx, snap.ty);
         snap.existed = true;
-        snap.bytes.resize(kTileBytes);
-        glBindFramebuffer(GL_FRAMEBUFFER, kv.second.fbo);
-        glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
-                     snap.bytes.data());
+        if (kv.second.cachedBytes) {
+            snap.bytes = kv.second.cachedBytes;
+        } else {
+            auto fresh = tilePool().acquire();
+            glBindFramebuffer(GL_FRAMEBUFFER, kv.second.fbo);
+            glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                         GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+            kv.second.cachedBytes = fresh;
+            snap.bytes = fresh;
+        }
         out.push_back(std::move(snap));
     }
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
@@ -2671,12 +2808,122 @@ void uploadTileBytesAndSave(size_t layerIdx, int tx, int ty,
     glTexSubImage2D(GL_TEXTURE_2D, 0, kApron, kApron, kTileSize, kTileSize,
                     GL_RGBA, GL_UNSIGNED_BYTE, bytes);
     glBindTexture(GL_TEXTURE_2D, 0);
+    // Mirror into the BEFORE-snapshot cache. Caller's `bytes` is the
+    // authoritative new content for the tile.
+    tile.cachedBytes = acquireTileBytesFrom(bytes);
     saveTileToDisk(layerIdx, tileKey(tx, ty));
     // Tile content changed — its 8 neighbors hold copies of its old
     // edge data in their aprons, so flag them (and self) for resync
     // before next composite.
     markApronStaleAround(layer, tx, ty);
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
+// ---- Async tile-disk writer ---------------------------------------------
+//
+// commitStroke used to do fwrite+fclose+rename synchronously on the GL
+// thread for every tile a stroke touched. With strokes covering many
+// tiles, disk I/O latency caused commit to overrun the vsync budget
+// and the GLFrontBufferedRenderer's transition occasionally presented
+// a frame where the front buffer was hidden but the multi-buffer
+// hadn't yet been updated — visible as a brief white flash on commit.
+//
+// The fix: a single-threaded FIFO writer. Tile writes (and the unlink
+// done by deleteTileIfExists) are queued from the GL thread and
+// drained on a background thread. Single consumer keeps ordering for
+// the same tile path so a later write can't be clobbered by an
+// earlier-queued one. Defined here (rather than next to
+// writeTileBytesToDisk) so deleteTileIfExists, which constructs a
+// DiskTask by value, can see the type.
+struct DiskTask {
+    enum Op { kWrite, kDelete };
+    Op op;
+    std::string path;       // final path
+    std::string tmpPath;    // write target (renamed atomically); unused for kDelete
+    std::vector<uint8_t> bytes;  // owned; copied at enqueue time
+};
+
+std::deque<DiskTask>     g_diskQueue;
+std::mutex               g_diskQueueMutex;
+std::condition_variable  g_diskQueueCv;
+std::thread              g_diskWriter;
+std::atomic<bool>        g_diskWriterStarted{false};
+std::atomic<bool>        g_diskWriterStop{false};
+
+static void diskWriterLoop() {
+    for (;;) {
+        DiskTask task;
+        {
+            std::unique_lock<std::mutex> lock(g_diskQueueMutex);
+            g_diskQueueCv.wait(lock, [] {
+                return !g_diskQueue.empty() || g_diskWriterStop.load();
+            });
+            if (g_diskQueue.empty() && g_diskWriterStop.load()) return;
+            task = std::move(g_diskQueue.front());
+            g_diskQueue.pop_front();
+        }
+        switch (task.op) {
+            case DiskTask::kWrite: {
+                FILE* f = fopen(task.tmpPath.c_str(), "wb");
+                if (!f) {
+                    LOGE("disk writer: fopen %s failed (errno=%d)",
+                         task.tmpPath.c_str(), errno);
+                    break;
+                }
+                size_t written = fwrite(task.bytes.data(), 1,
+                                        task.bytes.size(), f);
+                fclose(f);
+                if (written != task.bytes.size()) {
+                    LOGE("disk writer: short write %zu to %s",
+                         written, task.tmpPath.c_str());
+                    unlink(task.tmpPath.c_str());
+                    break;
+                }
+                if (rename(task.tmpPath.c_str(), task.path.c_str()) != 0) {
+                    LOGE("disk writer: rename %s → %s failed (errno=%d)",
+                         task.tmpPath.c_str(), task.path.c_str(), errno);
+                }
+                break;
+            }
+            case DiskTask::kDelete:
+                unlink(task.path.c_str());
+                break;
+        }
+    }
+}
+
+static void ensureDiskWriterStarted() {
+    bool expected = false;
+    if (g_diskWriterStarted.compare_exchange_strong(expected, true)) {
+        g_diskWriter = std::thread(diskWriterLoop);
+        // Detached so static destruction at process exit (rare on
+        // Android — usually SIGKILL — but possible) doesn't call
+        // std::terminate on a still-joinable thread.
+        g_diskWriter.detach();
+    }
+}
+
+static void enqueueDiskTask(DiskTask&& task) {
+    ensureDiskWriterStarted();
+    {
+        std::lock_guard<std::mutex> lock(g_diskQueueMutex);
+        g_diskQueue.push_back(std::move(task));
+    }
+    g_diskQueueCv.notify_one();
+}
+
+// Block until every queued disk task has been drained. Called at doc
+// boundaries (switch / close / app pause) so the user can't navigate
+// away with pending writes in memory.
+static void flushDiskWriter() {
+    if (!g_diskWriterStarted.load()) return;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(g_diskQueueMutex);
+            if (g_diskQueue.empty()) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 // Drop a tile's GL resources, remove it from the layer's map, and unlink
@@ -2686,15 +2933,21 @@ void deleteTileIfExists(size_t layerIdx, int tx, int ty) {
     Layer& layer = *layers()[layerIdx];
     int64_t k = tileKey(tx, ty);
     auto it = layer.tiles.find(k);
+    auto queueUnlink = [&](void) {
+        if (g_docDir.empty()) return;
+        DiskTask task;
+        task.op = DiskTask::kDelete;
+        task.path = activeLayerDir(layerIdx)
+                  + "/tile_" + std::to_string(tx)
+                  + "_"      + std::to_string(ty) + ".bin";
+        // FIFO single-consumer queue keeps this in order with any
+        // earlier-queued writes for the same tile path.
+        enqueueDiskTask(std::move(task));
+    };
     if (it == layer.tiles.end()) {
         // Even if no GPU tile, an orphan disk file from a partially-saved
         // state should still be cleaned up; harmless if absent.
-        if (!g_docDir.empty()) {
-            std::string p = activeLayerDir(layerIdx)
-                          + "/tile_" + std::to_string(tx)
-                          + "_"      + std::to_string(ty) + ".bin";
-            unlink(p.c_str());
-        }
+        queueUnlink();
         return;
     }
     if (it->second.fbo)     glDeleteFramebuffers(1, &it->second.fbo);
@@ -2704,18 +2957,13 @@ void deleteTileIfExists(size_t layerIdx, int tx, int ty) {
     // them stale so the next composite pulls in zero (no-neighbor)
     // for those sides instead of leaving the deleted content behind.
     markApronStaleAround(layer, tx, ty);
-    if (!g_docDir.empty()) {
-        std::string p = activeLayerDir(layerIdx)
-                      + "/tile_" + std::to_string(tx)
-                      + "_"      + std::to_string(ty) + ".bin";
-        unlink(p.c_str());
-    }
+    queueUnlink();
 }
 
 // Apply one tile snapshot (existed=true → upload bytes; false → delete).
 void applyTileSnap(size_t layerIdx, const TileSnap& snap) {
-    if (snap.existed) {
-        uploadTileBytesAndSave(layerIdx, snap.tx, snap.ty, snap.bytes.data());
+    if (snap.existed && snap.bytes) {
+        uploadTileBytesAndSave(layerIdx, snap.tx, snap.ty, snap.bytes->data());
     } else {
         deleteTileIfExists(layerIdx, snap.tx, snap.ty);
     }
@@ -3610,10 +3858,16 @@ void mergeRasterLayerDownImpl(size_t idx) {
         auto it = layer.tiles.find(k);
         if (it != layer.tiles.end()) {
             snap.existed = true;
-            snap.bytes.resize(kTileBytes);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                         GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+            if (it->second.cachedBytes) {
+                snap.bytes = it->second.cachedBytes;
+            } else {
+                auto fresh = tilePool().acquire();
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                it->second.cachedBytes = fresh;
+                snap.bytes = fresh;
+            }
         }
     };
 
@@ -4360,10 +4614,18 @@ void applyPendingShapes() {
 // Write tile pixel bytes to disk via tmp+rename. Callable when the
 // caller already has the bytes in hand (e.g. commitStroke's combined
 // after-snapshot + disk save pass). Bytes must be exactly kTileBytes.
+// The fopen/fwrite/fclose/rename happens on a background thread; the
+// caller pays only one extra memcpy of kTileBytes. mkdir is kept on
+// the calling thread — cheap when the dir already exists, and racing
+// it across threads would require the writer to know the doc/page
+// layout.
 void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
                           const uint8_t* bytes) {
     if (g_docDir.empty()) return;
     // Make sure the page dir exists; mkdir doesn't create intermediates.
+    // Kept sync on the calling thread — mkdir is cheap when the dir
+    // already exists (a stat-like check) and racing it across threads
+    // would require the writer to know the doc/page layout.
     std::string pageDir = pageDirOf(g_activePageIdx);
     mkdir(pageDir.c_str(), 0755);   // ignore EEXIST
     std::string layerDir = activeLayerDir(layerIdx);
@@ -4371,27 +4633,13 @@ void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
         LOGE("can't create %s (errno=%d)", layerDir.c_str(), errno);
         return;
     }
-    char path[1024], tmpPath[1024];
-    snprintf(path,    sizeof(path),    "%s/tile_%d_%d.bin",     layerDir.c_str(), tx, ty);
-    snprintf(tmpPath, sizeof(tmpPath), "%s/tile_%d_%d.bin.tmp", layerDir.c_str(), tx, ty);
-    FILE* f = fopen(tmpPath, "wb");
-    if (!f) {
-        LOGE("save tile (%d, %d) layer %zu: fopen %s failed",
-             tx, ty, layerIdx, tmpPath);
-        return;
-    }
-    size_t written = fwrite(bytes, 1, kTileBytes, f);
-    fclose(f);
-    if (written != kTileBytes) {
-        LOGE("save tile (%d, %d) layer %zu: short write %zu",
-             tx, ty, layerIdx, written);
-        unlink(tmpPath);
-        return;
-    }
-    if (rename(tmpPath, path) != 0) {
-        LOGE("save tile (%d, %d) layer %zu: rename failed (errno=%d)",
-             tx, ty, layerIdx, errno);
-    }
+    DiskTask task;
+    task.op = DiskTask::kWrite;
+    task.path    = layerDir + "/tile_" + std::to_string(tx)
+                            + "_"      + std::to_string(ty) + ".bin";
+    task.tmpPath = task.path + ".tmp";
+    task.bytes.assign(bytes, bytes + kTileBytes);
+    enqueueDiskTask(std::move(task));
 }
 
 void saveTileToDisk(size_t layerIdx, int64_t tileK) {
@@ -4411,12 +4659,18 @@ void saveTileToDisk(size_t layerIdx, int64_t tileK) {
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-    std::vector<uint8_t> buf(kTileBytes);
+    auto fresh = tilePool().acquire();
     glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
-                 buf.data());
+                 fresh->data());
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 
-    writeTileBytesToDisk(layerIdx, tx, ty, buf.data());
+    // Cache the freshly-read bytes for the BEFORE-snapshot fast path —
+    // saveTileToDisk is called by every mutation path that doesn't go
+    // through uploadTileBytesAndSave (selection lift's glClear, bucket
+    // fill, etc.), so this catches the post-mutation state.
+    it->second.cachedBytes = fresh;
+
+    writeTileBytesToDisk(layerIdx, tx, ty, fresh->data());
 }
 
 // ---- Bake -----------------------------------------------------------------
@@ -6384,11 +6638,13 @@ bool liftRasterSelectionPolygon(const float* points, size_t nPoints) {
             glReadPixels(kApron, kApron, kTileSize, kTileSize,
                          GL_RGBA, GL_UNSIGNED_BYTE, tileBytes.data());
 
-            // Pre-lift snapshot for undo + cancel restoration.
+            // Pre-lift snapshot for undo + cancel restoration. Copy
+            // the freshly-read bytes into a shared buffer; this is
+            // the BEFORE state for the lift's undo.
             TileSnap snap;
             snap.tx = tx; snap.ty = ty;
             snap.existed = true;
-            snap.bytes = tileBytes;        // copy
+            snap.bytes = acquireTileBytesFrom(tileBytes.data());
             liftedTiles.push_back(std::move(snap));
 
             // For each pixel inside the tile-bbox intersection that the
@@ -6552,14 +6808,21 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
             auto it = layer.tiles.find(tileKey(tx, ty));
             if (it == layer.tiles.end()) continue;
 
-            // (a) Snapshot for undo / restore.
+            // (a) Snapshot for undo / restore. Share the cache if
+            // available, fall back to glReadPixels otherwise.
             TileSnap snap;
             snap.tx = tx; snap.ty = ty;
             snap.existed = true;
-            snap.bytes.resize(kTileBytes);
-            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(kApron, kApron, kTileSize, kTileSize, GL_RGBA, GL_UNSIGNED_BYTE,
-                         snap.bytes.data());
+            if (it->second.cachedBytes) {
+                snap.bytes = it->second.cachedBytes;
+            } else {
+                auto fresh = tilePool().acquire();
+                glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                it->second.cachedBytes = fresh;
+                snap.bytes = fresh;
+            }
             liftedTiles.push_back(std::move(snap));
 
             // (b) Copy the tile's intersection into the content texture.
@@ -6715,10 +6978,16 @@ void commitRasterSelectionImpl() {
             auto it = layer.tiles.find(kv.first);
             if (it != layer.tiles.end()) {
                 snap.existed = true;
-                snap.bytes.resize(kTileBytes);
-                glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-                glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                             GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+                if (it->second.cachedBytes) {
+                    snap.bytes = it->second.cachedBytes;
+                } else {
+                    auto fresh = tilePool().acquire();
+                    glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                    glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                    it->second.cachedBytes = fresh;
+                    snap.bytes = fresh;
+                }
             }
             entry.beforeTiles.push_back(std::move(snap));
         }
@@ -6787,7 +7056,9 @@ void commitRasterSelectionImpl() {
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    // Build afterTiles snapshots from the post-drop state.
+    // Build afterTiles snapshots from the post-drop state. saveTileToDisk
+    // above already updated each touched tile's cachedBytes from the
+    // post-drop FBO, so we share those refcounted buffers here.
     entry.afterTiles.reserve(touchedTiles.size());
     for (auto& kv : touchedTiles) {
         int tx = kv.second.first, ty = kv.second.second;
@@ -6796,10 +7067,16 @@ void commitRasterSelectionImpl() {
         auto it = layer.tiles.find(kv.first);
         if (it != layer.tiles.end()) {
             snap.existed = true;
-            snap.bytes.resize(kTileBytes);
-            glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                         GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
+            if (it->second.cachedBytes) {
+                snap.bytes = it->second.cachedBytes;
+            } else {
+                auto fresh = tilePool().acquire();
+                glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                it->second.cachedBytes = fresh;
+                snap.bytes = fresh;
+            }
         }
         entry.afterTiles.push_back(std::move(snap));
     }
@@ -6820,8 +7097,10 @@ void commitRasterSelectionImpl() {
         if (it == beforeIdx.end()) { diff = true; break; }
         const auto& b = entry.beforeTiles[it->second];
         if (b.existed != a.existed
-         || (b.existed && std::memcmp(b.bytes.data(), a.bytes.data(),
-                                       b.bytes.size()) != 0)) {
+         || (b.existed && b.bytes != a.bytes
+             && (!b.bytes || !a.bytes
+                 || std::memcmp(b.bytes->data(), a.bytes->data(),
+                                b.bytes->size()) != 0))) {
             diff = true; break;
         }
     }
@@ -6868,10 +7147,16 @@ void discardRasterSelectionImpl() {
         auto it = layer.tiles.find(tileKey(b.tx, b.ty));
         if (it != layer.tiles.end()) {
             a.existed = true;
-            a.bytes.resize(kTileBytes);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
-            glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                         GL_RGBA, GL_UNSIGNED_BYTE, a.bytes.data());
+            if (it->second.cachedBytes) {
+                a.bytes = it->second.cachedBytes;
+            } else {
+                auto fresh = tilePool().acquire();
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, it->second.fbo);
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                it->second.cachedBytes = fresh;
+                a.bytes = fresh;
+            }
         }
         afterTiles.push_back(std::move(a));
     }
@@ -7338,18 +7623,26 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
         int tileDocX0 = tx * kTileSize;
         int tileDocY0 = ty * kTileSize;
 
-        // (a) Capture before-state. Skip the GPU readback for tiles that
-        // don't yet exist — they're conceptually all-transparent.
+        // (a) Capture before-state. Share the cache if present, fall
+        // back to glReadPixels for tiles whose cache hasn't been
+        // populated yet. Tiles that don't yet exist are conceptually
+        // all-transparent.
         TileSnap before;
         before.tx = tx; before.ty = ty;
         auto existing = layer.tiles.find(tileKey(tx, ty));
         if (existing != layer.tiles.end()) {
             before.existed = true;
-            before.bytes.resize(kTileBytes);
-            glBindFramebuffer(GL_FRAMEBUFFER, existing->second.fbo);
-            glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                         GL_RGBA, GL_UNSIGNED_BYTE, before.bytes.data());
-            std::memcpy(tilePixels.data(), before.bytes.data(), kTileBytes);
+            if (existing->second.cachedBytes) {
+                before.bytes = existing->second.cachedBytes;
+            } else {
+                auto fresh = tilePool().acquire();
+                glBindFramebuffer(GL_FRAMEBUFFER, existing->second.fbo);
+                glReadPixels(kApron, kApron, kTileSize, kTileSize,
+                             GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                existing->second.cachedBytes = fresh;
+                before.bytes = fresh;
+            }
+            std::memcpy(tilePixels.data(), before.bytes->data(), kTileBytes);
         } else {
             std::memset(tilePixels.data(), 0, kTileBytes);
         }
@@ -7400,11 +7693,15 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
         // Bucket fill changed this tile; flag for apron resync.
         markApronStaleAround(layer, tx, ty);
 
+        // Build the AFTER snap into a fresh shared buffer and reuse
+        // it as the new cache, so the next BEFORE snapshot for this
+        // tile is free.
+        auto fresh = acquireTileBytesFrom(tilePixels.data());
+        tile.cachedBytes = fresh;
         TileSnap after;
         after.tx = tx; after.ty = ty;
         after.existed = true;
-        after.bytes.resize(kTileBytes);
-        std::memcpy(after.bytes.data(), tilePixels.data(), kTileBytes);
+        after.bytes = fresh;
         entry.beforeTiles.push_back(std::move(before));
         entry.afterTiles.push_back(std::move(after));
     }
@@ -7419,8 +7716,10 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
         const auto& b = entry.beforeTiles[i];
         const auto& a = entry.afterTiles[i];
         if (b.existed != a.existed
-         || (b.existed && std::memcmp(b.bytes.data(), a.bytes.data(),
-                                       b.bytes.size()) != 0)) {
+         || (b.existed && b.bytes != a.bytes
+             && (!b.bytes || !a.bytes
+                 || std::memcmp(b.bytes->data(), a.bytes->data(),
+                                b.bytes->size()) != 0))) {
             diff = true;
         }
     }
@@ -7657,6 +7956,14 @@ bool pasteVectorSelectionImpl() {
 // ---- JNI ------------------------------------------------------------------
 
 extern "C" {
+
+// Block until every queued tile write/delete has been drained.
+// Called from Kotlin on app pause and from inside loadDocument so the
+// user can't navigate away with pending writes in memory.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_flushTileWrites(JNIEnv*, jobject) {
+    flushDiskWriter();
+}
 
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring jpath) {
@@ -9622,6 +9929,44 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     g_activePageIdx = savedPage;
 }
 
+// Render the preview-overlay shader pass against whatever FBO is
+// currently bound. Caller is responsible for binding the target FBO
+// and (for the front-buffer case) clearing it first. Used in two
+// places: the live front-buffer preview inside extendStrokeBatch, and
+// the multi-buffer commit "mask" pass that overlays the just-baked
+// stroke into MB so the user can't see the brief gap between the
+// front buffer being hidden by GLFrontBufferedRenderer's commit
+// transition and the new multi-buffer state actually appearing.
+//
+// Uses g_coverage / g_belowFbo / g_aboveFbo as populated during the
+// most recent extendStrokeBatch; g_strokeBrushColor + g_strokeTool
+// pick the brush/eraser branch. Doesn't touch transform — the shader
+// is a fullscreen quad and the per-pixel logic comes from the
+// pre-rendered below/above/coverage textures.
+static void renderPreviewOverlayToBoundFbo(int width, int height) {
+    glViewport(0, 0, width, height);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_preview.program);
+    glBindVertexArray(g_quadVao);
+    glUniform1i(g_preview.uBelow,    0);
+    glUniform1i(g_preview.uAbove,    1);
+    glUniform1i(g_preview.uCoverage, 2);
+    glUniform1i(g_preview.uMode,     g_strokeTool);
+    glUniform3fv(g_preview.uBrushRgb, 1, g_strokeBrushColor);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_belowFbo.texture);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_aboveFbo.texture);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, g_coverage.texture);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     ensureInited();
@@ -9648,8 +9993,8 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     g_strokeBrushHardness  = currentBrushHardness();
     // Both brush and eraser strokes use the WYSIWYG preview path so that
     // strokes appear under layers-above-active correctly. Defer the
-    // setup to first extendStroke (we don't have width/height/transform
-    // here yet).
+    // setup to the first extendStrokeBatch (we don't have width/height/
+    // transform here yet).
     g_needsPreviewPrep = true;
     g_current.samples.clear();
     g_liveEmitter.reset();
@@ -9659,154 +10004,6 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     // strand a predictionInFlight; off→on would force the next revert
     // to read a stale g_coverageReal).
     g_strokePredictionActive = g_predictionEnabled.load();
-}
-
-// Shared body for extendStroke / extendStrokePredicted. `persist=true`
-// adds the sample to g_current.samples so commitStroke bakes it; the
-// predicted variant skips the push so its dabs only ever live in the
-// front buffer (they get cleared on the next multi-buffer pass).
-static void extendStrokeImpl(JNIEnv* env, jint width, jint height,
-                             jfloatArray transform,
-                             jfloat x, jfloat y, jfloat pressure,
-                             bool persist) {
-    ensureInited();
-    // Predicted dabs that arrive when the stroke isn't prediction-active
-    // (mid-stroke toggle, or simply prediction off) are silently
-    // dropped. The Kotlin side normally won't dispatch them, but this
-    // keeps the coverage mirror coherent if the runtime flag flipped
-    // after beginStroke.
-    if (!persist && !g_strokePredictionActive) return;
-    if (persist) g_current.samples.push_back({x, y, pressure});
-
-    // Both brush and eraser run through the same WYSIWYG preview pipeline:
-    // accumulate the dab's coverage into g_coverage, then composite a
-    // fullscreen overlay of (fullColor * c, c) into the front buffer. The
-    // framework's premultiplied blend over multi yields display(c) =
-    // lerp(multi, fullColor, c) — correct under layers above active for
-    // either tool. fullColor differs by mode and is computed in the
-    // preview shader.
-
-    GLint frontFbo = 0;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &frontFbo);
-
-    if (g_needsPreviewPrep) {
-        preparePreviewBuffers(env, width, height, transform);
-        g_needsPreviewPrep = false;
-    }
-
-    // Real dabs after a run of predicted dabs: revert g_coverage to
-    // the mirrored real-only state and restore the emitter so the
-    // upcoming dab interpolates from the previous *real* position.
-    // Without this the predicted ink stays in g_coverage (visibly
-    // thickening the preview tip) and the next real dab interpolates
-    // from the predicted position (drift).
-    if (persist && g_predictionInFlight) {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_coverageReal.fbo);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_coverage.fbo);
-        glBlitFramebuffer(0, 0, width, height,
-                          0, 0, width, height,
-                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        g_liveEmitter = g_liveEmitterReal;
-        g_predictionInFlight = false;
-    }
-
-    // Step 1: accumulate this dab's coverage into g_coverage. RGB is
-    // ignored (rgb=0; premultiplied output is (0,0,0,α)); only the
-    // alpha is sampled by the preview shader. Alpha must match the
-    // bake so live preview equals post-commit appearance — both
-    // brush and eraser use g_strokeBrushAlpha as the per-dab α (same
-    // dab-accumulation curve drives stroke opacity for paint and for
-    // erasure).
-    float coverageRgba[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
-    glBindFramebuffer(GL_FRAMEBUFFER, g_coverage.fbo);
-    glViewport(0, 0, width, height);
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(g_dab.program);
-    glBindVertexArray(g_quadVao);
-    uploadMat4(env, g_dab.uTransform, transform);
-    glUniform2f(g_dab.uScreen, (float)width, (float)height);
-    glUniform4fv(g_dab.uColor, 1, coverageRgba);
-    glUniform1f(g_dab.uHardness, g_strokeBrushHardness);
-    // Page-clip in doc-pixels: the live preview uses uTransform = doc→buffer
-    // and uCenter is in doc-pixels, so the shader's vDocPos is doc-pixels
-    // and the page rect goes in unmodified.
-    {
-        PageClip pageClip = readPageClip();
-        uploadPageClip(g_dab.uPageMin, g_dab.uPageMax,
-                       g_dab.uPageActive, pageClip);
-    }
-    g_liveEmitter.extend(x, y, pressure);
-    glBindVertexArray(0);
-
-    // After a real dab, mirror coverage + emitter so the next predicted
-    // run can be reverted cleanly. Only paid when prediction is active
-    // for this stroke — otherwise the blit is wasted GPU time. After a
-    // predicted dab, flag that a revert is owed.
-    if (persist) {
-        if (g_strokePredictionActive) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, g_coverage.fbo);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_coverageReal.fbo);
-            glBlitFramebuffer(0, 0, width, height,
-                              0, 0, width, height,
-                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
-            g_liveEmitterReal = g_liveEmitter;
-        }
-    } else {
-        g_predictionInFlight = true;
-    }
-
-    // Step 2: re-render the front-buffer overlay using the unified
-    // preview shader. The mode uniform selects brush vs. eraser fullColor
-    // formula; the brushRgb uniform feeds the brush path (un-premult RGB).
-    glBindFramebuffer(GL_FRAMEBUFFER, frontFbo);
-    glViewport(0, 0, width, height);
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(g_preview.program);
-    glBindVertexArray(g_quadVao);
-    glUniform1i(g_preview.uBelow,    0);
-    glUniform1i(g_preview.uAbove,    1);
-    glUniform1i(g_preview.uCoverage, 2);
-    glUniform1i(g_preview.uMode,     g_strokeTool);            // 0=brush, 1=eraser
-    glUniform3fv(g_preview.uBrushRgb, 1, g_strokeBrushColor);  // 1st 3 floats = RGB
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_belowFbo.texture);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, g_aboveFbo.texture);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, g_coverage.texture);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
-    glBindVertexArray(0);
-}
-
-JNIEXPORT void JNICALL
-Java_com_bk_drawing_NativeRenderer_extendStroke(
-        JNIEnv* env, jobject,
-        jint width, jint height,
-        jfloatArray transform,
-        jfloat x, jfloat y, jfloat pressure) {
-    extendStrokeImpl(env, width, height, transform, x, y, pressure,
-                     /*persist=*/true);
-}
-
-// Like extendStroke but the sample isn't recorded into g_current.samples,
-// so commitStroke won't bake it. Used for motion-predicted dabs that
-// render into the front buffer to mask input latency — they vanish on
-// the next multi-buffer pass without ever becoming permanent.
-JNIEXPORT void JNICALL
-Java_com_bk_drawing_NativeRenderer_extendStrokePredicted(
-        JNIEnv* env, jobject,
-        jint width, jint height,
-        jfloatArray transform,
-        jfloat x, jfloat y, jfloat pressure) {
-    extendStrokeImpl(env, width, height, transform, x, y, pressure,
-                     /*persist=*/false);
 }
 
 // Batched stroke extension. xyp is [x,y,p, x,y,p, ...]; the first
@@ -9852,6 +10049,9 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
     GLint frontFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &frontFbo);
 
+    // Capture before clearing — used below to decide whether to clear
+    // the front buffer for the overlay render.
+    bool firstBatchOfStroke = g_needsPreviewPrep;
     if (g_needsPreviewPrep) {
         preparePreviewBuffers(env, width, height, transform);
         g_needsPreviewPrep = false;
@@ -9917,34 +10117,25 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
 
     glBindVertexArray(0);
 
-    // Single front-buffer overlay render — the only thing the user
-    // actually sees from this batch. Same shader setup as the
-    // per-sample path used to do, just done once.
+    // Single front-buffer overlay render. Normally we clear FB first
+    // and then run the preview overlay shader, so the FB pixels are
+    // exactly the current stroke's coverage. EXCEPTION: on the first
+    // batch of a new stroke (right after beginStroke), skip the
+    // clear so the previous stroke's preview overlay survives in FB
+    // for one frame. That bridges the GLFrontBufferedRenderer commit
+    // transition: if the framework hides FB before the new
+    // multi-buffer state lands, the user sees the still-visible old
+    // preview instead of paper-white where the just-finished stroke
+    // should be. The overlay shader's premultiplied output blends
+    // additively on the surviving content, and the NEXT batch (which
+    // does clear) returns FB to the correct state.
     glBindFramebuffer(GL_FRAMEBUFFER, frontFbo);
     glViewport(0, 0, width, height);
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(g_preview.program);
-    glBindVertexArray(g_quadVao);
-    glUniform1i(g_preview.uBelow,    0);
-    glUniform1i(g_preview.uAbove,    1);
-    glUniform1i(g_preview.uCoverage, 2);
-    glUniform1i(g_preview.uMode,     g_strokeTool);
-    glUniform3fv(g_preview.uBrushRgb, 1, g_strokeBrushColor);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_belowFbo.texture);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, g_aboveFbo.texture);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, g_coverage.texture);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
-    glBindVertexArray(0);
+    if (!firstBatchOfStroke) {
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    renderPreviewOverlayToBoundFbo(width, height);
 }
 
 JNIEXPORT void JNICALL
@@ -10001,11 +10192,17 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
                 auto it = layer.tiles.find(tileKey(tx, ty));
                 if (it != layer.tiles.end()) {
                     snap.existed = true;
-                    snap.bytes.resize(kTileBytes);
+                    auto fresh = tilePool().acquire();
                     glBindFramebuffer(GL_FRAMEBUFFER, it->second.fbo);
                     glReadPixels(kApron, kApron, kTileSize, kTileSize,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, snap.bytes.data());
-                    writeTileBytesToDisk(layerIdx, tx, ty, snap.bytes.data());
+                                 GL_RGBA, GL_UNSIGNED_BYTE, fresh->data());
+                    // Mirror the post-bake bytes into the BEFORE-
+                    // snapshot cache so the NEXT stroke's commit
+                    // doesn't need to glReadPixels for the BEFORE
+                    // pass — it reads straight from the cache.
+                    it->second.cachedBytes = fresh;
+                    snap.bytes = fresh;
+                    writeTileBytesToDisk(layerIdx, tx, ty, fresh->data());
                 }
                 entry.afterTiles.push_back(std::move(snap));
             }
@@ -10016,17 +10213,23 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
         if (changed) {
             // Confirm at least one tile differs (avoids a useless entry
             // when, e.g., the stroke missed every pixel of every tile).
+            // shared_ptr equality is a fast pointer compare; differ via
+            // memcmp only when the pointers point at different buffers.
             changed = false;
             for (size_t i = 0; i < entry.beforeTiles.size(); ++i) {
                 const auto& b = entry.beforeTiles[i];
                 const auto& a = entry.afterTiles[i];
-                if (b.existed != a.existed
-                    || b.bytes.size() != a.bytes.size()
-                    || (b.existed && std::memcmp(b.bytes.data(),
-                                                  a.bytes.data(),
-                                                  b.bytes.size()) != 0)) {
-                    changed = true;
-                    break;
+                if (b.existed != a.existed) {
+                    changed = true; break;
+                }
+                if (!b.existed) continue;
+                if (b.bytes == a.bytes) continue;            // same buffer = no change
+                if (!b.bytes || !a.bytes) { changed = true; break; }
+                if (b.bytes->size() != a.bytes->size()
+                    || std::memcmp(b.bytes->data(),
+                                   a.bytes->data(),
+                                   b.bytes->size()) != 0) {
+                    changed = true; break;
                 }
             }
         }

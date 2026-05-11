@@ -21,46 +21,33 @@ object NativeRenderer {
      */
     external fun loadDocument(path: String)
 
+    /**
+     * Block the calling thread until every queued tile write/delete
+     * has been drained. Tile saves run on a background thread; this is
+     * the synchronization point used at doc switches and on app pause
+     * so the user's last strokes can't be lost if the process is
+     * killed shortly after.
+     */
+    external fun flushTileWrites()
+
     /** Reset emitter state and start a new in-progress stroke. */
     external fun beginStroke()
-
-    /**
-     * Append a sample to the current stroke and emit any new dabs needed to
-     * reach (x, y), additively, into the bound (front-buffered) layer.
-     */
-    external fun extendStroke(
-        width: Int, height: Int,
-        transform: FloatArray,
-        x: Float, y: Float, pressure: Float
-    )
-
-    /**
-     * Like extendStroke but the sample is NOT recorded into the stroke's
-     * sample list — commitStroke won't bake it. Use this for motion-
-     * predicted dabs (rendered to front buffer to mask input latency);
-     * they disappear on the next multi-buffer pass.
-     */
-    external fun extendStrokePredicted(
-        width: Int, height: Int,
-        transform: FloatArray,
-        x: Float, y: Float, pressure: Float
-    )
 
     /**
      * Batched stroke extension. xyp packs `[x,y,p, x,y,p, ...]` in
      * doc-pixels; the first `realCount` triples are real samples
      * (persisted for the bake and used to update the coverage mirror)
      * and the remainder are predicted (rendered to the front-buffer
-     * preview only and reverted at the next batch). Replaces the
-     * per-sample extendStroke / extendStrokePredicted JNIs in the hot
-     * path: one mirror blit and one preview-overlay render per batch
-     * regardless of sample count.
+     * preview only and reverted at the next batch). One mirror blit
+     * and one preview-overlay render per batch regardless of sample
+     * count.
      */
     external fun extendStrokeBatch(
         width: Int, height: Int,
         transform: FloatArray,
         xyp: FloatArray, realCount: Int
     )
+
 
     /**
      * Bake the in-progress stroke into the tiles its bbox touches, then drop
@@ -201,9 +188,10 @@ object NativeRenderer {
     /**
      * Runtime toggle for motion-predicted dabs in the front-buffer
      * preview. When off, the Kotlin side stops dispatching predicted
-     * batches; when on, predicted dabs render via extendStrokePredicted
-     * and are reverted from the live preview before the next real dab
-     * is applied.
+     * batches; when on, predicted samples ride along in the
+     * extendStrokeBatch payload after the real samples and are
+     * reverted from the live preview before the next real batch is
+     * applied.
      */
     external fun setPredictionEnabled(enabled: Boolean)
     external fun isPredictionEnabled(): Boolean

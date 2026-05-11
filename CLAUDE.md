@@ -87,12 +87,14 @@ Selection mutations (`hitTestActiveVectorLayer`, `deleteSelection`, transform dr
 - `renderFrontBufferedLayer(action)` — low-latency render for live stroke / shape preview.
 - `commit()` — flushes to multi-buffer; framework calls `onDrawMultiBufferedLayer` with the accumulated actions.
 
-`StrokeAction` is a sealed class: `Sample(x, y, pressure, isNewStroke)` for brush/eraser, `ShapePreview(shapeType, x0..y1, snapped)` for shape tools. Sample coordinates are doc-px (Kotlin converts before constructing the action).
+`StrokeAction` is a sealed class: `BatchSamples(xyp, realCount, isNewStroke, …)` for brush/eraser, `ShapePreview(shapeType, x0..y1, snapped)` for shape tools, and `LassoPreview(points, closed)` for raster lasso. Sample coordinates are doc-px (Kotlin converts before packing the action).
+
+`BatchSamples` packs every sample from a single `MotionEvent` into one dispatch: real samples (the historical rows plus the current) followed by an optional predicted tail from `MotionEventPredictor`. `realCount` marks the real/predicted boundary. One `renderFrontBufferedLayer` call per `MotionEvent`, one native call (`extendStrokeBatch`), and one preview-overlay render per batch — keeps GL-thread work constant-time regardless of how many samples or how long the stroke. Motion prediction is gated by `g_predictionEnabled` (mirrored from `predictionEnabled` on the surface view, status-bar toggle; defaults on). The native side keeps a `g_coverageReal` FBO mirror and an emitter snapshot so it can revert predicted dabs from the live preview before applying the next real batch.
 
 Stroke lifecycle:
-1. `ACTION_DOWN` → `Sample(isNewStroke=true)` → native `beginStroke` clears `g_current.samples`.
-2. `ACTION_MOVE` → `Sample`s → native `extendStroke` appends to samples and renders the live preview.
-3. `ACTION_UP` → `r.commit()` → native `commitStroke` bakes samples into tile FBOs, snapshots tiles for undo, saves to disk.
+1. `ACTION_DOWN` → `BatchSamples(realCount=1, isNewStroke=true)` → native `beginStroke` clears `g_current.samples` and snapshots `g_predictionEnabled` into a per-stroke flag.
+2. `ACTION_MOVE` → `BatchSamples(real + predicted tail)` → native `extendStrokeBatch` reverts any pending prediction, applies real dabs (mirror after), applies predicted dabs (if active), and renders the front-buffer overlay once.
+3. `ACTION_UP` → `r.commit()` → native `commitStroke` bakes the real samples into tile FBOs (predicted samples are never persisted), snapshots tiles for undo, saves to disk.
 
 ### Undo / redo
 
