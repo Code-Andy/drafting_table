@@ -14,6 +14,8 @@ buffers: {
 # wired into the kernel ftrace ring. Categories chosen for graphics
 # pipeline visibility:
 #   gfx        - SurfaceFlinger composition, layer updates, fences
+#   sf         - SurfaceFlinger detailed events (composition strategy,
+#                latch, frame allocator, transaction apply)
 #   view       - View.draw() and HWUI render thread
 #   input      - input dispatcher events (touch/stylus)
 #   sched      - scheduler context switches (correlate GL thread vs
@@ -21,9 +23,11 @@ buffers: {
 #   binder_driver - IPC between our app and SurfaceFlinger / system
 #                services (request → response timing)
 #   freq       - CPU frequency changes (rules out throttling)
+#   wm         - WindowManager (visibility / focus transitions)
 # Plus our own atrace_apps entries — emits the DrawingApp.* sections
 # we instrument in renderer.cpp (ATraceScope) and DrawingSurfaceView
-# (android.os.Trace.beginSection / endSection).
+# (android.os.Trace.beginSection / endSection). atrace_apps "*"
+# captures system_server / surfaceflinger native atraces too.
 data_sources: {
     config {
         name: "linux.ftrace"
@@ -35,12 +39,15 @@ data_sources: {
             ftrace_events: "power/cpu_idle"
             ftrace_events: "power/cpu_frequency"
             atrace_categories: "gfx"
+            atrace_categories: "sf"
             atrace_categories: "view"
             atrace_categories: "input"
             atrace_categories: "sched"
             atrace_categories: "freq"
             atrace_categories: "binder_driver"
+            atrace_categories: "wm"
             atrace_apps: "com.bk.drawing"
+            atrace_apps: "*"
         }
     }
 }
@@ -52,6 +59,44 @@ data_sources: {
         process_stats_config {
             scan_all_processes_on_start: true
         }
+    }
+}
+
+# Per-frame timeline from SurfaceFlinger: expected vs actual present
+# times per layer, jank classification, and the chain from "app commit"
+# through "GPU done" through "presented to display". This is the track
+# that tells us, for a given vsync, which MB buffer was actually
+# scanned out — exactly what we need to chase the flash.
+data_sources: {
+    config {
+        name: "android.surfaceflinger.frame"
+    }
+}
+
+# Per-frame layer snapshots: the BufferQueue state of every layer at
+# each composition, including which buffer index is "front" vs "back"
+# and acquire/release fence status. With this enabled, the trace shows
+# explicitly when our MB SurfaceControl swaps to the freshly-rendered
+# buffer (and whether SurfaceFlinger picked the previous buffer for
+# any vsync because the new one's fence wasn't yet signaled).
+#
+# Bare config block — the surfaceflinger_layers_config sub-message is
+# Android-version-dependent and absent on some traced builds. The
+# defaults capture base composition state, which is what we need.
+data_sources: {
+    config {
+        name: "android.surfaceflinger.layers"
+    }
+}
+
+# Transaction stream: every SurfaceControl.Transaction.apply() that
+# SurfaceFlinger receives, including the FB-hide + MB-buffer-set pair
+# the GLFrontBufferedRenderer assembles on commit. Lets us verify
+# atomicity (or lack of it) of the two operations at the moment the
+# flash happens.
+data_sources: {
+    config {
+        name: "android.surfaceflinger.transactions"
     }
 }
 

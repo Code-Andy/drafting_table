@@ -62,12 +62,14 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <dirent.h>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -95,7 +97,9 @@ struct ATraceScope {
         if (ATrace_isEnabled()) ATrace_endSection();
     }
 };
-#define ATRACE_SCOPE(name) ATraceScope _atrace_scope_##__LINE__(name)
+#define ATRACE_CONCAT_(a, b) a##b
+#define ATRACE_CONCAT(a, b)  ATRACE_CONCAT_(a, b)
+#define ATRACE_SCOPE(name) ATraceScope ATRACE_CONCAT(_atrace_scope_, __LINE__)(name)
 
 namespace {
 
@@ -965,6 +969,44 @@ bool    g_predictionInFlight = false;
 // is a no-op so the coverage mirror can't desync.
 bool    g_strokePredictionActive = false;
 
+// ---- Multi-buffer cache (partial re-composite path) ---------------------
+//
+// GLFrontBufferedRenderer hands us a freshly-cleared MB.back every
+// commit, with no setting to preserve the previous frame. To avoid
+// re-rendering the entire document each commit (~11 ms at our doc
+// size, the dominant slice of the commit-flash window we measured via
+// perfetto), we maintain our own copy of MB's pixels and restore them
+// at the start of every renderDocument. Then we only re-composite the
+// region the just-finished stroke actually touched, scissored to a
+// dirty bbox. Saves ~9 ms per commit on typical strokes — enough to
+// land commits inside one 90 Hz vsync and eliminate the flash.
+ViewFbo g_mbCache;
+// Set true once g_mbCache contains a valid copy of the previous
+// frame's MB content. Reset whenever something invalidates that
+// cache (transform/zoom changed, layer count changed, doc switched,
+// etc.) — those force a full re-render that refreshes the cache.
+bool    g_mbCacheValid = false;
+// Doc-px bbox of the region affected by the most recent stroke /
+// bucket-fill / tile-mutating op. populated set true means
+// renderDocument can take the partial path; consumed (cleared) at
+// the start of renderDocument. Other render triggers (layer toggle,
+// doc switch, view transform change) leave this null and get a full
+// re-composite.
+struct PendingDirtyBbox {
+    bool  populated = false;
+    float minX = 0, minY = 0;
+    float maxX = 0, maxY = 0;
+};
+PendingDirtyBbox g_pendingDirtyBbox;
+// Last transform passed to renderDocument; compared against the
+// current one to detect view scale / pan / rotation changes. The
+// stored cache is keyed to a specific transform — if the user pans
+// or zooms, the cached pixels are at the wrong screen position and
+// we must do a full re-render.
+float g_mbCacheTransform[16] = { 0 };
+int   g_mbCacheWidth  = 0;
+int   g_mbCacheHeight = 0;
+
 std::vector<std::unique_ptr<Page>> g_pages;
 size_t g_activePageIdx = 0;
 size_t g_strokeTarget  = 0;          // captured at beginStroke
@@ -1719,6 +1761,10 @@ void loadVectorLayerShapes(Layer& layer, const std::string& dir);
 void saveTileToDisk(size_t layerIdx, int64_t tileK);
 void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
                           const uint8_t* bytes);
+void enqueueDeferredSave(size_t layerIdx, int64_t tileK);
+void drainPendingSaveTiles();
+void drainPendingSaveTilesForBbox(size_t layerIdx,
+                                  int tx0, int tx1, int ty0, int ty1);
 static void flushDiskWriter();
 void snapshotAllTiles(size_t layerIdx, std::vector<TileSnap>& out);
 void snapshotTilesInBbox(size_t layerIdx, int tx0, int tx1, int ty0, int ty1,
@@ -1787,7 +1833,19 @@ void applyPendingLayerActions() {
         actions.swap(g_pendingActions);
     }
     // Every action below uses layers() / activeLayer(), which need a page.
-    if (!actions.empty()) ensureAtLeastOnePage();
+    if (!actions.empty()) {
+        ensureAtLeastOnePage();
+        // Any pending action (layer add/move/delete, undo/redo, doc
+        // switch, etc.) potentially changes MB content outside what
+        // any single stroke could touch. Invalidate the partial-
+        // recomposite cache so the next renderDocument does a full
+        // re-render and refreshes the cache.
+        g_mbCacheValid = false;
+        // Drain deferred saves now, BEFORE the actions execute. The
+        // queue's keys are layerIdx-relative-to-active-page; layer or
+        // page mutations would re-map them to the wrong destinations.
+        drainPendingSaveTiles();
+    }
     for (int a : actions) {
         if (a == kActionAddLayer) {
             size_t prevActive = activeLayer();
@@ -2581,25 +2639,40 @@ void markApronStaleAround(Layer& layer, int tx, int ty) {
 }
 
 // Pull edge data from existing neighbors into this tile's apron. No-op
-// for sides where there is no neighbor — the apron stays zeroed
-// (transparent), which is the right behavior at the canvas edge: LINEAR
+// for sides where there is no neighbor — the apron is cleared to
+// transparent, which is the right behavior at the canvas edge: LINEAR
 // composite samples blend the interior edge texel with transparent,
 // fading the stroke out smoothly rather than producing a hard step.
+//
+// Uses glBlitFramebuffer (and a scissored glClear for missing neighbors)
+// rather than glCopyTexSubImage2D / glTexSubImage2D. The CopyTex path
+// forces a tile-memory flush on TBDR mobile GPUs (Adreno/Mali) — each
+// call costs hundreds of µs regardless of pixel count, and a single
+// commit can issue tens of these (9 stale tiles × 8 neighbors). Blits
+// go through dedicated hardware and don't pay that cost. Measured drop
+// from ~10 ms to <1 ms on the MovinkPad's flash repro.
 void syncTileApron(Layer& layer, int tx, int ty) {
     auto it = layer.tiles.find(tileKey(tx, ty));
     if (it == layer.tiles.end()) return;
     Tile& t = it->second;
     if (!t.apronStale) return;
 
-    GLint prevFbo = 0;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
-    glBindTexture(GL_TEXTURE_2D, t.texture);
+    // Save state we may clobber. The caller may have:
+    //   - Both FBO bindings set (the partial-recomposite path binds
+    //     MB.back as draw and may have a neighbor as read).
+    //   - Scissor enabled (partial-recomposite confines composite to
+    //     the dirty bbox in MB.back coords — meaningless for tile FBOs).
+    GLint prevDrawFbo = 0;
+    GLint prevReadFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+    GLboolean scissorWas = glIsEnabled(GL_SCISSOR_TEST);
+    GLint scissorBox[4];
+    glGetIntegerv(GL_SCISSOR_BOX, scissorBox);
 
-    // Static zero buffer big enough for one tile-edge worth of pixels —
-    // used to clear an apron strip when there's no neighbor on that
-    // side. (Small allocation, kept static.)
-    static const std::vector<uint8_t> zeros(
-        static_cast<size_t>(kTileSize) * 4, 0);
+    // Bind dest tile's FBO as the draw target for blits and clears.
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, t.fbo);
+    glDisable(GL_SCISSOR_TEST);
 
     auto copyFromNeighbor = [&](int nx, int ny,
                                 int srcX, int srcY,
@@ -2608,14 +2681,17 @@ void syncTileApron(Layer& layer, int tx, int ty) {
         auto nIt = layer.tiles.find(tileKey(nx, ny));
         if (nIt != layer.tiles.end()) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, nIt->second.fbo);
-            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dstX, dstY, srcX, srcY, w, h);
+            glBlitFramebuffer(srcX, srcY, srcX + w, srcY + h,
+                              dstX, dstY, dstX + w, dstY + h,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
         } else {
             // No neighbor — clear that apron strip to transparent so a
-            // recently-deleted neighbor's stale data doesn't linger
-            // (and so freshly-rendered canvas-edge tiles fade out
-            // smoothly under LINEAR sampling instead of stepping).
-            glTexSubImage2D(GL_TEXTURE_2D, 0, dstX, dstY, w, h,
-                            GL_RGBA, GL_UNSIGNED_BYTE, zeros.data());
+            // recently-deleted neighbor's stale data doesn't linger.
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(dstX, dstY, w, h);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDisable(GL_SCISSOR_TEST);
         }
     };
 
@@ -2653,7 +2729,11 @@ void syncTileApron(Layer& layer, int tx, int ty) {
     copyFromNeighbor(tx - 1, ty + 1, last,   kApron, aprL, aprB, 1, 1);
     copyFromNeighbor(tx + 1, ty + 1, kApron, kApron, aprR, aprB, 1, 1);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    // Restore scissor + FBO bindings.
+    glScissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]);
+    if (scissorWas) glEnable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFbo);
     t.apronStale = false;
 }
 
@@ -4598,6 +4678,9 @@ void applyPendingShapes() {
     }
     if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty())
         return;
+    // Any new vector shape changes what compositeAllLayers will draw,
+    // so the partial-recomposite cache must be considered stale.
+    g_mbCacheValid = false;
 
     ensureAtLeastOnePage();
 
@@ -4714,6 +4797,80 @@ void saveTileToDisk(size_t layerIdx, int64_t tileK) {
     it->second.cachedBytes = fresh;
 
     writeTileBytesToDisk(layerIdx, tx, ty, fresh->data());
+}
+
+// ---- Deferred saveTile queue ---------------------------------------------
+//
+// saveTileToDisk's glReadPixels is the dominant cost in commitStroke
+// (~3 ms per tile on TBDR mobile GPUs — same tile-store flush issue
+// as apronSync's old glCopyTexSubImage2D path). For typical fast
+// handwriting commits with 3 dirty tiles that's ~10 ms of
+// synchronous stall, enough to push commit past one vsync.
+//
+// We defer the call: commitStroke enqueues `(layerIdx, tileK)` here,
+// nulls the tile's cachedBytes (so any subsequent BEFORE snapshot
+// knows to refresh from the GPU rather than use stale data), and
+// returns fast. The queue is drained from:
+//   - Trailing-edge idle commits (Kotlin scheduler, ~250 ms after the
+//     last stroke), via the JNI flushPendingSaveTiles().
+//   - The next stroke's BEFORE-snapshot for tiles that overlap its
+//     bbox (drainPendingSaveTilesForBbox below) — those tiles need
+//     fresh cachedBytes anyway.
+//   - applyPendingLayerActions when any action is queued, since
+//     layer/page mutations would invalidate layerIdx-relative keys.
+//   - Best-effort on app pause (MainActivity.onPause calls
+//     forceRedraw() which triggers an idle MB pass and drains).
+//
+// GL-thread only — saveTileToDisk uses GL. No mutex required.
+std::deque<std::pair<size_t, int64_t>> g_pendingSaveTiles;
+
+void enqueueDeferredSave(size_t layerIdx, int64_t tileK) {
+    // Null out cachedBytes — the in-memory mirror is now stale
+    // (FBO has post-bake content, cache still has pre-bake). The
+    // BEFORE-snapshot fast path checks cachedBytes; nulling it
+    // routes to the synchronous-readback fallback for any tile
+    // that's still pending when its next snapshot needs it.
+    if (layerIdx < layers().size() && layers()[layerIdx]) {
+        auto& tiles = layers()[layerIdx]->tiles;
+        auto it = tiles.find(tileK);
+        if (it != tiles.end()) {
+            it->second.cachedBytes.reset();
+        }
+    }
+    g_pendingSaveTiles.emplace_back(layerIdx, tileK);
+}
+
+void drainPendingSaveTiles() {
+    if (g_pendingSaveTiles.empty()) return;
+    ATRACE_SCOPE("DrawingApp.drainPendingSaveTiles");
+    // saveTileToDisk does its own FBO save/restore, so iteration is
+    // safe even if the GL state changes between entries.
+    while (!g_pendingSaveTiles.empty()) {
+        auto [layerIdx, k] = g_pendingSaveTiles.front();
+        g_pendingSaveTiles.pop_front();
+        saveTileToDisk(layerIdx, k);
+    }
+}
+
+void drainPendingSaveTilesForBbox(size_t layerIdx,
+                                  int tx0, int tx1, int ty0, int ty1) {
+    if (g_pendingSaveTiles.empty()) return;
+    ATRACE_SCOPE("DrawingApp.drainPendingSaveTilesForBbox");
+    auto it = g_pendingSaveTiles.begin();
+    while (it != g_pendingSaveTiles.end()) {
+        if (it->first == layerIdx) {
+            int tx, ty;
+            unpackTileKey(it->second, tx, ty);
+            if (tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1) {
+                size_t li = it->first;
+                int64_t k = it->second;
+                it = g_pendingSaveTiles.erase(it);
+                saveTileToDisk(li, k);
+                continue;
+            }
+        }
+        ++it;
+    }
 }
 
 // ---- Bake -----------------------------------------------------------------
@@ -4927,15 +5084,24 @@ static void rebakeStroke(const UndoEntry& e) {
         }
     }
 
-    // Bake + persist. bakeCurrentStrokeIntoTiles clears g_current.samples
-    // at the end (matching the production commit flow); the disk save
-    // mirrors the post-bake bytes into each tile's cachedBytes so any
-    // future BEFORE snapshot reads from the cache rather than glReadPixels.
+    // Bake + persist. bakeCurrentStrokeIntoTiles binds tile FBOs in a
+    // loop and exits with the last one bound — fine for commitStroke
+    // (which wraps the call in a prevFbo save/restore) but fatal here:
+    // rebakeStroke runs inside applyPendingLayerActions, which is
+    // drained before compositeAllLayers. If we exit with a tile FBO
+    // bound, the subsequent clear/grid/composite all go to the tile
+    // instead of MB.back and the canvas turns black. Save + restore the
+    // binding around the bake to keep the multi-buffer FBO active.
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
     std::vector<int64_t> dirty;
     bakeCurrentStrokeIntoTiles(&dirty, e.layerIdx);
     for (int64_t k : dirty) {
         saveTileToDisk(e.layerIdx, k);
     }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 
     // Restore.
     g_strokeBrushColor[0] = saveColor[0];
@@ -4975,6 +5141,7 @@ void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
 }
 
 void compositeRasterLayer(const Layer& layer, float opacityOverride) {
+    ATRACE_SCOPE("DrawingApp.compositeRasterLayer");
     // Caller must have bound the raster pipeline first. opacityOverride
     // < 0 (the default) means "use the layer's own opacity"; passing
     // 1.0 forces opaque compositing (used by bucket fill so a partly-
@@ -4984,34 +5151,36 @@ void compositeRasterLayer(const Layer& layer, float opacityOverride) {
         : layer.opacity.load(std::memory_order_relaxed);
     glUniform1f(g_comp.uOpacity, effective);
 
-    // Lazily refresh any tile aprons that have been flagged stale since
-    // the last composite. This guarantees LINEAR sampling at the tile
-    // edges blends into up-to-date neighbor data instead of leaving a
-    // visible seam. Apron sync mutates tile state (apronStale flag and
-    // texture sub-image), so we cast away const; conceptually the
-    // composite is read-only and the apron is just a derived cache.
-    Layer& mut = const_cast<Layer&>(layer);
-    GLint prevReadFbo = 0;
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
-    for (auto& kv : mut.tiles) {
-        if (!kv.second.apronStale) continue;
-        int tx, ty;
-        unpackTileKey(kv.first, tx, ty);
-        syncTileApron(mut, tx, ty);
+    {
+        ATRACE_SCOPE("DrawingApp.compositeRasterLayer.apronSync");
+        // Lazily refresh any tile aprons that have been flagged stale since
+        // the last composite. This guarantees LINEAR sampling at the tile
+        // edges blends into up-to-date neighbor data instead of leaving a
+        // visible seam. Apron sync mutates tile state (apronStale flag and
+        // tile texture), so we cast away const; conceptually the
+        // composite is read-only and the apron is just a derived cache.
+        // syncTileApron saves/restores FBO + scissor state on its own.
+        Layer& mut = const_cast<Layer&>(layer);
+        for (auto& kv : mut.tiles) {
+            if (!kv.second.apronStale) continue;
+            int tx, ty;
+            unpackTileKey(kv.first, tx, ty);
+            syncTileApron(mut, tx, ty);
+        }
+        glActiveTexture(GL_TEXTURE0);
     }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
-    // syncTileApron leaves GL_TEXTURE_2D bound to whichever tile was
-    // last touched; rebind defensively before the composite loop.
-    glActiveTexture(GL_TEXTURE0);
 
-    for (const auto& kv : layer.tiles) {
-        int tx, ty;
-        unpackTileKey(kv.first, tx, ty);
-        float cx = tx * kTileSizeF + kTileHalfF;
-        float cy = ty * kTileSizeF + kTileHalfF;
-        glBindTexture(GL_TEXTURE_2D, kv.second.texture);
-        glUniform2f(g_comp.uTileCenter, cx, cy);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    {
+        ATRACE_SCOPE("DrawingApp.compositeRasterLayer.drawTiles");
+        for (const auto& kv : layer.tiles) {
+            int tx, ty;
+            unpackTileKey(kv.first, tx, ty);
+            float cx = tx * kTileSizeF + kTileHalfF;
+            float cy = ty * kTileSizeF + kTileHalfF;
+            glBindTexture(GL_TEXTURE_2D, kv.second.texture);
+            glUniform2f(g_comp.uTileCenter, cx, cy);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
     }
 }
 
@@ -5666,10 +5835,13 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
 
 void compositeAllLayers(JNIEnv* env, jint width, jint height,
                         jfloatArray transform) {
+    ATRACE_SCOPE("DrawingApp.compositeAllLayers");
     glViewport(0, 0, width, height);
 
     PageClip pageClip = readPageClip();
 
+    {
+        ATRACE_SCOPE("DrawingApp.compositeAllLayers.clearAndGrid");
     if (pageClip.active) {
         // Off-canvas background: light gray clear, then paint paper-white
         // over the page rectangle. With page disabled, fall back to a
@@ -5732,6 +5904,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
                         pageClip.minX, pageClip.minY, kPageColor, w, kPageAlpha);
         glBindVertexArray(0);
     }
+    }  // close clearAndGrid ATRACE_SCOPE
 
     if (layers().empty()) return;
 
@@ -5742,19 +5915,23 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
 
     bindRasterCompositePipeline(env, width, height, transform);
 
-    for (size_t i = 0; i < layers().size(); ++i) {
-        const auto& layer = layers()[i];
-        if (!layer) continue;
-        if (!layer->visible.load(std::memory_order_relaxed)) continue;
-        if (layer->type == LayerType::Raster) {
-            compositeRasterLayer(*layer);
-        } else { // Vector
-            compositeVectorLayer(env, *layer, i, width, height, transform);
-            // Switch back to raster pipeline for the next raster layer.
-            bindRasterCompositePipeline(env, width, height, transform);
+    {
+        ATRACE_SCOPE("DrawingApp.compositeAllLayers.layerLoop");
+        for (size_t i = 0; i < layers().size(); ++i) {
+            const auto& layer = layers()[i];
+            if (!layer) continue;
+            if (!layer->visible.load(std::memory_order_relaxed)) continue;
+            if (layer->type == LayerType::Raster) {
+                compositeRasterLayer(*layer);
+            } else { // Vector
+                compositeVectorLayer(env, *layer, i, width, height, transform);
+                // Switch back to raster pipeline for the next raster layer.
+                bindRasterCompositePipeline(env, width, height, transform);
+            }
         }
     }
 
+    ATRACE_SCOPE("DrawingApp.compositeAllLayers.selAndChrome");
     // Floating raster selection (if any) — drawn over its owner layer's
     // composite so the lifted pixels appear at their currently-translated
     // position. The owner layer's tiles already have a hole where the
@@ -6681,6 +6858,10 @@ bool liftRasterSelectionPolygon(const float* points, size_t nPoints) {
         if (g_rasterSel.active) return false;
     }
     if (nPoints < 3) return false;
+    // Lifting clears the lifted region in source tiles AND adds a
+    // floating-selection overlay to compositeAllLayers — both
+    // change MB content outside any stroke's bbox. Invalidate cache.
+    g_mbCacheValid = false;
 
     // Polygon AABB.
     float pMinX = points[0], pMinY = points[1];
@@ -6855,6 +7036,9 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
         if (g_rasterSel.active) return false;
     }
+    // Same rationale as liftRasterSelectionPolygon — invalidate the
+    // partial-recomposite cache.
+    g_mbCacheValid = false;
 
     // Normalize the rect.
     if (x1 < x0) std::swap(x0, x1);
@@ -7030,6 +7214,9 @@ void commitRasterSelectionImpl() {
         g_rasterSel.liftedTiles.clear();
         g_rasterSel.active = false;
     }
+    // Dropping the floating selection's pixels back into the layer
+    // changes MB content outside any stroke's bbox. Invalidate cache.
+    g_mbCacheValid = false;
     if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) {
         if (sel.contentTex) glDeleteTextures(1, &sel.contentTex);
         return;
@@ -7308,6 +7495,10 @@ void discardRasterSelectionImpl() {
 // Discard the floating selection by restoring each lifted tile's
 // pre-lift bytes. No undo entry is pushed (net zero change).
 void cancelRasterSelectionImpl() {
+    // Restoring lifted tiles writes back outside any stroke's bbox
+    // and the floating-selection overlay disappears from the
+    // compositor — both invalidate the partial-recomposite cache.
+    g_mbCacheValid = false;
     std::vector<TileSnap> snaps;
     GLuint contentTex = 0;
     size_t layerIdx = 0;
@@ -8100,6 +8291,15 @@ Java_com_bk_drawing_NativeRenderer_flushTileWrites(JNIEnv*, jobject) {
     flushDiskWriter();
 }
 
+// Drain deferred saveTileToDisk work queued by commitStroke. Must be
+// called from the GL thread (uses GL functions). Called from Kotlin's
+// no-stroke onDrawMultiBufferedLayer path (the trailing-edge idle
+// frame ~250 ms after the last stroke commit) — see DrawingSurfaceView.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_flushPendingSaveTiles(JNIEnv*, jobject) {
+    drainPendingSaveTiles();
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring jpath) {
     const char* str = env->GetStringUTFChars(jpath, nullptr);
@@ -8237,6 +8437,10 @@ Java_com_bk_drawing_NativeRenderer_bucketFillAt(
     ensureAtLeastOneLayer();
     uint32_t fillRgb = g_currentBrushColor.load();
     applyBucketFill(env, x, y, fillRgb);
+    // Bucket fill changes pixels across many tiles; the partial-
+    // recomposite cache is no longer trustworthy. Force a full
+    // re-render at the next renderDocument.
+    g_mbCacheValid = false;
 }
 
 // ---- Raster selection JNIs ----------------------------------------------
@@ -8282,6 +8486,9 @@ Java_com_bk_drawing_NativeRenderer_translateRasterSelection(
     if (!g_rasterSel.active) return;
     g_rasterSel.centerX += dx;
     g_rasterSel.centerY += dy;
+    // The floating selection's screen position changed; the cached
+    // frame holds it at the previous location.
+    g_mbCacheValid = false;
 }
 
 JNIEXPORT void JNICALL
@@ -8319,6 +8526,9 @@ Java_com_bk_drawing_NativeRenderer_copySelection(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_cutSelection(JNIEnv*, jobject) {
     ensureInited();
+    // Cut removes either pixels or a vector shape from the doc;
+    // either way MB content changes outside any stroke's bbox.
+    g_mbCacheValid = false;
     bool rasterActive = false;
     {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
@@ -8339,6 +8549,9 @@ Java_com_bk_drawing_NativeRenderer_pasteSelection(JNIEnv*, jobject) {
     applyPendingLayerActions();
     applyPendingShapes();
     ensureAtLeastOneLayer();
+    // Paste creates a new floating selection or vector shape —
+    // invalidates the partial-recomposite cache.
+    g_mbCacheValid = false;
     int kind = g_clipboardKind.load(std::memory_order_acquire);
     if (kind == 2) {
         return pasteVectorSelectionImpl() ? JNI_TRUE : JNI_FALSE;
@@ -8392,6 +8605,7 @@ Java_com_bk_drawing_NativeRenderer_rasterSelectionContains(
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setGridEnabled(JNIEnv*, jobject, jboolean enabled) {
     g_gridEnabled.store(enabled ? 1 : 0);
+    g_mbCacheValid = false;
 }
 
 JNIEXPORT void JNICALL
@@ -8399,6 +8613,7 @@ Java_com_bk_drawing_NativeRenderer_setGridStyle(JNIEnv*, jobject, jint style) {
     // Only 1 (lines) or 2 (dots) are valid; clamp.
     int s = (style == 2) ? 2 : 1;
     g_gridStyle.store(s);
+    g_mbCacheValid = false;
 }
 
 JNIEXPORT void JNICALL
@@ -8544,6 +8759,10 @@ Java_com_bk_drawing_NativeRenderer_addCircle(
 JNIEXPORT jboolean JNICALL
 Java_com_bk_drawing_NativeRenderer_selectShapeAt(
         JNIEnv*, jobject, jfloat x, jfloat y) {
+    // Selection chrome (handles, OBB) renders in compositeAllLayers, so
+    // adding / clearing a selection changes MB content outside any
+    // stroke bbox.
+    g_mbCacheValid = false;
     return hitTestActiveVectorLayer(x, y) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -9247,6 +9466,8 @@ Java_com_bk_drawing_NativeRenderer_updateInteractionAt(
         g_marqueeX1 = x;
         g_marqueeY1 = y;
     }
+    // Any of these drag modes moves selection chrome / shape geometry.
+    g_mbCacheValid = false;
 }
 
 JNIEXPORT void JNICALL
@@ -9447,6 +9668,8 @@ Java_com_bk_drawing_NativeRenderer_updateRasterInteractionAt(
     if (mode == DragMode::Scale)       applyRasterScaleTo(x, y);
     else if (mode == DragMode::Rotate) applyRasterRotateTo(x, y);
     else if (mode == DragMode::Move)   applyRasterMoveTo(x, y);
+    // The floating raster selection's screen footprint changed.
+    g_mbCacheValid = false;
 }
 
 JNIEXPORT void JNICALL
@@ -9458,9 +9681,13 @@ Java_com_bk_drawing_NativeRenderer_endRasterInteraction(JNIEnv*, jobject) {
 
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_clearSelection(JNIEnv*, jobject) {
-    std::lock_guard<std::mutex> lock(g_selectionMutex);
-    g_selection = Selection{};
-    g_extraSelections.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        g_selection = Selection{};
+        g_extraSelections.clear();
+    }
+    // Selection chrome went away — cached frame still has it drawn.
+    g_mbCacheValid = false;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -9484,6 +9711,7 @@ Java_com_bk_drawing_NativeRenderer_translateSelection(
     Layer& layer = *layers()[sel.layerIdx];
     if (layer.type != LayerType::Vector) return;
     translateShape(layer, sel, dx, dy);
+    g_mbCacheValid = false;
 }
 
 // Snap-aware absolute move: drives an in-progress Move drag with the
@@ -9494,12 +9722,14 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_moveSelectionTo(
         JNIEnv*, jobject, jfloat x, jfloat y) {
     applyMoveTo(x, y);
+    g_mbCacheValid = false;
 }
 
 // Remove the currently selected shape from its layer. Clears selection.
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
     deleteAllSelectionsImpl();
+    g_mbCacheValid = false;
 }
 
 // Persist the active vector layer to disk. Used after a transform-drag
@@ -9620,9 +9850,13 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setPageBounds(
         JNIEnv*, jobject,
         jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
-    std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
-    g_pageX0 = x0; g_pageY0 = y0;
-    g_pageX1 = x1; g_pageY1 = y1;
+    {
+        std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
+        g_pageX0 = x0; g_pageY0 = y0;
+        g_pageX1 = x1; g_pageY1 = y1;
+    }
+    // Page bg / outline / discard regions all repaint on resize.
+    g_mbCacheValid = false;
 }
 
 // Update the cached view scale (doc-px per view-px). Read by snap/hit-
@@ -9771,6 +10005,7 @@ Java_com_bk_drawing_NativeRenderer_setLayerVisible(JNIEnv*, jobject,
     if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return;
     bool vis = (visible == JNI_TRUE);
     ls[idx]->visible.store(vis, std::memory_order_relaxed);
+    g_mbCacheValid = false;
 
     std::string dir = activeLayerDir(static_cast<size_t>(idx));
     std::string flagPath = dir + "/hidden.flag";
@@ -9803,6 +10038,7 @@ Java_com_bk_drawing_NativeRenderer_setLayerOpacity(JNIEnv*, jobject,
     if (idx < 0 || static_cast<size_t>(idx) >= ls.size() || !ls[idx]) return;
     float clamped = opacity < 0.0f ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
     ls[idx]->opacity.store(clamped, std::memory_order_relaxed);
+    g_mbCacheValid = false;
 
     std::string dir = activeLayerDir(static_cast<size_t>(idx));
     std::string path = dir + "/opacity.txt";
@@ -10282,10 +10518,13 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
 
-    ensureLoaded();
-    applyPendingLayerActions();
-    applyPendingShapes();
-    ensureAtLeastOneLayer();
+    {
+        ATRACE_SCOPE("DrawingApp.commitStroke.prep");
+        ensureLoaded();
+        applyPendingLayerActions();
+        applyPendingShapes();
+        ensureAtLeastOneLayer();
+    }
 
     size_t layerIdx = g_strokeTarget < layers().size() ? g_strokeTarget
                                                        : layers().size() - 1;
@@ -10299,6 +10538,15 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     int    tx0 = 0, tx1 = 0, ty0 = 0, ty1 = 0;
     UndoEntry entry;
     if (snapForUndo && currentStrokeTileBbox(tx0, tx1, ty0, ty1)) {
+        ATRACE_SCOPE("DrawingApp.commitStroke.beforeSnapshot");
+        // If a prior stroke deferred its saveTileToDisk for tiles in
+        // this bbox, their cachedBytes is nulled and snapshotTilesInBbox
+        // would fall through to a per-tile glReadPixels anyway. Drain
+        // them first — saveTileToDisk does the same readback but ALSO
+        // populates cachedBytes, so the snapshot below hits the fast
+        // path. Net cost is the same as the fallback; the upside is
+        // future strokes don't keep paying.
+        drainPendingSaveTilesForBbox(layerIdx, tx0, tx1, ty0, ty1);
         entry.op = UndoOp::RasterStroke;
         entry.layerIdx = layerIdx;
         snapshotTilesInBbox(layerIdx, tx0, tx1, ty0, ty1, entry.beforeTiles);
@@ -10327,12 +10575,43 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     }
 
     std::vector<int64_t> dirty;
-    bakeCurrentStrokeIntoTiles(&dirty, layerIdx);
+    {
+        ATRACE_SCOPE("DrawingApp.commitStroke.bake");
+        bakeCurrentStrokeIntoTiles(&dirty, layerIdx);
+    }
 
-    // Persist each dirty tile and refresh its cache. saveTileToDisk
-    // does the glReadPixels + queue + cache update in one pass.
-    for (int64_t k : dirty) {
-        saveTileToDisk(layerIdx, k);
+    // Defer per-tile glReadPixels off the commit critical path. See
+    // the enqueueDeferredSave / drainPendingSaveTiles block above for
+    // the full rationale; trade-off is that any future code path
+    // reading these tiles' cachedBytes will hit the readback instead
+    // of the cache.
+    {
+        ATRACE_SCOPE("DrawingApp.commitStroke.deferSaveTiles");
+        for (int64_t k : dirty) {
+            enqueueDeferredSave(layerIdx, k);
+        }
+    }
+
+    // Compute doc-px bbox of the dirty tiles and stash it so the
+    // following renderDocument can take the partial-recomposite
+    // path (restore prior MB content from cache, scissor to this
+    // bbox, re-composite only the changed region).
+    if (!dirty.empty()) {
+        int tdx0 = INT_MAX, tdy0 = INT_MAX;
+        int tdx1 = INT_MIN, tdy1 = INT_MIN;
+        for (int64_t k : dirty) {
+            int tx, ty;
+            unpackTileKey(k, tx, ty);
+            tdx0 = std::min(tdx0, tx);
+            tdy0 = std::min(tdy0, ty);
+            tdx1 = std::max(tdx1, tx);
+            tdy1 = std::max(tdy1, ty);
+        }
+        g_pendingDirtyBbox.populated = true;
+        g_pendingDirtyBbox.minX = static_cast<float>(tdx0 * kTileSize);
+        g_pendingDirtyBbox.minY = static_cast<float>(tdy0 * kTileSize);
+        g_pendingDirtyBbox.maxX = static_cast<float>((tdx1 + 1) * kTileSize);
+        g_pendingDirtyBbox.maxY = static_cast<float>((tdy1 + 1) * kTileSize);
     }
 
     // Push the undo entry if anything was actually drawn. We don't
@@ -10348,6 +10627,45 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
     g_liveEmitter.reset();
 }
 
+// Compute a buffer-px AABB scissor for a doc-px bbox, given the
+// column-major doc→buffer mat4. uTransform's output is buffer-px in
+// the same convention glScissor expects (origin bottom-left, Y up), so
+// no Y flip is needed. The result is padded and clamped to the
+// drawable size; if the bbox lies entirely off-screen the rect's w or
+// h come back zero.
+struct PartialScissor { int x, y, w, h; };
+static PartialScissor dirtyBboxToScissor(const float* m,
+                                         float x0, float y0,
+                                         float x1, float y1,
+                                         int width, int height,
+                                         int pad) {
+    const float cornersX[4] = { x0, x1, x1, x0 };
+    const float cornersY[4] = { y0, y0, y1, y1 };
+    float minBX = std::numeric_limits<float>::infinity();
+    float minBY = std::numeric_limits<float>::infinity();
+    float maxBX = -std::numeric_limits<float>::infinity();
+    float maxBY = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < 4; ++i) {
+        float bx = m[0] * cornersX[i] + m[4] * cornersY[i] + m[12];
+        float by = m[1] * cornersX[i] + m[5] * cornersY[i] + m[13];
+        if (bx < minBX) minBX = bx;
+        if (by < minBY) minBY = by;
+        if (bx > maxBX) maxBX = bx;
+        if (by > maxBY) maxBY = by;
+    }
+    int ix0 = static_cast<int>(std::floor(minBX)) - pad;
+    int iy0 = static_cast<int>(std::floor(minBY)) - pad;
+    int ix1 = static_cast<int>(std::ceil (maxBX)) + pad;
+    int iy1 = static_cast<int>(std::ceil (maxBY)) + pad;
+    if (ix0 < 0)      ix0 = 0;
+    if (iy0 < 0)      iy0 = 0;
+    if (ix1 > width)  ix1 = width;
+    if (iy1 > height) iy1 = height;
+    int w = ix1 - ix0; if (w < 0) w = 0;
+    int h = iy1 - iy0; if (h < 0) h = 0;
+    return { ix0, iy0, w, h };
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_renderDocument(
         JNIEnv* env, jobject,
@@ -10356,9 +10674,87 @@ Java_com_bk_drawing_NativeRenderer_renderDocument(
     ATRACE_SCOPE("DrawingApp.renderDocument");
     ensureInited();
     ensureLoaded();
-    applyPendingLayerActions();
-    applyPendingShapes();
-    compositeAllLayers(env, width, height, transform);
+    {
+        ATRACE_SCOPE("DrawingApp.renderDocument.applyPending");
+        // applyPending* will flip g_mbCacheValid to false if anything
+        // beyond a plain stroke commit drained — those ops can't be
+        // partial-recomposited and force the full path below.
+        applyPendingLayerActions();
+        applyPendingShapes();
+    }
+
+    // The framework binds MB.back before calling onDrawMultiBufferedLayer;
+    // capture it so we can blit to/from g_mbCache and restore at the end.
+    GLint mbBackFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &mbBackFbo);
+
+    float xform[16];
+    env->GetFloatArrayRegion(transform, 0, 16, xform);
+
+    // Consume the pending dirty bbox (single-shot per renderDocument).
+    PendingDirtyBbox bbox = g_pendingDirtyBbox;
+    g_pendingDirtyBbox.populated = false;
+
+    bool sameSize = (g_mbCacheWidth == width && g_mbCacheHeight == height);
+    bool sameXform = std::memcmp(xform, g_mbCacheTransform, sizeof(xform)) == 0;
+    bool canPartial = g_mbCacheValid && sameSize && sameXform && bbox.populated;
+
+    if (canPartial) {
+        ATRACE_SCOPE("DrawingApp.renderDocument.partial");
+        {
+            ATRACE_SCOPE("DrawingApp.renderDocument.partial.cacheRestore");
+            // 1) Restore previous frame's pixels from the cache. NEAREST is
+            //    fine — sizes match exactly.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, g_mbCache.fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mbBackFbo);
+            glDisable(GL_SCISSOR_TEST);
+            glBlitFramebuffer(0, 0, width, height,
+                              0, 0, width, height,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+
+        // 2) Confine the re-composite to the dirty region. Pad by a
+        //    few buffer-px for antialiasing slop. compositeAllLayers
+        //    does an unconditional glClear at start — scissor confines
+        //    the clear, too, so the rest of the cached frame survives.
+        PartialScissor s = dirtyBboxToScissor(
+            xform, bbox.minX, bbox.minY, bbox.maxX, bbox.maxY,
+            width, height, /*pad=*/8);
+        if (s.w > 0 && s.h > 0) {
+            ATRACE_SCOPE("DrawingApp.renderDocument.partial.composite");
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(s.x, s.y, s.w, s.h);
+            compositeAllLayers(env, width, height, transform);
+            glDisable(GL_SCISSOR_TEST);
+        }
+        // If the dirty bbox is fully offscreen, the cached pixels are
+        // already correct — nothing to redraw this frame.
+    } else {
+        ATRACE_SCOPE("DrawingApp.renderDocument.full");
+        glDisable(GL_SCISSOR_TEST);
+        compositeAllLayers(env, width, height, transform);
+    }
+
+    // 3) Snapshot the freshly-rendered MB.back into g_mbCache for the
+    //    next frame's partial path. ensureViewFbo will rebind GL state;
+    //    rebind MB.back afterwards so the framework gets the right
+    //    surface to present.
+    {
+        ATRACE_SCOPE("DrawingApp.renderDocument.cacheBlit");
+        ensureViewFbo(g_mbCache, width, height);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, mbBackFbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_mbCache.fbo);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, width, height,
+                          0, 0, width, height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, mbBackFbo);
+    }
+
+    std::memcpy(g_mbCacheTransform, xform, sizeof(xform));
+    g_mbCacheWidth  = width;
+    g_mbCacheHeight = height;
+    g_mbCacheValid  = true;
 }
 
 // ---- Test-only JNI access ------------------------------------------------

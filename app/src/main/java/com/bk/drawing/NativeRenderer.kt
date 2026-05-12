@@ -30,6 +30,14 @@ object NativeRenderer {
      */
     external fun flushTileWrites()
 
+    /**
+     * Drain deferred per-tile glReadPixels work that commitStroke
+     * queues. Must be invoked from the GL thread (uses GL functions).
+     * Called from the no-stroke onDrawMultiBufferedLayer path so the
+     * cost is paid on a quiet idle frame instead of during commits.
+     */
+    external fun flushPendingSaveTiles()
+
     /** Reset emitter state and start a new in-progress stroke. */
     external fun beginStroke()
 

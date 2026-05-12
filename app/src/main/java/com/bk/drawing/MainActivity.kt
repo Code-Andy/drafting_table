@@ -481,6 +481,14 @@ class MainActivity : AppCompatActivity() {
         // duration of a session; force them to disk before we hand
         // control back to the system so a process kill (low-memory
         // reaper, user task swipe) doesn't lose the last few strokes.
+        //
+        // The forceRedraw triggers one final no-stroke MB pass which
+        // drains commitStroke's deferred glReadPixels queue on the GL
+        // thread. This is best-effort — if the system tears the GL
+        // thread down before that pass completes, the recently
+        // deferred saves may not make it to disk. Normal back/home
+        // transitions give plenty of time.
+        drawingView?.forceRedraw()
         NativeRenderer.flushTileWrites()
         super.onPause()
     }

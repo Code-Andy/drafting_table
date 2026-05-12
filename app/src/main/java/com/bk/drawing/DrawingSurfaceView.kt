@@ -308,20 +308,41 @@ class DrawingSurfaceView @JvmOverloads constructor(
             // drawing). setThumbnailTargets / requestFullThumbnailRefresh
             // sets a one-shot flag to refresh all entries the next time
             // around (used after addPage / switchPage / sidebar rebuild).
-            val targets = thumbnailTargets
-            if (targets != null && targets.isNotEmpty()) {
-                val pageCount  = NativeRenderer.getPageCount()
-                val activePage = NativeRenderer.getActivePage()
-                val refreshAll = thumbnailRefreshAllOnce
-                thumbnailRefreshAllOnce = false
+            //
+            // Stroke commits SKIP the refresh here and defer it to a
+            // trailing-edge forceRedraw — renderPageThumbnail's full
+            // re-composite + glReadPixels is ~8 ms, enough to push the
+            // commit past one vsync and cause a flash on fast handwriting.
+            // Schedule a trailing-edge forceRedraw after every stroke
+            // commit. The next no-stroke commit drains deferred tile
+            // saves and (if the sidebar is open) refreshes thumbnails —
+            // both costs we keep out of the stroke commit critical
+            // path. dedup via removeCallbacks so a flurry of strokes
+            // only triggers one trailing redraw.
+            if (hadStrokeSamples) {
+                removeCallbacks(thumbnailRefreshRunnable)
+                postDelayed(thumbnailRefreshRunnable, kThumbnailDeferMs)
+            } else {
+                // Quiet frame — drain deferred saves and (if needed)
+                // refresh thumbnails. Cheap if nothing's queued.
+                NativeRenderer.flushPendingSaveTiles()
+                removeCallbacks(thumbnailRefreshRunnable)
 
-                for ((idx, bitmap) in targets) {
-                    if (idx !in 0 until pageCount) continue
-                    if (refreshAll || idx == activePage) {
-                        NativeRenderer.renderPageThumbnail(idx, bitmap)
+                val targets = thumbnailTargets
+                if (targets != null && targets.isNotEmpty()) {
+                    val pageCount  = NativeRenderer.getPageCount()
+                    val activePage = NativeRenderer.getActivePage()
+                    val refreshAll = thumbnailRefreshAllOnce
+                    thumbnailRefreshAllOnce = false
+
+                    for ((idx, bitmap) in targets) {
+                        if (idx !in 0 until pageCount) continue
+                        if (refreshAll || idx == activePage) {
+                            NativeRenderer.renderPageThumbnail(idx, bitmap)
+                        }
                     }
+                    post { onThumbnailsUpdated?.invoke() }
                 }
-                post { onThumbnailsUpdated?.invoke() }
             }
 
             // Drain any queued export render. Same pattern as the
@@ -370,6 +391,18 @@ class DrawingSurfaceView @JvmOverloads constructor(
     @Volatile
     private var thumbnailRefreshAllOnce = false
 
+    // Trailing-edge debounce: when a stroke commits we DON'T refresh the
+    // thumbnail in the same multi-buffer pass (renderPageThumbnail does a
+    // full compositeAllLayers + glReadPixels into a Bitmap — ~8 ms on the
+    // MovinkPad, enough to push the commit past one 90 Hz vsync and cause
+    // a flash during fast handwriting). Instead we mark the thumbnail
+    // pending and schedule a trailing forceRedraw — when no new strokes
+    // arrive for kThumbnailDeferMs, the next MB pass has no stroke samples
+    // and the refresh runs there at no commit-latency cost. postDelayed on
+    // a View is thread-safe (posts to the View's Handler), so calling it
+    // from the GL thread is fine.
+    private val thumbnailRefreshRunnable = Runnable { forceRedraw() }
+
     /** Notified on the UI thread after every batch of thumbnails finishes
      *  rendering. The sidebar uses this to ImageView.invalidate() each item. */
     var onThumbnailsUpdated: (() -> Unit)? = null
@@ -383,6 +416,46 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  pass, even those for non-active pages. */
     fun requestFullThumbnailRefresh() {
         thumbnailRefreshAllOnce = true
+    }
+
+    init {
+        // Force the panel to its highest refresh rate (90 Hz on the
+        // MovinkPad). MainActivity sets window.attributes
+        // .preferredDisplayModeId = <90 Hz mode>, but the framework was
+        // ignoring it (dumpsys display showed the panel stuck at the
+        // 60 Hz mode despite our preference). Surface.setFrameRate on
+        // the rendering surface is a stronger signal — it tells the
+        // framework this specific surface needs that rate, which under
+        // CHANGE_FRAME_RATE_ALWAYS forces the panel mode switch for the
+        // duration this surface is visible.
+        //
+        // Direct impact on the flash: each MB transition spans one
+        // vsync of blackout window (FB hidden while the framework's
+        // commit transaction propagates to the display). At 60 Hz that
+        // window is ~16.7 ms and visibly flashes; at 90 Hz it shrinks
+        // to ~11.1 ms and is much less perceptible.
+        // Best-effort frame-rate hint. Under the system "90 Hz" display
+        // setting this is redundant (the panel is already at 90); under
+        // "Adaptive" it's ignored because GLFrontBufferedRenderer's child
+        // SurfaceControls — not this surface — are what SurfaceFlinger
+        // consults for rate selection, and androidx.graphics-core alpha05
+        // doesn't expose setFrameRate on SurfaceControlCompat. Kept in
+        // place so it engages on newer library versions / future code
+        // paths that DO render directly through this Surface.
+        holder.addCallback(object : android.view.SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: android.view.SurfaceHolder) {
+                holder.surface.setFrameRate(
+                    90f,
+                    android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    android.view.Surface.CHANGE_FRAME_RATE_ALWAYS
+                )
+            }
+            override fun surfaceChanged(
+                holder: android.view.SurfaceHolder,
+                format: Int, width: Int, height: Int
+            ) {}
+            override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {}
+        })
     }
 
     private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
@@ -965,6 +1038,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // Limits on the gesture-driven view scale.
         const val kMinViewScale = 0.25f
         const val kMaxViewScale = 8.0f
+        // Trailing-edge debounce window for the deferred thumbnail refresh.
+        const val kThumbnailDeferMs = 250L
     }
 
     private fun endGesture() {
@@ -1017,6 +1092,14 @@ class DrawingSurfaceView @JvmOverloads constructor(
             gestureActive   = false
             suppressTouches = false
             cancelNextCommit = false
+            // Cancel any trailing-edge forceRedraw scheduled by the
+            // prior stroke. If it fired mid-stroke it would trigger
+            // an MB transition with no samples, briefly hiding the
+            // FB-rendered in-progress stroke until the next move
+            // sample restored it — visible to the user as a "skip"
+            // mid-letter. The drain it would have performed gets
+            // picked up on the next post-stroke trailing-edge anyway.
+            removeCallbacks(thumbnailRefreshRunnable)
         }
 
         // While a gesture is active, all events drive the gesture path.
