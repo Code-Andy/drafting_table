@@ -9725,10 +9725,29 @@ Java_com_bk_drawing_NativeRenderer_moveSelectionTo(
     g_mbCacheValid = false;
 }
 
-// Remove the currently selected shape from its layer. Clears selection.
+// Remove the currently selected content. For vector selections, erases
+// each selected shape from its layer (one VectorDelete undo entry each).
+// For a floating raster selection, discards the lifted pixels — the
+// source layer keeps the hole punched out at lift time — and pushes a
+// RasterStroke undo entry for it. Both paths clear the selection.
+//
+// Raster path uses GL (texture delete + glReadPixels on the hole-state
+// tiles for the redo afterTiles snapshot), so callers must invoke this
+// on the GL thread whenever a raster selection is active. The Kotlin
+// layer routes through DrawingSurfaceView.queueDeleteSelection().
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_deleteSelection(JNIEnv*, jobject) {
-    deleteAllSelectionsImpl();
+    ensureInited();
+    bool rasterActive = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        rasterActive = g_rasterSel.active;
+    }
+    if (rasterActive) {
+        discardRasterSelectionImpl();
+    } else {
+        deleteAllSelectionsImpl();
+    }
     g_mbCacheValid = false;
 }
 

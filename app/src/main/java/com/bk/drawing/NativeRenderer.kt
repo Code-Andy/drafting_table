@@ -235,7 +235,12 @@ object NativeRenderer {
      *  translateSelection: move the selected shape by (dx, dy) doc px.
      *  moveSelectionTo:    snap-aware absolute move; drives an in-progress
      *     Move drag using the captured pen-to-center offset.
-     *  deleteSelection: remove the selected shape from its layer.
+     *  deleteSelection: remove the selected vector shape(s) from their
+     *     layer, OR — if a floating raster selection is active — discard
+     *     its lifted pixels (source layer keeps the hole). The raster
+     *     path needs a GL context, so callers must queue this onto the
+     *     GL thread (via DrawingSurfaceView.queueDeleteSelection) when
+     *     a raster selection is active.
      *  persistActiveVectorLayer: write shapes.bin for the active layer
      *     (used after a transform drag completes).
      *

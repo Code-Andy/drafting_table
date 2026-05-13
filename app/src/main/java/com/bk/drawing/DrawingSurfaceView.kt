@@ -294,6 +294,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 pendingCutSel = false
                 NativeRenderer.cutSelection()
             }
+            if (pendingDeleteSel) {
+                pendingDeleteSel = false
+                NativeRenderer.deleteSelection()
+            }
             if (pendingPasteSel) {
                 pendingPasteSel = false
                 NativeRenderer.pasteSelection()
@@ -635,6 +639,18 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  queuePasteSelection to drop the content elsewhere. */
     fun queueCutSelection() {
         pendingCutSel = true
+        forceRedraw()
+    }
+
+    /** Delete the active selection (raster floating selection OR vector
+     *  shape(s)). For raster, this discards the lifted pixels — the
+     *  source layer keeps the hole punched out at lift time. For
+     *  vectors, this erases the shape(s) from their layer. Queued onto
+     *  the next multi-buffer pass since the raster path needs a GL
+     *  context (texture delete + glReadPixels for the redo snapshot).
+     *  No-op (silently) if nothing is selected. */
+    fun queueDeleteSelection() {
+        pendingDeleteSel = true
         forceRedraw()
     }
 
@@ -1440,6 +1456,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
     @Volatile
     private var pendingCopySel = false
     private var pendingCutSel  = false
+    @Volatile
+    private var pendingDeleteSel = false
     @Volatile
     private var pendingPasteSel = false
 

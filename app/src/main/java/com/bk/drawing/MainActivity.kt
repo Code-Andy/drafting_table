@@ -3068,9 +3068,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun userDeleteSelection() {
-        if (NativeRenderer.hasSelection()) {
-            NativeRenderer.deleteSelection()
-            drawingView?.forceRedraw()
+        if (NativeRenderer.hasSelection() || NativeRenderer.hasRasterSelection()) {
+            drawingView?.queueDeleteSelection()
         }
     }
 
