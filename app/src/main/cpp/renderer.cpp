@@ -9991,15 +9991,25 @@ Java_com_bk_drawing_NativeRenderer_setLayerName(JNIEnv* env, jobject,
     }
 
     // Persist. Empty name removes the file so absence is canonical.
-    std::string path = activeLayerDir(static_cast<size_t>(idx)) + "/name.txt";
+    std::string dir = activeLayerDir(static_cast<size_t>(idx));
+    std::string path = dir + "/name.txt";
     if (name.empty()) {
         std::remove(path.c_str());
         return;
     }
-    if (FILE* f = std::fopen(path.c_str(), "wb")) {
-        std::fwrite(name.data(), 1, name.size(), f);
-        std::fclose(f);
+    // A freshly-added raster layer (and the page containing it) may have
+    // no on-disk presence yet — the layer dir is created lazily by the
+    // first stroke bake. Without these mkdirs the fopen below silently
+    // fails and the rename is lost on next launch.
+    mkdir(pageDirOf(g_activePageIdx).c_str(), 0755);
+    mkdir(dir.c_str(), 0755);
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        LOGE("setLayerName: fopen %s failed (errno=%d)", path.c_str(), errno);
+        return;
     }
+    std::fwrite(name.data(), 1, name.size(), f);
+    std::fclose(f);
 }
 
 // Per-layer visibility. Returns true if visible (default), false if
@@ -10031,11 +10041,19 @@ Java_com_bk_drawing_NativeRenderer_setLayerVisible(JNIEnv*, jobject,
     if (vis) {
         std::remove(flagPath.c_str());
     } else {
-        // Make sure the layer dir exists — a freshly-added empty
-        // raster layer has no on-disk presence until something gets
-        // baked into it.
+        // Make sure both the page dir and the layer dir exist — a
+        // freshly-added empty raster layer (and a page that hasn't been
+        // saved to disk yet) has no on-disk presence until something
+        // gets baked into it.
+        mkdir(pageDirOf(g_activePageIdx).c_str(), 0755);
         mkdir(dir.c_str(), 0755);
-        if (FILE* f = std::fopen(flagPath.c_str(), "wb")) std::fclose(f);
+        FILE* f = std::fopen(flagPath.c_str(), "wb");
+        if (!f) {
+            LOGE("setLayerVisible: fopen %s failed (errno=%d)",
+                 flagPath.c_str(), errno);
+            return;
+        }
+        std::fclose(f);
     }
 }
 
@@ -10066,13 +10084,20 @@ Java_com_bk_drawing_NativeRenderer_setLayerOpacity(JNIEnv*, jobject,
         std::remove(path.c_str());
         return;
     }
+    // Both the page dir and the layer dir may not exist yet (empty layer
+    // on a never-saved page). Create both before the fopen.
+    mkdir(pageDirOf(g_activePageIdx).c_str(), 0755);
     mkdir(dir.c_str(), 0755);
-    if (FILE* f = std::fopen(path.c_str(), "wb")) {
-        char buf[16];
-        int n = std::snprintf(buf, sizeof(buf), "%.4f", clamped);
-        if (n > 0) std::fwrite(buf, 1, static_cast<size_t>(n), f);
-        std::fclose(f);
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        LOGE("setLayerOpacity: fopen %s failed (errno=%d)",
+             path.c_str(), errno);
+        return;
     }
+    char buf[16];
+    int n = std::snprintf(buf, sizeof(buf), "%.4f", clamped);
+    if (n > 0) std::fwrite(buf, 1, static_cast<size_t>(n), f);
+    std::fclose(f);
 }
 
 JNIEXPORT jint JNICALL
