@@ -471,6 +471,16 @@ object NativeRenderer {
     external fun setGridStyle(style: Int)   // 1 = lines, 2 = dots
 
     /**
+     * Per-pixel grid overlay. When enabled AND the view is zoomed
+     * enough that one doc-pixel covers several buffer-pixels, renders
+     * a 1-buffer-pixel line at every integer doc-pixel boundary on top
+     * of the layers. Below the zoom threshold it's a no-op (the grid
+     * would be denser than the resolution). Call forceRedraw() to
+     * make a toggle take effect immediately.
+     */
+    external fun setPixelGridEnabled(enabled: Boolean)
+
+    /**
      * Layer-state read accessors for UI display. Values may lag queued
      * addLayer/cycleActiveLayer calls by up to one stroke/render; that's
      * fine for status text.

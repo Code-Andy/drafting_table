@@ -628,6 +628,50 @@ void main() {
 }
 )";
 
+// Per-pixel grid overlay. Drawn on top of the layers when the user
+// toggles it on AND the view scale is high enough that one doc-pixel
+// covers several buffer-pixels (otherwise the grid is denser than the
+// resolution and just fills the screen as a solid wash). Uses fwidth
+// to keep the line at ~1 buffer-pixel wide regardless of zoom — the
+// shared grid shader's 1-doc-pixel AA band would blur to many buffer-
+// pixels at the zoom levels this feature targets.
+const char* kPixelGridVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+void main() {
+    gl_Position = vec4(aQuad, 0.0, 1.0);
+}
+)";
+
+const char* kPixelGridFS = R"(#version 300 es
+precision highp float;
+uniform mat4  uInverseTransform;
+uniform vec4  uColor;        // straight RGBA
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
+out vec4 outColor;
+void main() {
+    vec2 docPos = (uInverseTransform * vec4(gl_FragCoord.xy, 0.0, 1.0)).xy;
+    if (uPageActive != 0 && (
+        docPos.x < uPageMin.x || docPos.x > uPageMax.x ||
+        docPos.y < uPageMin.y || docPos.y > uPageMax.y)) {
+        discard;
+    }
+    // Distance from the nearest integer doc-px boundary, per axis.
+    vec2 dEdge = 0.5 - abs(fract(docPos) - 0.5);
+    // Scale into buffer-pixel space. fwidth gives 1 buffer-pixel ≈
+    // (zoom-recip) doc-px, so dividing rescales the AA band to ~1
+    // buffer-pixel regardless of zoom.
+    vec2 bufD = dEdge / max(fwidth(docPos), vec2(1e-6));
+    // Fade over a single buffer-pixel centered on the boundary — keeps
+    // the line at sub-pixel thickness where the screen permits.
+    float a = 1.0 - smoothstep(0.0, 1.0, min(bufD.x, bufD.y));
+    if (a <= 0.0) discard;
+    float alpha = uColor.a * a;
+    outColor = vec4(uColor.rgb * alpha, alpha);
+}
+)";
+
 // Solid-color fill of an axis-aligned doc-coord rectangle. Used to paint
 // the page-area paper-white over the gray (off-canvas) clear.
 const char* kFillVS = R"(#version 300 es
@@ -985,6 +1029,15 @@ struct RectProg {
     GLint  uPageActive = -1;
 };
 
+struct PixelGridProg {
+    GLuint program          = 0;
+    GLint  uInverseTransform = -1;
+    GLint  uColor            = -1;
+    GLint  uPageMin          = -1;
+    GLint  uPageMax          = -1;
+    GLint  uPageActive       = -1;
+};
+
 struct StampProg {
     GLuint program   = 0;
     GLint  uCoverage = -1;
@@ -1032,6 +1085,7 @@ GridProg    g_grid;
 LineProg    g_lineProg;
 EllipseProg g_ellipseProg;
 RectProg    g_rectProg;
+PixelGridProg g_pixelGridProg;
 StampProg   g_stamp;
 FillProg    g_fill;
 SelProg     g_sel;
@@ -1044,6 +1098,17 @@ bool        g_inited  = false;
 // internally, but the public setter only sends 1 (lines) or 2 (dots).
 std::atomic<int> g_gridEnabled{0};   // 0 = off, 1 = on
 std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
+
+// Pixel grid overlay — 1-buffer-pixel lines at every integer doc-px
+// boundary. Only renders when enabled AND view scale is at least
+// kPixelGridMinViewScale (below that the grid would be denser than the
+// resolution can show, just darkening the canvas). UI toggle persists
+// across launches; the zoom gate is automatic, not user-visible.
+std::atomic<int> g_pixelGridEnabled{0};
+// Below this zoom the grid would be denser than the screen can show;
+// keep some headroom below the gesture max (kMaxViewScale = 8.0) so the
+// grid is visible across a useful zoom range, not just the very top.
+constexpr float kPixelGridMinViewScale = 4.0f;
 
 // Snapping is on by default. Settable from any thread.
 std::atomic<int> g_snapEnabled{1};
@@ -2592,6 +2657,13 @@ void ensureInited() {
     glUniform1f(g_rectProg.uOpacity, 1.0f);
     glUseProgram(0);
 
+    g_pixelGridProg.program          = linkProgram(kPixelGridVS, kPixelGridFS);
+    g_pixelGridProg.uInverseTransform = glGetUniformLocation(g_pixelGridProg.program, "uInverseTransform");
+    g_pixelGridProg.uColor            = glGetUniformLocation(g_pixelGridProg.program, "uColor");
+    g_pixelGridProg.uPageMin          = glGetUniformLocation(g_pixelGridProg.program, "uPageMin");
+    g_pixelGridProg.uPageMax          = glGetUniformLocation(g_pixelGridProg.program, "uPageMax");
+    g_pixelGridProg.uPageActive       = glGetUniformLocation(g_pixelGridProg.program, "uPageActive");
+
     g_stamp.program   = linkProgram(kStampVS, kStampFS);
     g_stamp.uCoverage = glGetUniformLocation(g_stamp.program, "uCoverage");
     g_stamp.uColor    = glGetUniformLocation(g_stamp.program, "uColor");
@@ -2707,6 +2779,40 @@ void renderGridOverlay(JNIEnv* env, int width, int height,
     glUniform4fv(g_grid.uMajorColor, 1, kGridMajorColor);
     glUniform1i(g_grid.uStyle, style);
 
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+}
+
+// Pixel-grid overlay — draws a 1-buffer-pixel-wide line at every integer
+// doc-pixel boundary. Gated on the enable flag AND the current view scale;
+// at low zoom the grid would be denser than the screen can show and just
+// darkens the canvas. Drawn AFTER the layer composite so users can see the
+// grid sitting on top of their pixels (vs the regular grid which renders
+// underneath as a background).
+void renderPixelGridOverlay(JNIEnv* env, int width, int height,
+                            jfloatArray transform) {
+    if (g_pixelGridEnabled.load() == 0) return;
+    if (currentViewScale() < kPixelGridMinViewScale) return;
+
+    jfloat* m = env->GetFloatArrayElements(transform, nullptr);
+    float invM[16];
+    bool ok = invertMat4(m, invM);
+    env->ReleaseFloatArrayElements(transform, m, JNI_ABORT);
+    if (!ok) return;
+
+    glViewport(0, 0, width, height);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_pixelGridProg.program);
+    glBindVertexArray(g_quadVao);
+    glUniformMatrix4fv(g_pixelGridProg.uInverseTransform, 1, GL_FALSE, invM);
+    // Dark gray at ~25% alpha — visible against both paper-white and
+    // dark strokes, but subtle enough that the per-pixel lines don't
+    // dominate the actual pixel content they overlay.
+    float color[4] = { 0.15f, 0.15f, 0.15f, 0.25f };
+    glUniform4fv(g_pixelGridProg.uColor, 1, color);
+    PageClip pageClip = readPageClip();
+    uploadPageClip(g_pixelGridProg.uPageMin, g_pixelGridProg.uPageMax,
+                   g_pixelGridProg.uPageActive, pageClip);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 }
@@ -6478,6 +6584,11 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         }
     }
 
+    // Pixel-grid overlay sits on top of the layers so the user can see
+    // individual pixel boundaries when zoomed in. Internally gated on
+    // view scale, so it's a no-op at low zoom.
+    renderPixelGridOverlay(env, width, height, transform);
+
     ATRACE_SCOPE("DrawingApp.compositeAllLayers.selAndChrome");
     // Floating raster selection (if any) — drawn over its owner layer's
     // composite so the lifted pixels appear at their currently-translated
@@ -9195,6 +9306,16 @@ Java_com_bk_drawing_NativeRenderer_setGridStyle(JNIEnv*, jobject, jint style) {
     // Only 1 (lines) or 2 (dots) are valid; clamp.
     int s = (style == 2) ? 2 : 1;
     g_gridStyle.store(s);
+    g_mbCacheValid = false;
+}
+
+// Pixel grid (1-doc-pixel boundaries) overlay. Renders only when the
+// view scale is high enough to make each doc-pixel several buffer-
+// pixels — see kPixelGridMinViewScale.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setPixelGridEnabled(JNIEnv*, jobject,
+                                                      jboolean enabled) {
+    g_pixelGridEnabled.store(enabled ? 1 : 0);
     g_mbCacheValid = false;
 }
 

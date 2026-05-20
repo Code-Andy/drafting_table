@@ -105,6 +105,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusToolText:  TextView
     private lateinit var statusDocText:   TextView
     private lateinit var statusGridText:    TextView
+    private lateinit var statusPixelGridText: TextView
     private lateinit var statusSnapText:    TextView
     private lateinit var statusAngleText:   TextView
     private lateinit var statusPreviewText: TextView
@@ -139,6 +140,10 @@ class MainActivity : AppCompatActivity() {
 
     // ---- App state mirrors ---------------------------------------------
     private var gridState = 0          // 0 = off, 1 = lines, 2 = dots
+    // Pixel-grid overlay (1-doc-pixel boundaries). Native self-gates on
+    // zoom — only renders when view scale is high enough that pixel
+    // boundaries are visibly distinct. Persists across launches.
+    private var pixelGridEnabled = false
     private var snapEnabled = true
     private var stylusOnly  = true
     private var layerCount = 1
@@ -188,6 +193,7 @@ class MainActivity : AppCompatActivity() {
     private val kPrefBrushSize     = "brush_size_scale"
     private val kPrefVectorWidth   = "vector_line_width"
     private val kPrefStylusOnly    = "stylus_only"
+    private val kPrefPixelGrid     = "pixel_grid_enabled"
     private val kPrefBrushAlpha    = "brush_alpha"
     private val kPrefStrokeUniformAlpha = "stroke_uniform_alpha"
     private val kPrefBrushHardness = "brush_hardness"
@@ -314,6 +320,8 @@ class MainActivity : AppCompatActivity() {
         // Palm-rejection mode persists across launches; defaults on so
         // accidental finger touches don't draw out of the box.
         stylusOnly = prefs().getBoolean(kPrefStylusOnly, true)
+        pixelGridEnabled = prefs().getBoolean(kPrefPixelGrid, false)
+        NativeRenderer.setPixelGridEnabled(pixelGridEnabled)
         // Color picker state — recents + my-slots. Stored as comma-
         // separated 6-digit hex. "" entries in mySlots persist as empty.
         loadColorState()
@@ -2393,6 +2401,18 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (gridState != 0) R.color.hot else R.color.inkSoft))
         }
+        // Pixel grid — 1-doc-pixel boundaries on top of strokes. Native
+        // self-gates on zoom so the chip can read "on" while no grid
+        // shows at low zoom; the user enables once and the grid appears
+        // automatically when they zoom in past the threshold.
+        statusPixelGridText = makeStatusText(
+            if (pixelGridEnabled) "px: on" else "px: off"
+        ).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { togglePixelGrid() }
+            setTextColor(getColor(
+                if (pixelGridEnabled) R.color.hot else R.color.inkSoft))
+        }
         statusSnapText = makeStatusText(
             if (snapEnabled) "snap: on" else "snap: off"
         ).apply {
@@ -2438,6 +2458,7 @@ class MainActivity : AppCompatActivity() {
         bar.addView(statusDocText,    statusItemLp())
         bar.addView(statusToolText,   statusItemLp())
         bar.addView(statusGridText,   statusItemLp())
+        bar.addView(statusPixelGridText, statusItemLp())
         bar.addView(statusSnapText,   statusItemLp())
         bar.addView(statusAngleText,  statusItemLp())
         bar.addView(statusPreviewText, statusItemLp())
@@ -3268,6 +3289,19 @@ class MainActivity : AppCompatActivity() {
             }
             statusGridText.setTextColor(getColor(
                 if (gridState != 0) R.color.hot else R.color.inkSoft))
+        }
+        drawingView?.forceRedraw()
+    }
+
+    private fun togglePixelGrid() {
+        pixelGridEnabled = !pixelGridEnabled
+        NativeRenderer.setPixelGridEnabled(pixelGridEnabled)
+        prefs().edit().putBoolean(kPrefPixelGrid, pixelGridEnabled).apply()
+        if (::statusPixelGridText.isInitialized) {
+            statusPixelGridText.text =
+                if (pixelGridEnabled) "px: on" else "px: off"
+            statusPixelGridText.setTextColor(getColor(
+                if (pixelGridEnabled) R.color.hot else R.color.inkSoft))
         }
         drawingView?.forceRedraw()
     }
