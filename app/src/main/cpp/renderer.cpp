@@ -11010,6 +11010,29 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     // would otherwise render the head of the stroke with one mode and the
     // tail with the other.
     g_strokeUniformAlpha = g_strokeUniformAlphaEnabled.load();
+
+    // In stacking mode the OVER-blend asymptote at the stroke spine is
+    // ~1 - (1 - α)^N where N is the typical per-pixel dab overlap (4-10
+    // depending on hardness/spacing/speed). With the slider passed
+    // directly as the per-dab α, α = 0.25 already saturates the spine
+    // near 75% and α = 0.5 saturates near 95% — the slider behaves as a
+    // narrow lower-range curve, and uniform mode (where slider = stroke
+    // alpha exactly) looks dramatically lighter at the same value.
+    //
+    // Apply the inverse so the slider means "stroke alpha at the spine"
+    // in stacking mode too: per_dab = 1 - (1 - α)^(1/N). After N
+    // overlapping dabs the cumulative spine returns to α. Self-crossings
+    // beyond N still darken (preserving the "stacking" feel that
+    // distinguishes the mode from uniform), but the baseline matches
+    // the slider. Uniform mode leaves the slider as-is.
+    if (!g_strokeUniformAlpha) {
+        constexpr float kStackingDabOverlap = 6.0f;
+        float compensated = 1.0f
+            - std::pow(1.0f - g_strokeBrushAlpha,
+                       1.0f / kStackingDabOverlap);
+        g_strokeBrushAlpha    = compensated;
+        g_strokeBrushColor[3] = compensated;
+    }
 }
 
 // Batched stroke extension. xyp is [x,y,p, x,y,p, ...]; the first
