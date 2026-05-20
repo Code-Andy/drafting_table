@@ -387,6 +387,140 @@ void main() {
 }
 )";
 
+// Vector-layer ellipse/circle outline drawn as a single SDF quad. Replaces
+// the N-segment polyline approach (drawEllipseAsLines), which left dark
+// junction artifacts at sub-1 alpha — each segment's rounded cap overlaps
+// the next segment's cap, and overlapping caps double-cover the same
+// pixels. Single-primitive SDF avoids the overlap entirely so the stroke
+// renders at exactly the requested alpha everywhere.
+const char* kEllipseVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+out vec2 vLocal;       // ellipse-local (axis-aligned), doc-pixels from center
+out vec2 vDocPos;      // for page-bounds discard
+uniform mat4  uTransform;
+uniform vec2  uScreen;
+uniform vec2  uCenter;
+uniform vec2  uRadii;       // (rx, ry)
+uniform float uRotation;
+uniform float uHalfWidth;
+void main() {
+    // Enclose the outer edge of the stroke (rx+halfW, ry+halfW) with a
+    // 1-pixel slack for the AA ramp.
+    vec2 outer = uRadii + vec2(uHalfWidth + 1.0);
+    vec2 local = aQuad * outer;
+    vLocal = local;
+
+    float c = cos(uRotation), s = sin(uRotation);
+    vec2 docPos = uCenter + vec2(local.x * c - local.y * s,
+                                 local.x * s + local.y * c);
+    vDocPos = docPos;
+
+    vec4 bufPx = uTransform * vec4(docPos, 0.0, 1.0);
+    vec2 ndc   = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+}
+)";
+
+const char* kEllipseFS = R"(#version 300 es
+precision highp float;
+in vec2 vLocal;
+in vec2 vDocPos;
+uniform vec2  uRadii;
+uniform float uHalfWidth;
+uniform vec4  uColor;     // straight RGBA (premultiplied at output)
+uniform float uOpacity;
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
+out vec4 outColor;
+
+// Approximate signed distance to the ellipse outline. For rx == ry this
+// reduces to length(p) - rx (exact circle). For unequal radii the relative
+// error grows with eccentricity but stays well under a pixel at the radii
+// / stroke widths used here. Sign is positive outside, negative inside.
+float ellipseDistApprox(vec2 p, vec2 ab) {
+    if (ab.x < 1e-4 || ab.y < 1e-4) return 1e9;
+    float k1 = length(p / ab);
+    float k2 = length(p / (ab * ab));
+    if (k2 < 1e-8) return -min(ab.x, ab.y);
+    return k1 * (k1 - 1.0) / k2;
+}
+
+void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
+    float d  = ellipseDistApprox(vLocal, uRadii);
+    float ad = abs(d);
+    float alpha = 1.0 - smoothstep(uHalfWidth - 0.5, uHalfWidth + 0.5, ad);
+    if (alpha <= 0.0) discard;
+    float a = uColor.a * alpha * uOpacity;
+    outColor = vec4(uColor.rgb * a, a);
+}
+)";
+
+// Vector-layer rectangle outline drawn as a single SDF quad. Same
+// motivation as the ellipse program: drawing the outline as 4 line
+// segments leaves overlapping caps at the corners, which double-cover and
+// render darker than requested whenever alpha < 1.
+const char* kRectVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+out vec2 vLocal;       // rect-local (axis-aligned), doc-pixels from center
+out vec2 vDocPos;
+uniform mat4  uTransform;
+uniform vec2  uScreen;
+uniform vec2  uCenter;
+uniform vec2  uHalfExt;       // (hw, hh)
+uniform float uRotation;
+uniform float uHalfWidth;
+void main() {
+    vec2 outer = uHalfExt + vec2(uHalfWidth + 1.0);
+    vec2 local = aQuad * outer;
+    vLocal = local;
+
+    float c = cos(uRotation), s = sin(uRotation);
+    vec2 docPos = uCenter + vec2(local.x * c - local.y * s,
+                                 local.x * s + local.y * c);
+    vDocPos = docPos;
+
+    vec4 bufPx = uTransform * vec4(docPos, 0.0, 1.0);
+    vec2 ndc   = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+}
+)";
+
+const char* kRectFS = R"(#version 300 es
+precision highp float;
+in vec2 vLocal;
+in vec2 vDocPos;
+uniform vec2  uHalfExt;
+uniform float uHalfWidth;
+uniform vec4  uColor;
+uniform float uOpacity;
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
+out vec4 outColor;
+
+void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
+    // Standard axis-aligned box SDF (positive outside, negative inside).
+    vec2 q = abs(vLocal) - uHalfExt;
+    float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0);
+    float ad = abs(d);
+    float alpha = 1.0 - smoothstep(uHalfWidth - 0.5, uHalfWidth + 0.5, ad);
+    if (alpha <= 0.0) discard;
+    float a = uColor.a * alpha * uOpacity;
+    outColor = vec4(uColor.rgb * a, a);
+}
+)";
+
 // Page-background grid. A fullscreen NDC quad whose fragment shader
 // computes each pixel's document position via the inverse of the
 // framework's transform matrix, then evaluates a periodic line/dot
@@ -785,6 +919,36 @@ struct LineProg {
     GLint  uOpacity    = -1;
 };
 
+struct EllipseProg {
+    GLuint program    = 0;
+    GLint  uTransform  = -1;
+    GLint  uScreen     = -1;
+    GLint  uCenter     = -1;
+    GLint  uRadii      = -1;
+    GLint  uRotation   = -1;
+    GLint  uHalfWidth  = -1;
+    GLint  uColor      = -1;
+    GLint  uOpacity    = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
+};
+
+struct RectProg {
+    GLuint program     = 0;
+    GLint  uTransform  = -1;
+    GLint  uScreen     = -1;
+    GLint  uCenter     = -1;
+    GLint  uHalfExt    = -1;
+    GLint  uRotation   = -1;
+    GLint  uHalfWidth  = -1;
+    GLint  uColor      = -1;
+    GLint  uOpacity    = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
+};
+
 struct FillProg {
     GLuint program    = 0;
     GLint  uTransform = -1;
@@ -823,6 +987,8 @@ CompProg    g_comp;
 PreviewProg g_preview;
 GridProg    g_grid;
 LineProg    g_lineProg;
+EllipseProg g_ellipseProg;
+RectProg    g_rectProg;
 FillProg    g_fill;
 SelProg     g_sel;
 GLuint      g_quadVao = 0;
@@ -2334,6 +2500,38 @@ void ensureInited() {
     glUniform1f(g_lineProg.uOpacity, 1.0f);
     glUseProgram(g_comp.program);
     glUniform1f(g_comp.uOpacity, 1.0f);
+    glUseProgram(0);
+
+    g_ellipseProg.program     = linkProgram(kEllipseVS, kEllipseFS);
+    g_ellipseProg.uTransform  = glGetUniformLocation(g_ellipseProg.program, "uTransform");
+    g_ellipseProg.uScreen     = glGetUniformLocation(g_ellipseProg.program, "uScreen");
+    g_ellipseProg.uCenter     = glGetUniformLocation(g_ellipseProg.program, "uCenter");
+    g_ellipseProg.uRadii      = glGetUniformLocation(g_ellipseProg.program, "uRadii");
+    g_ellipseProg.uRotation   = glGetUniformLocation(g_ellipseProg.program, "uRotation");
+    g_ellipseProg.uHalfWidth  = glGetUniformLocation(g_ellipseProg.program, "uHalfWidth");
+    g_ellipseProg.uColor      = glGetUniformLocation(g_ellipseProg.program, "uColor");
+    g_ellipseProg.uOpacity    = glGetUniformLocation(g_ellipseProg.program, "uOpacity");
+    g_ellipseProg.uPageMin    = glGetUniformLocation(g_ellipseProg.program, "uPageMin");
+    g_ellipseProg.uPageMax    = glGetUniformLocation(g_ellipseProg.program, "uPageMax");
+    g_ellipseProg.uPageActive = glGetUniformLocation(g_ellipseProg.program, "uPageActive");
+    glUseProgram(g_ellipseProg.program);
+    glUniform1f(g_ellipseProg.uOpacity, 1.0f);
+    glUseProgram(0);
+
+    g_rectProg.program     = linkProgram(kRectVS, kRectFS);
+    g_rectProg.uTransform  = glGetUniformLocation(g_rectProg.program, "uTransform");
+    g_rectProg.uScreen     = glGetUniformLocation(g_rectProg.program, "uScreen");
+    g_rectProg.uCenter     = glGetUniformLocation(g_rectProg.program, "uCenter");
+    g_rectProg.uHalfExt    = glGetUniformLocation(g_rectProg.program, "uHalfExt");
+    g_rectProg.uRotation   = glGetUniformLocation(g_rectProg.program, "uRotation");
+    g_rectProg.uHalfWidth  = glGetUniformLocation(g_rectProg.program, "uHalfWidth");
+    g_rectProg.uColor      = glGetUniformLocation(g_rectProg.program, "uColor");
+    g_rectProg.uOpacity    = glGetUniformLocation(g_rectProg.program, "uOpacity");
+    g_rectProg.uPageMin    = glGetUniformLocation(g_rectProg.program, "uPageMin");
+    g_rectProg.uPageMax    = glGetUniformLocation(g_rectProg.program, "uPageMax");
+    g_rectProg.uPageActive = glGetUniformLocation(g_rectProg.program, "uPageActive");
+    glUseProgram(g_rectProg.program);
+    glUniform1f(g_rectProg.uOpacity, 1.0f);
     glUseProgram(0);
 
     g_fill.program    = linkProgram(kFillVS, kFillFS);
@@ -5199,6 +5397,48 @@ void drawLineSegment(float x0, float y0, float x1, float y1,
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
+// Single-quad ellipse outline via SDF. Caller must have bound g_ellipseProg
+// and set the per-frame uniforms (uTransform, uScreen, uOpacity, page clip).
+// rx == ry produces an exact circle. Used in place of drawEllipseAsLines
+// when the alpha may be < 1 (the polyline version double-covers at every
+// segment junction, making sub-opaque strokes look darker than requested).
+void drawEllipseOutline(float cx, float cy, float rx, float ry,
+                        float rotation, uint32_t rgb, float width,
+                        float alpha) {
+    glUniform2f(g_ellipseProg.uCenter, cx, cy);
+    glUniform2f(g_ellipseProg.uRadii, rx, ry);
+    glUniform1f(g_ellipseProg.uRotation, rotation);
+    glUniform1f(g_ellipseProg.uHalfWidth, width * 0.5f);
+    float r = ((rgb >> 16) & 0xFFu) / 255.0f;
+    float g = ((rgb >>  8) & 0xFFu) / 255.0f;
+    float b = ( rgb        & 0xFFu) / 255.0f;
+    float c[4] = { r, g, b, alpha };
+    glUniform4fv(g_ellipseProg.uColor, 1, c);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+// Single-quad rectangle outline via box SDF. Caller must have bound
+// g_rectProg and set per-frame uniforms. Same motivation as
+// drawEllipseOutline: drawing the outline as 4 line segments leaves the
+// rounded caps overlapping at every corner.
+void drawRectOutline(float x0, float y0, float x1, float y1, float rotation,
+                     uint32_t rgb, float width, float alpha) {
+    float cx = (x0 + x1) * 0.5f;
+    float cy = (y0 + y1) * 0.5f;
+    float hw = std::fabs(x1 - x0) * 0.5f;
+    float hh = std::fabs(y1 - y0) * 0.5f;
+    glUniform2f(g_rectProg.uCenter, cx, cy);
+    glUniform2f(g_rectProg.uHalfExt, hw, hh);
+    glUniform1f(g_rectProg.uRotation, rotation);
+    glUniform1f(g_rectProg.uHalfWidth, width * 0.5f);
+    float r = ((rgb >> 16) & 0xFFu) / 255.0f;
+    float g = ((rgb >>  8) & 0xFFu) / 255.0f;
+    float b = ( rgb        & 0xFFu) / 255.0f;
+    float c[4] = { r, g, b, alpha };
+    glUniform4fv(g_rectProg.uColor, 1, c);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 constexpr uint32_t kHandleColor       = 0x4080FFu;   // blue
 // Visual / hit-test sizes for selection UI, expressed in view pixels.
 // Wrapped through vpxToDoc() at use sites so the on-screen size stays
@@ -5692,6 +5932,156 @@ float distToEllipseOutline(float px, float py,
     return std::fabs(lenScaled - 1.0f) * avg;
 }
 
+// ---- Marquee outline-intersection helpers --------------------------------
+//
+// Used by endInteraction's Marquee branch to decide which vector shapes a
+// drag-rectangle picks up. Semantics: "touch outline only" — a marquee
+// fully inside a large rectangle does NOT select it; only marquees that
+// actually overlap painted strokes do.
+
+// Liang-Barsky: does segment (ax,ay)->(bx,by) overlap AABB [x0,x1]x[y0,y1]?
+bool segmentIntersectsAabb(float ax, float ay, float bx, float by,
+                           float x0, float y0, float x1, float y1) {
+    if (ax >= x0 && ax <= x1 && ay >= y0 && ay <= y1) return true;
+    if (bx >= x0 && bx <= x1 && by >= y0 && by <= y1) return true;
+    float dx = bx - ax, dy = by - ay;
+    float t0 = 0.0f, t1 = 1.0f;
+    float p[4] = { -dx,  dx, -dy,  dy };
+    float q[4] = { ax - x0, x1 - ax, ay - y0, y1 - ay };
+    for (int i = 0; i < 4; ++i) {
+        if (std::fabs(p[i]) < 1e-9f) {
+            if (q[i] < 0.0f) return false;
+        } else {
+            float r = q[i] / p[i];
+            if (p[i] < 0.0f) {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            } else {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+        }
+    }
+    return t0 <= t1;
+}
+
+// Fat segment (capsule with square caps) vs AABB: expand the AABB by the
+// stroke's half-width and run the segment test. Slight over-acceptance at
+// the rounded endpoints, well below what users can perceive.
+inline bool fatSegmentIntersectsAabb(float ax, float ay, float bx, float by,
+                                     float halfWidth,
+                                     float x0, float y0,
+                                     float x1, float y1) {
+    return segmentIntersectsAabb(ax, ay, bx, by,
+                                 x0 - halfWidth, y0 - halfWidth,
+                                 x1 + halfWidth, y1 + halfWidth);
+}
+
+// Rotated-rect outline (4 fat edges of the OBB) vs AABB.
+bool rectOutlineIntersectsAabb(const Rect& r,
+                               float x0, float y0, float x1, float y1) {
+    float cx = (r.x0 + r.x1) * 0.5f, cy = (r.y0 + r.y1) * 0.5f;
+    float hw = std::fabs(r.x1 - r.x0) * 0.5f;
+    float hh = std::fabs(r.y1 - r.y0) * 0.5f;
+    float c = std::cos(r.rotation), si = std::sin(r.rotation);
+    // Corners in traversal order: TL, TR, BR, BL.
+    auto corner = [&](float sx, float sy, float& ox, float& oy) {
+        float lx = sx * hw, ly = sy * hh;
+        ox = cx + lx * c - ly * si;
+        oy = cy + lx * si + ly * c;
+    };
+    float qx[4], qy[4];
+    corner(-1.0f, -1.0f, qx[0], qy[0]);
+    corner( 1.0f, -1.0f, qx[1], qy[1]);
+    corner( 1.0f,  1.0f, qx[2], qy[2]);
+    corner(-1.0f,  1.0f, qx[3], qy[3]);
+    float halfW = r.width * 0.5f;
+    for (int i = 0; i < 4; ++i) {
+        int j = (i + 1) & 3;
+        if (fatSegmentIntersectsAabb(qx[i], qy[i], qx[j], qy[j],
+                                     halfW, x0, y0, x1, y1)) return true;
+    }
+    return false;
+}
+
+// Ellipse outline (rotated) sampled as a 64-segment polyline vs AABB.
+// 64 keeps the worst-case chord error well under a stroke width at all
+// realistic sizes (single-shape, single-marquee-end-of-drag — perf is fine).
+bool ellipseOutlineIntersectsAabb(float cx, float cy, float rx, float ry,
+                                  float rotation, float halfWidth,
+                                  float x0, float y0,
+                                  float x1, float y1) {
+    constexpr int N = 64;
+    float c = std::cos(rotation), si = std::sin(rotation);
+    float prevX = cx + rx * c;
+    float prevY = cy + rx * si;
+    for (int i = 1; i <= N; ++i) {
+        float ang = (float)i * (2.0f * 3.14159265358979323846f / N);
+        float lx = rx * std::cos(ang), ly = ry * std::sin(ang);
+        float px = cx + lx * c - ly * si;
+        float py = cy + lx * si + ly * c;
+        if (fatSegmentIntersectsAabb(prevX, prevY, px, py, halfWidth,
+                                     x0, y0, x1, y1)) return true;
+        prevX = px; prevY = py;
+    }
+    return false;
+}
+
+// Circle outline vs AABB, closed form. The outline crosses or touches the
+// AABB iff the nearest point on the AABB to the center is within
+// (radius + halfWidth) AND the farthest point on the AABB is at least
+// (radius - halfWidth) away — i.e. the AABB straddles the ring.
+bool circleOutlineIntersectsAabb(float cx, float cy, float radius,
+                                 float halfWidth,
+                                 float x0, float y0, float x1, float y1) {
+    float ccx = cx < x0 ? x0 : (cx > x1 ? x1 : cx);
+    float ccy = cy < y0 ? y0 : (cy > y1 ? y1 : cy);
+    float ndx = cx - ccx, ndy = cy - ccy;
+    float minD2 = ndx*ndx + ndy*ndy;
+    float outer = radius + halfWidth;
+    if (minD2 > outer * outer) return false;
+    float fdx = std::fmax(std::fabs(cx - x0), std::fabs(cx - x1));
+    float fdy = std::fmax(std::fabs(cy - y0), std::fabs(cy - y1));
+    float maxD2 = fdx*fdx + fdy*fdy;
+    float inner = radius - halfWidth;
+    if (inner > 0.0f && maxD2 < inner * inner) return false;
+    return true;
+}
+
+// Per-shape outline intersection test for the marquee. AABB pre-reject
+// keeps the loop fast when there are lots of shapes far from the drag.
+bool shapeOutlineIntersectsMarquee(const ShapeData& s,
+                                   float mx0, float my0,
+                                   float mx1, float my1) {
+    DocBbox bb = shapeAabb(s);
+    if (bb.maxX < mx0 || bb.minX > mx1
+     || bb.maxY < my0 || bb.minY > my1) return false;
+    switch (s.kind) {
+        case ShapeKind::Line: {
+            const Line& l = s.line;
+            return fatSegmentIntersectsAabb(l.x0, l.y0, l.x1, l.y1,
+                                            l.width * 0.5f,
+                                            mx0, my0, mx1, my1);
+        }
+        case ShapeKind::Rect:
+            return rectOutlineIntersectsAabb(s.rect, mx0, my0, mx1, my1);
+        case ShapeKind::Ellipse: {
+            const Ellipse& e = s.ellipse;
+            return ellipseOutlineIntersectsAabb(e.cx, e.cy, e.rx, e.ry,
+                                                e.rotation, e.width * 0.5f,
+                                                mx0, my0, mx1, my1);
+        }
+        case ShapeKind::Circle: {
+            const Circle& c = s.circle;
+            return circleOutlineIntersectsAabb(c.cx, c.cy, c.radius,
+                                               c.width * 0.5f,
+                                               mx0, my0, mx1, my1);
+        }
+        default:
+            return false;
+    }
+}
+
 // Hit-test the active layer at (x, y); on hit, set g_selection. Returns
 // true if a shape was selected, false if no shape was hit (and clears
 // any prior selection). Searches in render order so the topmost shape
@@ -5799,37 +6189,73 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
         }
         drawLineSegment(l.x0, l.y0, l.x1, l.y1, l.color, l.width, 1.0f);
     }
-    for (size_t i = 0; i < layer.rects.size(); ++i) {
-        const Rect r = layer.rects[i];
-        if (inAnySel(ShapeKind::Rect, i)) {
-            drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation,
-                                 kSelectionHaloColor, r.width + kSelectionHaloPad * 2.0f,
-                                 kSelectionHaloAlpha);
+    // Rectangles use the box-SDF program — single quad, no segment-cap
+    // overlap at the corners.
+    if (!layer.rects.empty()) {
+        glUseProgram(g_rectProg.program);
+        uploadMat4(env, g_rectProg.uTransform, transform);
+        glUniform2f(g_rectProg.uScreen, (float)width, (float)height);
+        uploadPageClip(g_rectProg.uPageMin, g_rectProg.uPageMax,
+                       g_rectProg.uPageActive, pageClip);
+        glUniform1f(g_rectProg.uOpacity,
+                    layer.opacity.load(std::memory_order_relaxed));
+        for (size_t i = 0; i < layer.rects.size(); ++i) {
+            const Rect r = layer.rects[i];
+            if (inAnySel(ShapeKind::Rect, i)) {
+                drawRectOutline(r.x0, r.y0, r.x1, r.y1, r.rotation,
+                                kSelectionHaloColor,
+                                r.width + kSelectionHaloPad * 2.0f,
+                                kSelectionHaloAlpha);
+            }
+            drawRectOutline(r.x0, r.y0, r.x1, r.y1, r.rotation,
+                            r.color, r.width, 1.0f);
         }
-        drawRectangleAsLines(r.x0, r.y0, r.x1, r.y1, r.rotation, r.color, r.width, 1.0f);
+        glUniform1f(g_rectProg.uOpacity, 1.0f);
     }
-    for (size_t i = 0; i < layer.ellipses.size(); ++i) {
-        const Ellipse e = layer.ellipses[i];
-        if (inAnySel(ShapeKind::Ellipse, i)) {
-            drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation,
-                               kSelectionHaloColor, e.width + kSelectionHaloPad * 2.0f,
-                               kSelectionHaloAlpha);
+    // Ellipses and circles use the SDF program — one quad per shape with
+    // no segment junctions, so the rendered alpha is uniform regardless
+    // of the layer's opacity.
+    if (!layer.ellipses.empty() || !layer.circles.empty()) {
+        glUseProgram(g_ellipseProg.program);
+        uploadMat4(env, g_ellipseProg.uTransform, transform);
+        glUniform2f(g_ellipseProg.uScreen, (float)width, (float)height);
+        uploadPageClip(g_ellipseProg.uPageMin, g_ellipseProg.uPageMax,
+                       g_ellipseProg.uPageActive, pageClip);
+        glUniform1f(g_ellipseProg.uOpacity,
+                    layer.opacity.load(std::memory_order_relaxed));
+
+        for (size_t i = 0; i < layer.ellipses.size(); ++i) {
+            const Ellipse e = layer.ellipses[i];
+            if (inAnySel(ShapeKind::Ellipse, i)) {
+                drawEllipseOutline(e.cx, e.cy, e.rx, e.ry, e.rotation,
+                                   kSelectionHaloColor,
+                                   e.width + kSelectionHaloPad * 2.0f,
+                                   kSelectionHaloAlpha);
+            }
+            drawEllipseOutline(e.cx, e.cy, e.rx, e.ry, e.rotation,
+                               e.color, e.width, 1.0f);
         }
-        drawEllipseAsLines(e.cx, e.cy, e.rx, e.ry, e.rotation, e.color, e.width, 1.0f);
-    }
-    for (size_t i = 0; i < layer.circles.size(); ++i) {
-        const Circle c = layer.circles[i];
-        if (inAnySel(ShapeKind::Circle, i)) {
-            drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f,
-                               kSelectionHaloColor, c.width + kSelectionHaloPad * 2.0f,
-                               kSelectionHaloAlpha);
+        for (size_t i = 0; i < layer.circles.size(); ++i) {
+            const Circle c = layer.circles[i];
+            if (inAnySel(ShapeKind::Circle, i)) {
+                drawEllipseOutline(c.cx, c.cy, c.radius, c.radius,
+                                   /*rotation*/ 0.0f, kSelectionHaloColor,
+                                   c.width + kSelectionHaloPad * 2.0f,
+                                   kSelectionHaloAlpha);
+            }
+            drawEllipseOutline(c.cx, c.cy, c.radius, c.radius,
+                               /*rotation*/ 0.0f, c.color, c.width, 1.0f);
         }
-        drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f, c.color, c.width, 1.0f);
+
+        // Same uOpacity reset as for the line program: keep the default
+        // 1.0 for non-layer callers (snap marker, shape preview).
+        glUniform1f(g_ellipseProg.uOpacity, 1.0f);
     }
 
     // Reset opacity so the next non-layer use of the line program
     // (handles, snap markers, page outline, shape preview) doesn't
     // inherit this layer's value.
+    glUseProgram(g_lineProg.program);
     glUniform1f(g_lineProg.uOpacity, 1.0f);
 }
 
@@ -6178,25 +6604,49 @@ void renderShapePreviewToFront(JNIEnv* env, jint width, jint height,
         case 0:
             drawLineSegment(x0, y0, x1, y1, rgb, lineWidth, alpha);
             break;
-        case 1:
-            drawRectangleAsLines(x0, y0, x1, y1, /*rotation*/ 0.0f,
-                                 rgb, lineWidth, alpha);
-            break;
-        case 2: {
-            float dx = x1 - x0;
-            float dy = y1 - y0;
-            float radius = std::sqrt(dx * dx + dy * dy);
-            drawEllipseAsLines(x0, y0, radius, radius, /*rotation*/ 0.0f,
-                               rgb, lineWidth, alpha);
+        case 1: {
+            // Swap to the box-SDF program for the preview rect, same
+            // approach as the ellipse/circle case below.
+            glUseProgram(g_rectProg.program);
+            uploadMat4(env, g_rectProg.uTransform, transform);
+            glUniform2f(g_rectProg.uScreen, (float)width, (float)height);
+            {
+                PageClip pc = readPageClip();
+                uploadPageClip(g_rectProg.uPageMin, g_rectProg.uPageMax,
+                               g_rectProg.uPageActive, pc);
+            }
+            drawRectOutline(x0, y0, x1, y1, /*rotation*/ 0.0f,
+                            rgb, lineWidth, alpha);
+            glUseProgram(g_lineProg.program);
             break;
         }
+        case 2:
         case 3: {
-            float cx = (x0 + x1) * 0.5f;
-            float cy = (y0 + y1) * 0.5f;
-            float rx = std::fabs(x1 - x0) * 0.5f;
-            float ry = std::fabs(y1 - y0) * 0.5f;
-            drawEllipseAsLines(cx, cy, rx, ry, /*rotation*/ 0.0f,
+            float cx, cy, rx, ry;
+            if (shapeType == 2) {
+                float dx = x1 - x0, dy = y1 - y0;
+                cx = x0; cy = y0;
+                rx = ry = std::sqrt(dx * dx + dy * dy);
+            } else {
+                cx = (x0 + x1) * 0.5f;
+                cy = (y0 + y1) * 0.5f;
+                rx = std::fabs(x1 - x0) * 0.5f;
+                ry = std::fabs(y1 - y0) * 0.5f;
+            }
+            // Swap to the SDF ellipse program for the duration of this
+            // draw, then restore the line program so the snap marker
+            // below (if any) renders correctly.
+            glUseProgram(g_ellipseProg.program);
+            uploadMat4(env, g_ellipseProg.uTransform, transform);
+            glUniform2f(g_ellipseProg.uScreen, (float)width, (float)height);
+            {
+                PageClip pc = readPageClip();
+                uploadPageClip(g_ellipseProg.uPageMin, g_ellipseProg.uPageMax,
+                               g_ellipseProg.uPageActive, pc);
+            }
+            drawEllipseOutline(cx, cy, rx, ry, /*rotation*/ 0.0f,
                                rgb, lineWidth, alpha);
+            glUseProgram(g_lineProg.program);
             break;
         }
     }
@@ -9499,19 +9949,19 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
     }
     if (wasMode == DragMode::Marquee) {
         // Finalize marquee selection: every shape on the active vector
-        // layer whose AABB intersects the rectangle joins the
-        // selection. Tap-with-no-drag (zero-area rect) leaves the
-        // selection empty — hitTestActiveVectorLayer in the begin
-        // path already cleared the prior selection.
+        // layer whose actual outline overlaps the rectangle joins the
+        // selection. AABB-only tests over-select badly for diagonal
+        // lines (their AABB covers the whole bounding square) and
+        // rotated rects/ellipses (AABB > OBB). See
+        // shapeOutlineIntersectsMarquee for the per-kind geometry.
+        // Tap-with-no-drag (zero-area rect) leaves the selection empty
+        // — hitTestActiveVectorLayer in the begin path already cleared
+        // the prior selection.
         if (mx1 - mx0 < 1.0f && my1 - my0 < 1.0f) return;
         if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return;
         Layer& layer = *layers()[activeLayer()];
         if (layer.type != LayerType::Vector) return;
 
-        auto intersects = [&](const DocBbox& bb) {
-            return bb.maxX >= mx0 && bb.minX <= mx1
-                && bb.maxY >= my0 && bb.minY <= my1;
-        };
         std::vector<Selection> hits;
         auto add = [&](ShapeKind kind, size_t idx) {
             Selection s;
@@ -9522,19 +9972,23 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
         };
         for (size_t i = 0; i < layer.lines.size(); ++i) {
             ShapeData sd; sd.kind = ShapeKind::Line; sd.line = layer.lines[i];
-            if (intersects(shapeAabb(sd))) add(ShapeKind::Line, i);
+            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
+                add(ShapeKind::Line, i);
         }
         for (size_t i = 0; i < layer.rects.size(); ++i) {
             ShapeData sd; sd.kind = ShapeKind::Rect; sd.rect = layer.rects[i];
-            if (intersects(shapeAabb(sd))) add(ShapeKind::Rect, i);
+            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
+                add(ShapeKind::Rect, i);
         }
         for (size_t i = 0; i < layer.ellipses.size(); ++i) {
             ShapeData sd; sd.kind = ShapeKind::Ellipse; sd.ellipse = layer.ellipses[i];
-            if (intersects(shapeAabb(sd))) add(ShapeKind::Ellipse, i);
+            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
+                add(ShapeKind::Ellipse, i);
         }
         for (size_t i = 0; i < layer.circles.size(); ++i) {
             ShapeData sd; sd.kind = ShapeKind::Circle; sd.circle = layer.circles[i];
-            if (intersects(shapeAabb(sd))) add(ShapeKind::Circle, i);
+            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
+                add(ShapeKind::Circle, i);
         }
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         if (hits.empty()) {
