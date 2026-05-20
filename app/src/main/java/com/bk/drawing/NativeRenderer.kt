@@ -302,6 +302,16 @@ object NativeRenderer {
     external fun setBrushAlpha(alpha: Float)
 
     /**
+     * Stroke alpha mode. When true, overlapping dabs within a single
+     * stroke clamp to the brush alpha (no buildup where the stroke
+     * crosses itself) — useful for shading with low-alpha colors.
+     * When false (default), opacity stacks within a stroke. Either way
+     * the value is snapshotted at beginStroke, so a mid-stroke toggle
+     * doesn't split a stroke between the two modes.
+     */
+    external fun setStrokeUniformAlpha(enabled: Boolean)
+
+    /**
      * Dab hardness in [0, 1] — the radial fraction at which a single
      * dab becomes fully opaque. 1 = solid disc (hard edge); 0 = full
      * gradient from opaque center to transparent rim (smooth edge).

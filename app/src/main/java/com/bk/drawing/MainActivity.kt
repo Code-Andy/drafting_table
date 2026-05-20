@@ -95,6 +95,7 @@ class MainActivity : AppCompatActivity() {
     // apply to the active tool (e.g. for BUCKET only alpha is shown).
     private lateinit var brushSizeRow: View
     private lateinit var brushAlphaRow: View
+    private lateinit var strokeUniformAlphaRow: View
     private lateinit var brushHardRow: View
     private lateinit var brushPressRow: View
     private lateinit var bucketBleedRow: View
@@ -172,6 +173,11 @@ class MainActivity : AppCompatActivity() {
     private var vectorLineWidth = 2.0f
     private var brushAlpha = 1.0f
     private var brushHardness = 1.0f
+    // When true, overlapping dabs within a stroke clamp to brushAlpha
+    // instead of building up — useful for shading with low-alpha colors
+    // (see Clip Studio's default behavior). Persisted; defaults to off
+    // so existing behavior is preserved for users who upgrade.
+    private var strokeUniformAlpha = false
     // Pressure saturation in (0, 1]. Slider value / 100 — see
     // DrawingSurfaceView.brushPressureSaturation for the mapping
     // semantics. 1.0 = full pen range (default), 0.5 = pen maxes out
@@ -183,6 +189,7 @@ class MainActivity : AppCompatActivity() {
     private val kPrefVectorWidth   = "vector_line_width"
     private val kPrefStylusOnly    = "stylus_only"
     private val kPrefBrushAlpha    = "brush_alpha"
+    private val kPrefStrokeUniformAlpha = "stroke_uniform_alpha"
     private val kPrefBrushHardness = "brush_hardness"
     private val kPrefBrushPressure = "brush_pressure_sat"
     private val kPrefBucketBleed   = "bucket_bleed"
@@ -297,11 +304,13 @@ class MainActivity : AppCompatActivity() {
             .coerceIn(0.0f, 1.0f)
         bucketBleed = prefs().getInt(kPrefBucketBleed, 2)
             .coerceIn(0, kBucketBleedMax)
+        strokeUniformAlpha = prefs().getBoolean(kPrefStrokeUniformAlpha, false)
         NativeRenderer.setBrushSize(brushSizeScale)
         NativeRenderer.setVectorLineWidth(vectorLineWidth)
         NativeRenderer.setBrushAlpha(brushAlpha)
         NativeRenderer.setBrushHardness(brushHardness)
         NativeRenderer.setBucketBleed(bucketBleed)
+        NativeRenderer.setStrokeUniformAlpha(strokeUniformAlpha)
         // Palm-rejection mode persists across launches; defaults on so
         // accidental finger touches don't draw out of the box.
         stylusOnly = prefs().getBoolean(kPrefStylusOnly, true)
@@ -1338,6 +1347,12 @@ class MainActivity : AppCompatActivity() {
         brushAlphaRow = buildBrushAlphaRow()
         container.addView(brushAlphaRow)
 
+        // uniform-α toggle. When on, overlapping dabs within a single
+        // stroke clamp to brushAlpha (no buildup) — useful for shading
+        // and color blending. When off, stacking (the historical behavior).
+        strokeUniformAlphaRow = buildStrokeUniformAlphaRow()
+        container.addView(strokeUniformAlphaRow)
+
         // hard slider — radial dab hardness. Replaces the old "smth"
         // stub. 0 = full radial gradient (smooth dab), 100 = solid
         // disc (hard dab). Applies to brush + eraser.
@@ -1359,6 +1374,49 @@ class MainActivity : AppCompatActivity() {
         // Push the initial value display.
         updateSizeSliderForTool()
         return container
+    }
+
+    private fun buildStrokeUniformAlphaRow(): View {
+        // Two-column toggle: label "uniform α" on the left, on/off
+        // indicator on the right. Matches the brush panel's padding and
+        // font; the value column width mirrors the slider rows' so the
+        // on/off chip lines up with the value labels above and below.
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 4.dp, 10.dp, 4.dp)
+        }
+        val label = TextView(this).apply {
+            text = "uniform α"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        val valueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            gravity = Gravity.END
+            text = if (strokeUniformAlpha) "on" else "off"
+            setTextColor(getColor(
+                if (strokeUniformAlpha) R.color.hot else R.color.inkSoft))
+        }
+        row.addView(label, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        row.addView(valueLabel, LinearLayout.LayoutParams(36.dp,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.isClickable = true
+        row.isFocusable = true
+        row.setOnClickListener {
+            strokeUniformAlpha = !strokeUniformAlpha
+            NativeRenderer.setStrokeUniformAlpha(strokeUniformAlpha)
+            prefs().edit()
+                .putBoolean(kPrefStrokeUniformAlpha, strokeUniformAlpha)
+                .apply()
+            valueLabel.text = if (strokeUniformAlpha) "on" else "off"
+            valueLabel.setTextColor(getColor(
+                if (strokeUniformAlpha) R.color.hot else R.color.inkSoft))
+        }
+        return row
     }
 
     private fun buildBrushAlphaRow(): View {
@@ -1581,14 +1639,20 @@ class MainActivity : AppCompatActivity() {
                             || currentToolEditsVector()
             val showAlpha = tool == Tool.BRUSH || tool == Tool.ERASER
                             || tool == Tool.BUCKET
+            // Uniform-α toggle is meaningful only for the stroke-based
+            // raster tools (brush + eraser). Bucket is a single fill,
+            // not a stroke, so the mode has no effect there.
+            val showUniformAlpha = tool == Tool.BRUSH || tool == Tool.ERASER
             val showHard  = tool == Tool.BRUSH || tool == Tool.ERASER
             val showPress = tool == Tool.BRUSH || tool == Tool.ERASER
             val showBleed = tool == Tool.BUCKET
-            brushSizeRow.visibility   = if (showSize)  View.VISIBLE else View.GONE
-            brushAlphaRow.visibility  = if (showAlpha) View.VISIBLE else View.GONE
-            brushHardRow.visibility   = if (showHard)  View.VISIBLE else View.GONE
-            brushPressRow.visibility  = if (showPress) View.VISIBLE else View.GONE
-            bucketBleedRow.visibility = if (showBleed) View.VISIBLE else View.GONE
+            brushSizeRow.visibility   = if (showSize)         View.VISIBLE else View.GONE
+            brushAlphaRow.visibility  = if (showAlpha)        View.VISIBLE else View.GONE
+            strokeUniformAlphaRow.visibility =
+                if (showUniformAlpha) View.VISIBLE else View.GONE
+            brushHardRow.visibility   = if (showHard)         View.VISIBLE else View.GONE
+            brushPressRow.visibility  = if (showPress)        View.VISIBLE else View.GONE
+            bucketBleedRow.visibility = if (showBleed)        View.VISIBLE else View.GONE
         }
     }
 

@@ -314,6 +314,42 @@ void main() {
 }
 )";
 
+// "Uniform-stroke-alpha" stamp shader. Used by the bake when the active
+// stroke is in uniform-alpha mode: dabs build a per-tile coverage texture
+// via MAX blending, then this shader stamps the brush color (or the
+// eraser cut-out) onto the tile in a single OVER pass. That removes the
+// dab-on-dab accumulation that produces the dark spots wherever a
+// low-alpha stroke crosses itself.
+const char* kStampVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+out vec2 vUv;
+void main() {
+    gl_Position = vec4(aQuad, 0.0, 1.0);
+    vUv = aQuad * 0.5 + 0.5;
+}
+)";
+
+const char* kStampFS = R"(#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform sampler2D uCoverage;
+uniform vec4      uColor;       // straight rgb + ignored alpha
+uniform int       uMode;        // 0 = brush (OVER), 1 = eraser (DESTOUT)
+out vec4 outColor;
+void main() {
+    float c = texture(uCoverage, vUv).a;
+    if (c <= 0.0) discard;
+    if (uMode == 1) {
+        // Eraser: caller binds glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA),
+        // so output alpha c scales dest by (1 - c). RGB unused.
+        outColor = vec4(0.0, 0.0, 0.0, c);
+    } else {
+        // Brush: premultiplied (color * c, c), blended OVER.
+        outColor = vec4(uColor.rgb * c, c);
+    }
+}
+)";
+
 // Vector-layer line. Vertex shader morphs the unit quad into a
 // capsule-shaped quad oriented along the line, with an extra halfWidth
 // of margin past each endpoint so the rounded caps fit. Fragment shader
@@ -949,6 +985,13 @@ struct RectProg {
     GLint  uPageActive = -1;
 };
 
+struct StampProg {
+    GLuint program   = 0;
+    GLint  uCoverage = -1;
+    GLint  uColor    = -1;
+    GLint  uMode     = -1;
+};
+
 struct FillProg {
     GLuint program    = 0;
     GLint  uTransform = -1;
@@ -989,6 +1032,7 @@ GridProg    g_grid;
 LineProg    g_lineProg;
 EllipseProg g_ellipseProg;
 RectProg    g_rectProg;
+StampProg   g_stamp;
 FillProg    g_fill;
 SelProg     g_sel;
 GLuint      g_quadVao = 0;
@@ -1134,6 +1178,11 @@ bool    g_predictionInFlight = false;
 // gated on this — when off, no mirror cost is paid. Toggling mid-stroke
 // is a no-op so the coverage mirror can't desync.
 bool    g_strokePredictionActive = false;
+// Tile-sized scratch coverage FBO used by the uniform-alpha bake path:
+// dabs MAX-blend into it (one channel — only alpha matters), then a
+// single stamp pass composites the brush color + max coverage onto the
+// tile. Allocated lazily in bakeCurrentStrokeIntoTiles.
+ViewFbo g_strokeCoverageTile;
 
 // ---- Multi-buffer cache (partial re-composite path) ---------------------
 //
@@ -1555,6 +1604,7 @@ struct UndoEntry {
     float rebakeBrushSize     = 1.0f;
     float rebakeBrushHardness = 1.0f;
     int   rebakeTool          = 0;
+    bool  rebakeUniformAlpha  = false;
     // Page-clip snapshot — the bake's edge clipping depends on the
     // page bounds at bake time, so we capture and restore them.
     bool  rebakePageActive    = false;
@@ -1919,6 +1969,14 @@ DabEmitter g_liveEmitterReal;
 // a clear win; the toggle remains for the rare case of needing raw
 // pen tracking.
 std::atomic<bool> g_predictionEnabled{true};
+
+// "Uniform stroke alpha" mode. When true, overlapping dabs within a single
+// stroke do NOT accumulate opacity; the stroke's effective per-pixel alpha
+// is the max of any dab's coverage at that pixel. Atomic for cross-thread
+// UI toggling; snapshotted into g_strokeUniformAlpha at beginStroke so a
+// mid-stroke toggle doesn't split rendering between the two modes.
+std::atomic<bool> g_strokeUniformAlphaEnabled{false};
+bool              g_strokeUniformAlpha = false;
 
 // Forward declarations; defined down with the persistence and composite
 // helpers.
@@ -2533,6 +2591,11 @@ void ensureInited() {
     glUseProgram(g_rectProg.program);
     glUniform1f(g_rectProg.uOpacity, 1.0f);
     glUseProgram(0);
+
+    g_stamp.program   = linkProgram(kStampVS, kStampFS);
+    g_stamp.uCoverage = glGetUniformLocation(g_stamp.program, "uCoverage");
+    g_stamp.uColor    = glGetUniformLocation(g_stamp.program, "uColor");
+    g_stamp.uMode     = glGetUniformLocation(g_stamp.program, "uMode");
 
     g_fill.program    = linkProgram(kFillVS, kFillFS);
     g_fill.uTransform = glGetUniformLocation(g_fill.program, "uTransform");
@@ -5117,7 +5180,22 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     glUniform2f(g_dab.uScreen, kTileSizeF, kTileSizeF);
     glUniform1f(g_dab.uHardness, g_strokeBrushHardness);
 
-    if (g_strokeTool == 0) {
+    // Uniform-alpha mode: dabs MAX-blend into a per-tile coverage texture
+    // (only the alpha channel matters), and a single stamp pass composites
+    // the brush color + coverage onto the tile. Stacking mode: existing
+    // path — dabs blend directly into the tile and accumulate where they
+    // overlap. Both paths share the outer dab-program setup; only the
+    // per-tile inner work differs.
+    if (g_strokeUniformAlpha) {
+        ensureViewFbo(g_strokeCoverageTile, kTileSize, kTileSize);
+        // Coverage dab output: zero RGB, brush alpha. The stamp shader
+        // supplies the brush color so the dab pass only needs to track
+        // the max alpha. Same setup for brush and eraser; eraser is
+        // distinguished at stamp time by uMode + blend func.
+        float coverageColor[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
+        glUniform4fv(g_dab.uColor, 1, coverageColor);
+        glBlendEquation(GL_MAX);
+    } else if (g_strokeTool == 0) {
         // Brush: additive premultiplied.
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glUniform4fv(g_dab.uColor, 1, g_strokeBrushColor);
@@ -5177,9 +5255,6 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
             if (!touched) continue;
 
             Tile& tile = getOrCreateTile(layer, tx, ty);
-            glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
-            glViewport(kApron, kApron, kTileSize, kTileSize);
-
             float ox = tx * kTileSizeF;
             float oy = ty * kTileSizeF;
 
@@ -5203,6 +5278,19 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
             uploadPageClip(g_dab.uPageMin, g_dab.uPageMax,
                            g_dab.uPageActive, tilePage);
 
+            if (g_strokeUniformAlpha) {
+                // Coverage build: draw dabs into the scratch coverage
+                // FBO with MAX blending. No apron — the coverage is
+                // 256x256, aligned 1:1 with the tile's central region.
+                glBindFramebuffer(GL_FRAMEBUFFER, g_strokeCoverageTile.fbo);
+                glViewport(0, 0, kTileSize, kTileSize);
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+            } else {
+                glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
+                glViewport(kApron, kApron, kTileSize, kTileSize);
+            }
+
             DabEmitter e;
             // Clip to the tile (and page, where applicable) so the path's
             // interpolated dabs outside this region don't issue throwaway
@@ -5210,6 +5298,32 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
             e.setClipBounds(clipMinX, clipMinY, clipMaxX, clipMaxY);
             for (const auto& s : g_current.samples) {
                 e.extend(s.x - ox, s.y - oy, s.p);
+            }
+
+            if (g_strokeUniformAlpha) {
+                // Stamp coverage onto the tile in one OVER (brush) or
+                // DESTOUT (eraser) pass. The dab program's MAX state
+                // is restored at the bottom of this iteration so the
+                // next tile's coverage build picks up where it left off.
+                glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
+                glViewport(kApron, kApron, kTileSize, kTileSize);
+                glBlendEquation(GL_FUNC_ADD);
+                if (g_strokeTool == 0) {
+                    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                } else {
+                    glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+                }
+                glUseProgram(g_stamp.program);
+                glUniform1i(g_stamp.uCoverage, 0);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, g_strokeCoverageTile.texture);
+                glUniform4fv(g_stamp.uColor, 1, g_strokeBrushColor);
+                glUniform1i(g_stamp.uMode, g_strokeTool);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                // Back to the dab program + MAX blend for the next
+                // tile's coverage build.
+                glUseProgram(g_dab.program);
+                glBlendEquation(GL_MAX);
             }
 
             if (dirtyOut) dirtyOut->push_back(tileKey(tx, ty));
@@ -5223,8 +5337,12 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     glBindVertexArray(0);
 
     // Restore the default (additive premultiplied) blend so subsequent
-    // paths don't inherit eraser state.
+    // paths don't inherit uniform-alpha (GL_MAX) or eraser state.
+    glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    if (g_strokeUniformAlpha) {
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
 }
 
 // Replay a raster stroke's bake using inputs captured in the undo
@@ -5251,6 +5369,7 @@ static void rebakeStroke(const UndoEntry& e) {
     float saveSize  = g_strokeBrushSizeScale;
     float saveHard  = g_strokeBrushHardness;
     int   saveTool  = g_strokeTool;
+    bool  saveUniformAlpha = g_strokeUniformAlpha;
     std::vector<Sample> saveSamples = std::move(g_current.samples);
     g_current.samples.clear();
     float savePageX0, savePageY0, savePageX1, savePageY1;
@@ -5269,6 +5388,7 @@ static void rebakeStroke(const UndoEntry& e) {
     g_strokeBrushSizeScale = e.rebakeBrushSize;
     g_strokeBrushHardness  = e.rebakeBrushHardness;
     g_strokeTool           = e.rebakeTool;
+    g_strokeUniformAlpha   = e.rebakeUniformAlpha;
     g_current.samples      = e.rebakeSamples;     // copy (re-bakeable)
     {
         std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
@@ -5310,6 +5430,7 @@ static void rebakeStroke(const UndoEntry& e) {
     g_strokeBrushSizeScale = saveSize;
     g_strokeBrushHardness  = saveHard;
     g_strokeTool           = saveTool;
+    g_strokeUniformAlpha   = saveUniformAlpha;
     g_current.samples      = std::move(saveSamples);
     {
         std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
@@ -8839,6 +8960,17 @@ Java_com_bk_drawing_NativeRenderer_setBrushAlpha(JNIEnv*, jobject, jfloat alpha)
     g_brushAlphaBits.store(bits);
 }
 
+// Stroke alpha mode. When enabled, dabs MAX-blend within a single stroke
+// so overlapping dabs cap at the brush alpha instead of accumulating;
+// disabled (default) keeps the historical "opacity stacks within a
+// stroke" behavior. Snapshotted at beginStroke so a mid-stroke toggle
+// doesn't split a stroke between the two modes.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setStrokeUniformAlpha(JNIEnv*, jobject,
+                                                        jboolean enabled) {
+    g_strokeUniformAlphaEnabled.store(enabled == JNI_TRUE);
+}
+
 // Brush "hardness" in [0, 1]. 0 = full radial gradient (soft), 1 =
 // solid disc (hard). Snapshotted at beginStroke so mid-stroke changes
 // don't split a stroke; affects both brush and eraser dabs.
@@ -10873,6 +11005,11 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     // strand a predictionInFlight; off→on would force the next revert
     // to read a stale g_coverageReal).
     g_strokePredictionActive = g_predictionEnabled.load();
+    // Snapshot uniform-alpha mode for the life of the stroke. The preview
+    // dab pass and the bake both branch on this so any mid-stroke toggle
+    // would otherwise render the head of the stroke with one mode and the
+    // tail with the other.
+    g_strokeUniformAlpha = g_strokeUniformAlphaEnabled.load();
 }
 
 // Batched stroke extension. xyp is [x,y,p, x,y,p, ...]; the first
@@ -10944,7 +11081,14 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
     float coverageRgba[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
     glBindFramebuffer(GL_FRAMEBUFFER, g_coverage.fbo);
     glViewport(0, 0, width, height);
-    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    // Uniform-alpha mode: dabs MAX-blend into the coverage so overlaps
+    // within a stroke clamp to the brush alpha rather than accumulating.
+    // Stacking mode: standard OVER blend (the historical behavior).
+    if (g_strokeUniformAlpha) {
+        glBlendEquation(GL_MAX);
+    } else {
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
     glUseProgram(g_dab.program);
     glBindVertexArray(g_quadVao);
     uploadMat4(env, g_dab.uTransform, transform);
@@ -10986,6 +11130,13 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
     }
 
     glBindVertexArray(0);
+    // Restore blend equation in case we switched to GL_MAX for uniform
+    // alpha — the front-buffer overlay below + all subsequent renders
+    // assume the default GL_FUNC_ADD.
+    if (g_strokeUniformAlpha) {
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
 
     // Single front-buffer overlay render. Normally we clear FB first
     // and then run the preview overlay shader, so the FB pixels are
@@ -11062,6 +11213,7 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
         entry.rebakeBrushSize     = g_strokeBrushSizeScale;
         entry.rebakeBrushHardness = g_strokeBrushHardness;
         entry.rebakeTool          = g_strokeTool;
+        entry.rebakeUniformAlpha  = g_strokeUniformAlpha;
         PageClip pc = readPageClip();
         entry.rebakePageActive    = pc.active;
         entry.rebakePageX0        = pc.minX;
