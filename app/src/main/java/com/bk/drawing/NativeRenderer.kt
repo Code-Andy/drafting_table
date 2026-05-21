@@ -611,9 +611,15 @@ object NativeRenderer {
      * straight-into-Bitmap consumption (doc-top → bitmap-top). Letter-
      * boxes the page rect into the bitmap dimensions.
      *
+     * [drawChrome] controls whether the on-screen page-boundary outline
+     * is included. Sidebar thumbnails want it (it reads as a clear
+     * "this is a page" frame at small sizes); PNG / PDF export wants
+     * it off so the saved image has no 1-pixel border at the edges.
+     *
      * Must be called from the GL thread (i.e. inside a render callback).
      */
-    external fun renderPageThumbnail(pageIdx: Int, bitmap: android.graphics.Bitmap)
+    external fun renderPageThumbnail(pageIdx: Int, bitmap: android.graphics.Bitmap,
+                                     drawChrome: Boolean)
 
     /**
      * Undo/redo. Both are queued onto the GL thread alongside layer

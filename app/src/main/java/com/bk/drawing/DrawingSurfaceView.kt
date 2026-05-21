@@ -342,7 +342,11 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     for ((idx, bitmap) in targets) {
                         if (idx !in 0 until pageCount) continue
                         if (refreshAll || idx == activePage) {
-                            NativeRenderer.renderPageThumbnail(idx, bitmap)
+                            // Sidebar thumbnails include the page-edge
+                            // outline so the page reads as a framed
+                            // sheet at small sizes.
+                            NativeRenderer.renderPageThumbnail(idx, bitmap,
+                                drawChrome = true)
                         }
                     }
                     post { onThumbnailsUpdated?.invoke() }
@@ -358,7 +362,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 pendingExportRequest = null
                 for ((idx, bitmap) in exportReq.pages) {
                     if (idx in 0 until NativeRenderer.getPageCount()) {
-                        NativeRenderer.renderPageThumbnail(idx, bitmap)
+                        // PNG / PDF exports drop the page outline so the
+                        // saved image has no 1-pixel border at the edges.
+                        NativeRenderer.renderPageThumbnail(idx, bitmap,
+                            drawChrome = false)
                     }
                 }
                 post { exportReq.onComplete() }

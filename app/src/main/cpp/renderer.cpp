@@ -1105,6 +1105,11 @@ std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
 // resolution can show, just darkening the canvas). UI toggle persists
 // across launches; the zoom gate is automatic, not user-visible.
 std::atomic<int> g_pixelGridEnabled{0};
+// GL-thread-only flag: when true, compositeAllLayers skips the page-
+// boundary outline (the 1.5-view-px gray rectangle at the page edges).
+// Toggled around renderPageThumbnail's compositeAllLayers call for the
+// export path so the saved image has no border at the bitmap edges.
+bool g_skipPageOutline = false;
 // Below this zoom the grid would be denser than the screen can show;
 // keep some headroom below the gesture max (kMaxViewScale = 8.0) so the
 // grid is visible across a useful zoom range, not just the very top.
@@ -6535,7 +6540,9 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
     // Drawn under the layers so strokes that cross the boundary occlude
     // it locally while the rest stays visible. The outline itself must
     // NOT be page-clipped — that would invisibly trim its own edges.
-    if (pageClip.active) {
+    // Skipped by the export path (renderPageThumbnail with drawChrome=
+    // false) so the saved image isn't bordered.
+    if (pageClip.active && !g_skipPageOutline) {
         glUseProgram(g_lineProg.program);
         glBindVertexArray(g_quadVao);
         uploadMat4(env, g_lineProg.uTransform, transform);
@@ -10946,7 +10953,7 @@ Java_com_bk_drawing_NativeRenderer_switchPage(JNIEnv*, jobject, jint idx) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
         JNIEnv* env, jobject,
-        jint pageIdx, jobject bitmap) {
+        jint pageIdx, jobject bitmap, jboolean drawChrome) {
     ensureInited();
     ensureLoaded();
     if (pageIdx < 0 || static_cast<size_t>(pageIdx) >= g_pages.size()) return;
@@ -11024,7 +11031,12 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     // compositeAllLayers takes a jfloatArray; wrap our local matrix.
     jfloatArray transformArr = env->NewFloatArray(16);
     env->SetFloatArrayRegion(transformArr, 0, 16, t);
+    // The page-edge outline is on by default for sidebar thumbnails;
+    // disable it for export so the saved PNG / PDF has no border.
+    bool savedSkipOutline = g_skipPageOutline;
+    g_skipPageOutline = (drawChrome == JNI_FALSE);
     compositeAllLayers(env, w, h, transformArr);
+    g_skipPageOutline = savedSkipOutline;
     env->DeleteLocalRef(transformArr);
 
     // Read pixels back. The bitmap may have stride > w*4 (rare for

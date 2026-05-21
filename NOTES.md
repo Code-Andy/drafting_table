@@ -6,7 +6,7 @@ A custom technical-notebook / sketching app for the **Wacom MovinkPad 11** (stan
 
 Comparable apps tried: Autodesk Sketchbook (closest fit), Tayasui Sketches, Clip Studio Paint, Concepts. None hit the right combination.
 
-## Required features (deliberate ceiling, not a floor)
+## Required features 
 
 - Multi-document; each document has multiple pages (slide-deck style)
 - Per-page drawing surface
@@ -159,6 +159,8 @@ Get the first three feeling *right* before adding anything else. If the stroke d
 12. Snapping (endpoints first, intersections later)
 13. UI chrome (brush picker, layer panel, page navigator, tool palette)
 14. Bucket fill, selection/transform, and the rest
+15. image import onto layer, with scale/move/rotate transforms
+
 
 ## First two spikes
 
