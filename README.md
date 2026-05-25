@@ -33,11 +33,12 @@ Claude Code generated Readme below:
 
 **Tools**
 - Brush (size, opacity, hardness sliders).
+- "Uniform α" toggle in the brush panel — when on, overlapping dabs within a single stroke clamp to the brush alpha instead of building up. Useful for shading and color blending at low opacity. Stacking mode (off) is the historical behavior; α in stacking mode is compensated so its spine alpha reads as the slider value too, so both modes look comparable at the same setting.
 - Eraser.
 - Bucket fill (with adjustable bleed).
-- Vector shapes: line, rectangle, ellipse, circle.
+- Vector shapes: line, rectangle, ellipse, circle. Rendered as single-quad SDFs so circles/ellipses/rectangles at sub-1 alpha are uniformly translucent — no segment-cap darkening at corners or around the rim.
 - Selection — rectangular, lasso. Lifts pixels into a floating raster selection with move / scale / rotate handles. Copy / paste / delete.
-- Vector selection — tap a shape to select; same transform handles.
+- Vector selection — tap a shape to select; same transform handles. Marquee uses proper segment / SDF intersection (not AABB), so parallel diagonal lines don't all select together.
 - Eyedropper — sample any pixel under the pen as the active color.
 - Image import as a floating raster selection on a fresh layer (with fixed-aspect scaling).
 
@@ -57,9 +58,11 @@ Claude Code generated Readme below:
 - Palm rejection.
 
 **Other**
-- Undo / redo, 50 entries / 200 MB, covers raster strokes, vector add/delete/mutate, layer clear, layer add..
-- Status bar with quick toggles for grid and snap.
+- Undo / redo, 50 entries / 200 MB, covers raster strokes, vector add/delete/mutate, layer clear, layer add.
+- Status bar with quick toggles for grid, pixel grid, snap, angle snap, brush preview, and motion prediction.
+- Pixel-grid overlay (`px` chip): 1-buffer-px lines at every doc-pixel boundary, auto-gated on zoom (only renders at ≥ 4× so it doesn't fill the screen at normal zoom).
 - Reset-view fits the page edge-to-edge.
+- PNG / PDF export of the active page or full document. Export drops the on-screen page-edge anchor outline so saved images have no border at the bitmap edges.
 
 ## Build & run (first time)
 
@@ -118,4 +121,38 @@ Two-language split: Kotlin owns lifecycle, UI, touch dispatch, and the doc->view
 - **min SDK 33** so `GLFrontBufferedRenderer` is available without backports.
 - **C++20**, NDK side-by-side, OpenGL ES 3.2.
 
-There is no test suite — validation is by running on the tablet.
+## Testing & debugging
+
+The bulk of validation is still done by running the app on the tablet — UI feel, latency, and rendering are all things that have to be seen on real hardware. But there's a small instrumented test suite for the parts where bit-exactness matters, plus a perfetto trace pipeline for latency / flash investigations.
+
+### Instrumented tests (`app/src/androidTest/`)
+
+A device or emulator with arm64 is required (the renderer is arm64-only). Run from Android Studio (right-click the `androidTest` source set → Run) or from the command line:
+
+```powershell
+.\gradlew.bat connectedDebugAndroidTest
+```
+
+Test files:
+
+- **`GLTestContext.kt`** — spins up an offscreen EGL 3.x context on a dedicated thread so the renderer can be driven without a SurfaceView. Tests dispatch every `NativeRenderer` call onto this thread via `gl { ... }`. Not a test itself; it's the harness the others build on.
+- **`RendererTestBase.kt`** — base class wiring up the context + utilities (clean document directories, pixel-readback helpers).
+- **`BakeFidelityTest.kt`** — 6 tests verifying that the raster-stroke bake is bit-deterministic: draw a stroke, snapshot the layer's pixels, undo, redo, snapshot again, assert byte-identical. This is the invariant the `rebakeStroke`-from-samples redo path depends on; if a future change to dab rasterization, blending, or page clipping breaks determinism, these fail.
+
+### Perfetto trace capture (`tools/`)
+
+For investigating GL-thread latency, dropped frames, or the occasional commit-time flash. Captures app ATRACE slices (`DrawingApp.*`) alongside SurfaceFlinger frame timeline, layer composition, and transaction tracks.
+
+```powershell
+.\tools\capture-trace.ps1
+```
+
+Gives a 10-second window — draw a few strokes during it. The resulting `.perfetto-trace` opens at [ui.perfetto.dev](https://ui.perfetto.dev). See `tools/README.md` for which slices to look at, and the buffer-level pipeline tracks that surface "fits in vsync but still flashes" cases.
+
+### Native log channel
+
+`renderer.cpp` logs under the `DrawingApp` tag — tile lifecycle, layer/page mutations, undo apply, persistence errors, etc. Useful for confirming an in-game action actually fired and didn't drop silently.
+
+```powershell
+adb logcat -s DrawingApp
+```
