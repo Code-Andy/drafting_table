@@ -37,7 +37,8 @@
       "PowerShell(python -c \"import imageio; r = imageio.get_reader\\(r'C:\\\\Users\\\\ben\\\\Documents\\\\drawing_app\\\\Screen_recording_20260505_205514.mp4'\\); print\\(r.get_meta_data\\(\\)\\); print\\('nframes:', r.count_frames\\(\\)\\)\" 2>&1)",
       "PowerShell(python -m pip install --quiet imageio-ffmpeg 2>&1 | Select-Object -Last 5)",
       "Bash(where gradle *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(python *)"
     ]
   }
 }

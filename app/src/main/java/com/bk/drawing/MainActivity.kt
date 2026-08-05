@@ -2160,6 +2160,31 @@ class MainActivity : AppCompatActivity() {
         drawingView?.forceRedraw()
     }
 
+    /** Move the "active page" highlight without touching the view tree
+     *  or the thumbnail bitmaps.
+     *
+     *  Switching pages used to route through rebuildSidebar(), which
+     *  allocates a fresh white Bitmap per item and re-registers them as
+     *  thumbnail targets — so every preview blanked and then repainted.
+     *  That was invisible back when the whole refresh happened inside a
+     *  single GL pass; now that it's spread across several (see
+     *  thumbnailRefreshQueue in DrawingSurfaceView), the blank frames
+     *  read as a flash across every thumbnail. A page switch changes
+     *  nothing structural, so don't rebuild anything.
+     *
+     *  Thumbnails don't go stale from skipping the refresh: a page's
+     *  pixels can only change while it's the active one, and the active
+     *  page is re-rendered every quiet pass regardless. */
+    private fun updateSidebarActivePage(active: Int) {
+        for (item in pageItems) {
+            val isActive = item.pageIdx == active
+            item.frame.isSelected = isActive
+            item.numberBadge.setTextColor(
+                getColor(if (isActive) R.color.hot else R.color.inkSoft))
+        }
+        lastBuiltActivePage = active
+    }
+
     private fun buildAddPageRow(): View {
         val frame = FrameLayout(this).apply {
             isClickable = true; isFocusable = true
@@ -3990,9 +4015,15 @@ class MainActivity : AppCompatActivity() {
         for (item in pageItems) item.imageView.invalidate()
         val pc = NativeRenderer.getPageCount()
         val ap = NativeRenderer.getActivePage()
-        if (pc != lastBuiltPageCount || ap != lastBuiltActivePage) {
+        if (pc != lastBuiltPageCount) {
             syncLayerStateFromNative()
             rebuildSidebar()
+        } else if (ap != lastBuiltActivePage) {
+            // Page switch only. Layers are per-page so the layer panel
+            // still needs a resync, but the sidebar's view tree and
+            // thumbnails are unchanged — just move the highlight.
+            syncLayerStateFromNative()
+            updateSidebarActivePage(ap)
         }
         // Layer count / active-layer drift: catches the case where a
         // queued action (merge, rasterize, delete, add) drains AFTER

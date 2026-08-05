@@ -936,6 +936,15 @@ struct Layer {
 struct Page {
     std::vector<std::unique_ptr<Layer>> layers;
     size_t activeLayer = 0;
+    // False until this page's *content* (raster tile uploads, vector
+    // shape tables) has been pulled off disk. Layer metadata — type,
+    // name, visibility, opacity — is always loaded for every page at
+    // document-open time because it's cheap; content is not, because a
+    // single raster layer on a Letter-size page is ~63 tiles x 256 KB
+    // of file I/O plus a texture and an FBO each. Loading every page's
+    // content up front is what made switching documents take seconds.
+    // See ensurePageContentLoaded.
+    bool contentLoaded = false;
 };
 
 struct DabProg {
@@ -1416,6 +1425,37 @@ inline std::string activeLayerDir(size_t layerIdx) {
     return layerDirIn(g_activePageIdx, layerIdx);
 }
 
+// Per-document memory of which page the user was last on. Without this
+// every document reopens on page 1, because closeCurrentDocument resets
+// g_activePageIdx to 0 and nothing restores it. Stored as a plain
+// decimal index in <docDir>/active_page.txt; a missing or unparseable
+// file means page 0, and the value is clamped to the page count at read
+// time so a deleted page can't strand us out of range.
+inline std::string activePagePath() {
+    return g_docDir + "/active_page.txt";
+}
+inline void saveActivePageToDisk() {
+    if (g_docDir.empty()) return;
+    if (FILE* f = std::fopen(activePagePath().c_str(), "wb")) {
+        std::fprintf(f, "%zu", g_activePageIdx);
+        std::fclose(f);
+    }
+}
+inline size_t readActivePageFromDisk(size_t pageCount) {
+    if (g_docDir.empty() || pageCount == 0) return 0;
+    size_t idx = 0;
+    if (FILE* f = std::fopen(activePagePath().c_str(), "rb")) {
+        char buf[32] = {};
+        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        if (n > 0) {
+            long v = std::strtol(buf, nullptr, 10);
+            if (v > 0) idx = static_cast<size_t>(v);
+        }
+    }
+    return idx < pageCount ? idx : pageCount - 1;
+}
+
 // Cross-thread queue: UI-thread layer ops enqueue, GL thread drains at the
 // start of each operation.
 std::mutex g_pendingMutex;
@@ -1558,6 +1598,13 @@ struct DragState {
     // selections with fixedAspect set; lets applyRasterScaleTo derive
     // a uniform scale factor preserving the original aspect ratio.
     float    initialHalfW = 0.0f, initialHalfH = 0.0f;
+    // Scale: offset from the pen to the grabbed handle, captured at drag
+    // start. The dragged corner tracks (pen − offset) so it moves by
+    // exactly the pen delta. Without this the corner teleports to the
+    // pen on the first move — a grab anywhere inside the handle's hit
+    // radius yanks the corner up to that radius away. Same role
+    // moveOffset plays for Move and initialPenAngle plays for Rotate.
+    float    grabOffsetX = 0.0f, grabOffsetY = 0.0f;
     // Rotate: shape center (fixed), initial pen-to-center angle, and the
     // shape's initial rotation. Also a snapshot of the initial Line
     // endpoints (for rotating Lines, which have no rotation field).
@@ -2096,6 +2143,7 @@ void applyPendingShapes();
 void ensureAtLeastOnePage();
 void closeCurrentDocument();
 void ensureLoaded();
+void ensurePageContentLoaded(size_t pageIdx);
 bool liftRasterSelectionRect(float x0, float y0, float x1, float y1);
 bool liftRasterSelectionPolygon(const float* points, size_t nPoints);
 void commitRasterSelectionImpl();
@@ -2263,7 +2311,12 @@ void applyPendingLayerActions() {
                 g_redoStack.clear(); g_redoTotalBytes = 0;
             }
             g_pages.push_back(std::make_unique<Page>());
+            // Brand-new page — nothing on disk to lazily load, so mark
+            // it resident rather than leaving ensurePageContentLoaded
+            // to scan an empty directory on every frame.
+            g_pages.back()->contentLoaded = true;
             g_activePageIdx = g_pages.size() - 1;
+            saveActivePageToDisk();
             LOGI("page added (count=%zu, active=%zu)",
                  g_pages.size(), g_activePageIdx);
         } else if (a == kActionLoadDocument) {
@@ -2454,6 +2507,10 @@ void applyPendingLayerActions() {
                     g_redoStack.clear(); g_redoTotalBytes = 0;
                 }
                 g_activePageIdx = static_cast<size_t>(target);
+                // Pages load their content lazily; this is the moment
+                // the target page's pixels are actually needed.
+                ensurePageContentLoaded(g_activePageIdx);
+                saveActivePageToDisk();
                 LOGI("switched to page %d", target);
             }
         }
@@ -2466,6 +2523,8 @@ void applyPendingLayerActions() {
 void ensureAtLeastOnePage() {
     if (g_pages.empty()) {
         g_pages.push_back(std::make_unique<Page>());
+        // Synthesized, not read from disk — see the addPage path.
+        g_pages.back()->contentLoaded = true;
         g_activePageIdx = 0;
     }
     if (g_activePageIdx >= g_pages.size()) {
@@ -4576,6 +4635,11 @@ void deletePageImpl(size_t idx) {
         --g_activePageIdx;
     }
 
+    // Deleting shifts the active page; the lazily-loaded target may not
+    // be resident yet.
+    ensurePageContentLoaded(g_activePageIdx);
+    saveActivePageToDisk();
+
     LOGI("page %zu deleted (count=%zu, active=%zu)",
          idx, g_pages.size(), g_activePageIdx);
 }
@@ -4636,6 +4700,11 @@ void movePageImpl(size_t from, size_t to) {
     } else if (to < from && g_activePageIdx >= to && g_activePageIdx < from) {
         ++g_activePageIdx;
     }
+
+    // The Page objects moved with their dirs, so residency and lazy-load
+    // state track correctly across the reorder — only the persisted
+    // index needs rewriting.
+    saveActivePageToDisk();
 
     LOGI("page moved %zu->%zu (count=%zu, active=%zu)",
          from, to, g_pages.size(), g_activePageIdx);
@@ -4763,6 +4832,10 @@ void loadTilesIntoLayer(Layer& layer, const std::string& dir) {
 // why we want a metadata-only mode reachable from the UI thread.
 void loadPageLayersFromDisk(size_t pageIdx, Page& page, bool loadContent = true) {
     if (g_docDir.empty()) return;
+    // Latch before the early-outs below: a page whose dir is missing or
+    // holds no layers has no content to load, and we don't want
+    // ensurePageContentLoaded retrying the directory scan every frame.
+    if (loadContent) page.contentLoaded = true;
     std::string root = pageDirOf(pageIdx);
     DIR* d = opendir(root.c_str());
     if (!d) return;
@@ -4844,8 +4917,33 @@ void loadPageLayersFromDisk(size_t pageIdx, Page& page, bool loadContent = true)
     }
 }
 
+// Pull one page's content (raster tiles, vector shapes) off disk if it
+// hasn't been already. GL thread only — creates textures and FBOs.
+//
+// Restores the draw-framebuffer binding on the way out: getOrCreateTile
+// leaves the last tile's FBO bound, and this runs from inside
+// compositeAllLayers and the pending-action drain, where clobbering the
+// multi-buffer FBO would send the frame's clear and composite into a
+// tile instead of the screen.
+void ensurePageContentLoaded(size_t pageIdx) {
+    if (pageIdx >= g_pages.size() || !g_pages[pageIdx]) return;
+    if (g_pages[pageIdx]->contentLoaded) return;
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    loadPageLayersFromDisk(pageIdx, *g_pages[pageIdx], /*loadContent=*/true);
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
 void loadAllLayersFromDisk(bool loadContent = true) {
     if (g_docDir.empty()) return;
+
+    // Is this a document coming into memory for the first time, or a
+    // metadata refresh over a doc that's already resident? Only the
+    // former should adopt the persisted active page. renameCurrentDocument
+    // re-points g_docDir at the renamed directory and calls back through
+    // here precisely BECAUSE it wants in-memory state left alone — it
+    // must not yank the user off the page they're on.
+    bool freshLoad = g_pages.empty();
 
     // Two-step legacy migration: bare tiles → layer_0/, root layer_* →
     // page_0/. Both are no-ops on already-migrated docs.
@@ -4873,10 +4971,29 @@ void loadAllLayersFromDisk(bool loadContent = true) {
     for (auto& slot : g_pages) {
         if (!slot) slot = std::make_unique<Page>();
     }
+    // Metadata for every page. Cheap: a directory scan plus a handful of
+    // sub-kilobyte files per layer, no GL work, no tile reads.
     for (int idx : pageIndices) {
-        loadPageLayersFromDisk(static_cast<size_t>(idx), *g_pages[idx], loadContent);
+        loadPageLayersFromDisk(static_cast<size_t>(idx), *g_pages[idx],
+                               /*loadContent=*/false);
     }
-    if (loadContent) LOGI("loaded %zu pages", g_pages.size());
+
+    // Restore the page the user left this document on before deciding
+    // whose content to pull in.
+    if (freshLoad) {
+        g_activePageIdx = readActivePageFromDisk(g_pages.size());
+    } else if (g_activePageIdx >= g_pages.size()) {
+        g_activePageIdx = g_pages.size() - 1;
+    }
+
+    // Content for the active page only — every other page waits until
+    // something actually needs its pixels (a page switch, a thumbnail,
+    // an export). See ensurePageContentLoaded.
+    if (loadContent) {
+        ensurePageContentLoaded(g_activePageIdx);
+        LOGI("loaded %zu pages (content: page %zu)",
+             g_pages.size(), g_activePageIdx);
+    }
 }
 
 // Metadata-only load — reads layer types, names, visibility, opacity
@@ -5681,6 +5798,14 @@ constexpr float    kHandleHitRadiusViewPx   = 18.0f;
 constexpr float    kRotateHandleOffsetViewPx = 28.0f;
 constexpr float    kSelectionOutlineWidthViewPx = 1.5f;
 inline float vpxToDoc(float vpx) { return vpx / currentViewScale(); }
+// UI-thread variant. Hit-tests run on the UI thread, where
+// currentViewScale() is unsafe: renderPageThumbnail and the bucket-fill
+// composite both temporarily overwrite g_viewScaleBits on the GL thread
+// (see the comment on g_userViewScaleBits). A tap dispatched inside a
+// thumbnail render's window would otherwise read the thumbnail's scale
+// — ~0.05 — and inflate an 18 view-px handle radius to ~350 doc-px, so
+// a tap well outside the selection registers as a corner grab.
+inline float vpxToDocUi(float vpx) { return vpx / userViewScale(); }
 
 // Oriented bounding box for a shape, in doc-pixel space. Defined before
 // the handle-rendering helpers (which take it by reference) and before
@@ -5957,10 +6082,17 @@ void scaleHandlePosition(const Obb& o, ShapeKind kind, int handleIdx,
     rotateLocalToWorld(o, lx, ly, outX, outY);
 }
 
-// Rotate handle is offset above the OBB top-center.
-void rotateHandlePosition(const Obb& o, float& outX, float& outY) {
-    rotateLocalToWorld(o, 0.0f, -o.hh - vpxToDoc(kRotateHandleOffsetViewPx),
-                       outX, outY);
+// Rotate handle is offset above the OBB top-center. `uiThread` selects
+// which view-scale mirror the offset is derived from: hit-tests run on
+// the UI thread and must use userViewScale() (see vpxToDocUi), render
+// runs on the GL thread and uses currentViewScale(). Getting this wrong
+// puts the hit-test's notion of the handle hundreds of doc-px away from
+// where it was drawn.
+void rotateHandlePosition(const Obb& o, float& outX, float& outY,
+                          bool uiThread = false) {
+    float off = uiThread ? vpxToDocUi(kRotateHandleOffsetViewPx)
+                         : vpxToDoc(kRotateHandleOffsetViewPx);
+    rotateLocalToWorld(o, 0.0f, -o.hh - off, outX, outY);
 }
 
 // Number of scale handles for the shape (2 for Line, 4 for others).
@@ -7924,6 +8056,46 @@ void commitRasterSelectionImpl() {
     rotateLocalToWorld(selObb, +selObb.hw, -selObb.hh, c1x, c1y);
     rotateLocalToWorld(selObb, +selObb.hw, +selObb.hh, c2x, c2y);
     rotateLocalToWorld(selObb, -selObb.hw, +selObb.hh, c3x, c3y);
+
+    // Snap an unrotated placement to the doc-pixel grid before baking.
+    //
+    // A move drag leaves centerX/centerY at an arbitrary float, and the
+    // bake samples contentTex with GL_LINEAR — so a fractional doc-px
+    // offset makes every destination pixel a 2x2 blend of its
+    // neighbors. That is a permanent one-pixel box blur baked into the
+    // tiles, and it compounds on every lift/drop cycle. This is the
+    // "content goes soft after I move it" bug.
+    //
+    // With the corners on integers, each fragment samples a texel dead
+    // center and the bake is lossless. Rotated placements resample no
+    // matter what, so they're left alone. Worst-case visible effect is
+    // the selection settling by up to half a doc-pixel on pen-up.
+    bool pixelExact = false;      // unrotated AND unscaled => 1:1 copy
+    if (std::fabs(selObb.rotation) < 1e-4f) {
+        float minX = std::round(selObb.cx - selObb.hw);
+        float minY = std::round(selObb.cy - selObb.hh);
+        float maxX, maxY;
+        // Unscaled? Carry the source dimensions across exactly instead
+        // of rounding each edge independently — that could shave a
+        // pixel off the extent and reintroduce the resample we're
+        // trying to avoid.
+        if (std::fabs(selObb.hw * 2.0f - static_cast<float>(sel.contentW)) < 1e-3f
+         && std::fabs(selObb.hh * 2.0f - static_cast<float>(sel.contentH)) < 1e-3f) {
+            maxX = minX + static_cast<float>(sel.contentW);
+            maxY = minY + static_cast<float>(sel.contentH);
+            pixelExact = true;
+        } else {
+            maxX = std::round(selObb.cx + selObb.hw);
+            maxY = std::round(selObb.cy + selObb.hh);
+            if (maxX <= minX) maxX = minX + 1.0f;
+            if (maxY <= minY) maxY = minY + 1.0f;
+        }
+        c0x = minX; c0y = minY;
+        c1x = maxX; c1y = minY;
+        c2x = maxX; c2y = maxY;
+        c3x = minX; c3y = maxY;
+    }
+
     // Axis-aligned bounding box of the (possibly rotated) placement.
     float aabbMinX = std::min(std::min(c0x, c1x), std::min(c2x, c3x));
     float aabbMinY = std::min(std::min(c0y, c1y), std::min(c2y, c3y));
@@ -8015,6 +8187,17 @@ void commitRasterSelectionImpl() {
         glUniform1f(g_sel.uOpacity, 1.0f);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+        // Integer-aligned 1:1 placement: sample NEAREST so the bake is
+        // bit-exact. LINEAR would give the same bytes in principle (the
+        // samples land on texel centers) but only up to float precision
+        // in the corner math at large doc coordinates — NEAREST removes
+        // the question. The texture is deleted below, so no restore.
+        if (pixelExact) {
+            glBindTexture(GL_TEXTURE_2D, sel.contentTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
 
         // Per-tile bake. Each tile uses its own viewport and the four
         // placement corners translated into the tile's local coordinate
@@ -9490,12 +9673,16 @@ int hitTestSelectionHandle(float x, float y) {
     Obb obb;
     if (!obbForSelection(sel, obb)) return -1;
 
+    // Radius via the UI-thread scale mirror — see vpxToDocUi.
+    float r2 = vpxToDocUi(kHandleHitRadiusViewPx)
+             * vpxToDocUi(kHandleHitRadiusViewPx);
+
     // Rotate handle (skip for circles).
     if (sel.kind != ShapeKind::Circle) {
         float rhX, rhY;
-        rotateHandlePosition(obb, rhX, rhY);
+        rotateHandlePosition(obb, rhX, rhY, /*uiThread=*/true);
         float dx = x - rhX, dy = y - rhY;
-        if (dx*dx + dy*dy <= vpxToDoc(kHandleHitRadiusViewPx) * vpxToDoc(kHandleHitRadiusViewPx)) {
+        if (dx*dx + dy*dy <= r2) {
             return -2;
         }
     }
@@ -9506,7 +9693,7 @@ int hitTestSelectionHandle(float x, float y) {
         float hx, hy;
         scaleHandlePosition(obb, sel.kind, i, hx, hy);
         float dx = x - hx, dy = y - hy;
-        if (dx*dx + dy*dy <= vpxToDoc(kHandleHitRadiusViewPx) * vpxToDoc(kHandleHitRadiusViewPx)) {
+        if (dx*dx + dy*dy <= r2) {
             return i;
         }
     }
@@ -9528,12 +9715,13 @@ int hitTestRasterSelectionHandle(float x, float y) {
         if (!g_rasterSel.active) return -1;
         obb = obbForRasterSelection(g_rasterSel);
     }
-    float r2 = vpxToDoc(kHandleHitRadiusViewPx)
-             * vpxToDoc(kHandleHitRadiusViewPx);
+    // Radius via the UI-thread scale mirror — see vpxToDocUi.
+    float r2 = vpxToDocUi(kHandleHitRadiusViewPx)
+             * vpxToDocUi(kHandleHitRadiusViewPx);
 
     // Rotate handle.
     float rhX, rhY;
-    rotateHandlePosition(obb, rhX, rhY);
+    rotateHandlePosition(obb, rhX, rhY, /*uiThread=*/true);
     {
         float dx = x - rhX, dy = y - rhY;
         if (dx*dx + dy*dy <= r2) return -2;
@@ -9563,6 +9751,13 @@ void applyRasterScaleTo(float x, float y) {
         d = g_rasterDrag;
     }
     if (d.mode != DragMode::Scale) return;
+
+    // Work in handle space, not pen space: the corner sits wherever the
+    // pen is minus where the pen was relative to the corner at grab
+    // time. Applied before snap/velocity so everything downstream sees
+    // the corner's actual position.
+    x -= d.grabOffsetX;
+    y -= d.grabOffsetY;
 
     float vView = 0.0f;
     bool fast = false;
@@ -9763,11 +9958,16 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
         }
         float ax, ay;
         scaleHandlePosition(obb, sel.kind, anchorIdx, ax, ay);
+        // Grab offset: how far the pen landed from the handle it hit.
+        float gx, gy;
+        scaleHandlePosition(obb, sel.kind, handleHit, gx, gy);
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         g_drag.mode = DragMode::Scale;
         g_drag.handleIdx = handleHit;
         g_drag.anchorX = ax;
         g_drag.anchorY = ay;
+        g_drag.grabOffsetX = x - gx;
+        g_drag.grabOffsetY = y - gy;
         g_drag.initialRotation = obb.rotation;
         g_transformBeforeSel = sel;
         snapshotSelectionShape(sel, g_transformBeforeShape);
@@ -9975,6 +10175,10 @@ void applyScaleTo(float x, float y) {
     if (d.mode != DragMode::Scale || sel.kind == ShapeKind::None) return;
     if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return;
     Layer& layer = *layers()[sel.layerIdx];
+
+    // Work in handle space, not pen space — see applyRasterScaleTo.
+    x -= d.grabOffsetX;
+    y -= d.grabOffsetY;
 
     // Snap the dragged handle's pen position against other shapes'
     // targets (excluding self) before recomputing extents.
@@ -10343,10 +10547,15 @@ Java_com_bk_drawing_NativeRenderer_beginRasterInteractionAt(
         int anchorIdx = (hit + 2) % 4;
         float ax, ay;
         scaleHandlePosition(obb, ShapeKind::Rect, anchorIdx, ax, ay);
+        // Grab offset: how far the pen landed from the handle it hit.
+        float gx, gy;
+        scaleHandlePosition(obb, ShapeKind::Rect, hit, gx, gy);
         g_rasterDrag.mode = DragMode::Scale;
         g_rasterDrag.handleIdx = hit;
         g_rasterDrag.anchorX = ax;
         g_rasterDrag.anchorY = ay;
+        g_rasterDrag.grabOffsetX = x - gx;
+        g_rasterDrag.grabOffsetY = y - gy;
         g_rasterDrag.initialRotation = obb.rotation;
         // Snapshot the initial half-extents so applyRasterScaleTo can
         // enforce a uniform scale when fixedAspect is set on the
@@ -10975,6 +11184,12 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
 
     g_activePageIdx = static_cast<size_t>(pageIdx);
+    // Pages load lazily, and a thumbnail is a full composite of one —
+    // so this is a load trigger. Note the cost: refreshing every
+    // thumbnail in a document pulls in every page. The Kotlin side
+    // spreads a full refresh over several frames for exactly that
+    // reason (see thumbnailRefreshQueue in DrawingSurfaceView).
+    ensurePageContentLoaded(g_activePageIdx);
 
     // Fit the page rect into (w, h) with letterboxing. The transform is
     // doc → buffer with the same y direction in both spaces; combined with
@@ -11480,6 +11695,13 @@ Java_com_bk_drawing_NativeRenderer_renderDocument(
     ATRACE_SCOPE("DrawingApp.renderDocument");
     ensureInited();
     ensureLoaded();
+    // Defensive: covers pages created in-memory (addPage, the
+    // ensureAtLeastOnePage fallback) reaching the compositor before
+    // anything else triggered their load. Cheap once loaded — a bool.
+    // Deliberately NOT inside compositeAllLayers: the partial-recomposite
+    // path calls that with the scissor test enabled, and tile creation
+    // does a full-texture glClear that a live scissor would truncate.
+    ensurePageContentLoaded(g_activePageIdx);
     {
         ATRACE_SCOPE("DrawingApp.renderDocument.applyPending");
         // applyPending* will flip g_mbCacheValid to false if anything

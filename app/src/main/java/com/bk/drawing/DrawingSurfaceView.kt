@@ -336,20 +336,50 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 if (targets != null && targets.isNotEmpty()) {
                     val pageCount  = NativeRenderer.getPageCount()
                     val activePage = NativeRenderer.getActivePage()
-                    val refreshAll = thumbnailRefreshAllOnce
-                    thumbnailRefreshAllOnce = false
+                    if (thumbnailRefreshAllOnce) {
+                        thumbnailRefreshAllOnce = false
+                        // Queue every non-active page; the active one is
+                        // always rendered below, so queuing it would just
+                        // make us composite it twice.
+                        thumbnailRefreshQueue.clear()
+                        for (idx in targets.keys) {
+                            if (idx in 0 until pageCount && idx != activePage) {
+                                thumbnailRefreshQueue.addLast(idx)
+                            }
+                        }
+                    }
 
-                    for ((idx, bitmap) in targets) {
-                        if (idx !in 0 until pageCount) continue
-                        if (refreshAll || idx == activePage) {
-                            // Sidebar thumbnails include the page-edge
-                            // outline so the page reads as a framed
-                            // sheet at small sizes.
-                            NativeRenderer.renderPageThumbnail(idx, bitmap,
+                    // Sidebar thumbnails include the page-edge outline so
+                    // the page reads as a framed sheet at small sizes.
+                    if (activePage in 0 until pageCount) {
+                        targets[activePage]?.let { bitmap ->
+                            NativeRenderer.renderPageThumbnail(activePage, bitmap,
                                 drawChrome = true)
                         }
                     }
+
+                    var budget = kThumbnailsPerPass
+                    while (budget > 0 && thumbnailRefreshQueue.isNotEmpty()) {
+                        val idx = thumbnailRefreshQueue.removeFirst()
+                        val bitmap = targets[idx] ?: continue
+                        if (idx !in 0 until pageCount) continue
+                        NativeRenderer.renderPageThumbnail(idx, bitmap,
+                            drawChrome = true)
+                        budget--
+                    }
+
+                    // Unconditional, even when nothing rendered: this is
+                    // also how MainActivity notices page-count / active-page
+                    // drift and rebuilds the sidebar. After addPage the new
+                    // active page isn't in `targets` yet, so gating this on
+                    // "did we render something" would strand the sidebar.
                     post { onThumbnailsUpdated?.invoke() }
+                    // More queued: come back next pass and keep draining.
+                    // post() rather than calling forceRedraw() directly —
+                    // commit() from inside the framework's own MB callback
+                    // is the re-entrant case the deferred-refresh path
+                    // already avoids.
+                    if (thumbnailRefreshQueue.isNotEmpty()) post { forceRedraw() }
                 }
             }
 
@@ -401,6 +431,22 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var thumbnailTargets: Map<Int, android.graphics.Bitmap>? = null
     @Volatile
     private var thumbnailRefreshAllOnce = false
+
+    // Pending non-active pages awaiting a thumbnail render, drained a few
+    // per multi-buffer pass.
+    //
+    // Pages load their raster tiles lazily now (see ensurePageContentLoaded
+    // in renderer.cpp), and renderPageThumbnail is a load trigger — it
+    // composites the page it's given. Rendering every thumbnail in one
+    // pass therefore pulls every page's tiles off disk in a single GL
+    // callback, which is the cost the lazy load exists to avoid. Spreading
+    // the refresh means switching documents pays for the active page and
+    // the rest fill in over the following frames.
+    //
+    // GL thread only.
+    private val thumbnailRefreshQueue = ArrayDeque<Int>()
+    // Per-pass budget. The active page is always refreshed on top of this.
+    private val kThumbnailsPerPass = 2
 
     // Trailing-edge debounce: when a stroke commits we DON'T refresh the
     // thumbnail in the same multi-buffer pass (renderPageThumbnail does a
@@ -1224,6 +1270,75 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var selRectPreviewX1 = 0f
     private var selRectPreviewY1 = 0f
 
+    // ---- INTERACT drag slop -----------------------------------------
+    //
+    // A tap must not transform the selection. The corner handles have a
+    // hit radius that extends OUTSIDE the selection body, so a tap just
+    // past a corner registers as a scale grab; without a movement
+    // threshold, a single pixel of pen jitter between DOWN and UP is
+    // then enough to resize. Combined with the native-side grab offset
+    // (DragState.grabOffsetX/Y) this makes a handle drag start exactly
+    // where the pen is and only move by the pen's own delta.
+    //
+    // Tracked in view-px so the threshold is a constant physical
+    // distance regardless of zoom.
+    private var interactDownX = 0f
+    private var interactDownY = 0f
+    private var interactMoved = false
+    // Did the ACTION_DOWN land inside the selection body, as opposed to
+    // merely inside a handle's hit radius (which reaches outside it)?
+    // Decides what an unmoved tap means on ACTION_UP.
+    private var interactInsideBody = false
+    // Mode beginRasterInteractionAt chose: 1 = move, 2 = scale, 3 = rotate.
+    private var interactHit = 0
+    private val kInteractSlopViewPx = 6f
+
+    /** Shared ACTION_DOWN bookkeeping for a rect/lasso INTERACT drag. */
+    private fun beginSelInteract(
+        event: MotionEvent, docX: Float, docY: Float, hit: Int
+    ) {
+        selRectMode = SelRectMode.INTERACT
+        interactDownX = event.x
+        interactDownY = event.y
+        interactMoved = false
+        interactHit = hit
+        interactInsideBody = NativeRenderer.rasterSelectionContains(docX, docY)
+    }
+
+    /** Drive an in-progress INTERACT drag, holding still until the pen
+     *  has travelled past the slop threshold. */
+    private fun updateSelInteract(event: MotionEvent, docX: Float, docY: Float) {
+        if (!interactMoved) {
+            val ddx = event.x - interactDownX
+            val ddy = event.y - interactDownY
+            if (ddx * ddx + ddy * ddy
+                < kInteractSlopViewPx * kInteractSlopViewPx) return
+            interactMoved = true
+        }
+        NativeRenderer.updateRasterInteractionAt(docX, docY)
+        forceRedraw()
+    }
+
+    /** Finish an INTERACT drag. An unmoved tap that landed outside the
+     *  selection body but got claimed by a CORNER handle was the user
+     *  reaching for "tap outside to finalize" and merely clipping that
+     *  handle's hit radius — honour it and commit, matching what a
+     *  cleaner miss (hit == 0) would have done.
+     *
+     *  Deliberately scoped to corner handles (hit == 2). Their radius is
+     *  centred on the corners themselves, so half of it spills into the
+     *  space just outside the selection — which is exactly where a
+     *  dismissing tap lands. The rotate handle is a distinct affordance
+     *  floating above the top edge; a tap there stays inert rather than
+     *  silently dropping the selection. */
+    private fun endSelInteract(r: GLFrontBufferedRenderer<StrokeAction>) {
+        NativeRenderer.endRasterInteraction()
+        if (!interactMoved && !interactInsideBody && interactHit == 2) {
+            pendingCommitRasterSel = true
+            r.commit()
+        }
+    }
+
     private fun handleSelectRectEvent(
         r: GLFrontBufferedRenderer<StrokeAction>,
         event: MotionEvent
@@ -1237,7 +1352,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 // 0 means no active selection OR the tap fell outside it.
                 val hit = NativeRenderer.beginRasterInteractionAt(dx, dy)
                 if (hit != 0) {
-                    selRectMode = SelRectMode.INTERACT
+                    beginSelInteract(event, dx, dy, hit)
                     forceRedraw()
                 } else {
                     // Tap missed the selection (or there is none). Commit
@@ -1275,10 +1390,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                             StrokeAction.LassoPreview(pts, closed = true)
                         )
                     }
-                    SelRectMode.INTERACT -> {
-                        NativeRenderer.updateRasterInteractionAt(dx, dy)
-                        forceRedraw()
-                    }
+                    SelRectMode.INTERACT -> updateSelInteract(event, dx, dy)
                     SelRectMode.NONE -> {}
                 }
             }
@@ -1296,9 +1408,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         r.commit()
                     }
                     SelRectMode.INTERACT -> {
-                        // Selection stays floating; user can drag again
-                        // or tap outside to commit.
-                        NativeRenderer.endRasterInteraction()
+                        // Selection stays floating unless this was a tap
+                        // outside it; user can drag again or tap outside
+                        // to commit.
+                        endSelInteract(r)
                     }
                     SelRectMode.NONE -> {}
                 }
@@ -1331,7 +1444,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 // lasso path.
                 val hit = NativeRenderer.beginRasterInteractionAt(dx, dy)
                 if (hit != 0) {
-                    selRectMode = SelRectMode.INTERACT
+                    beginSelInteract(event, dx, dy, hit)
                     forceRedraw()
                 } else {
                     if (NativeRenderer.hasRasterSelection()) {
@@ -1365,10 +1478,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                             )
                         )
                     }
-                    SelRectMode.INTERACT -> {
-                        NativeRenderer.updateRasterInteractionAt(dx, dy)
-                        forceRedraw()
-                    }
+                    SelRectMode.INTERACT -> updateSelInteract(event, dx, dy)
                     SelRectMode.NONE -> {}
                 }
             }
@@ -1385,9 +1495,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         // lasso lift queue on the GL thread.
                         r.commit()
                     }
-                    SelRectMode.INTERACT -> {
-                        NativeRenderer.endRasterInteraction()
-                    }
+                    SelRectMode.INTERACT -> endSelInteract(r)
                     SelRectMode.NONE -> {}
                 }
                 selRectMode = SelRectMode.NONE
