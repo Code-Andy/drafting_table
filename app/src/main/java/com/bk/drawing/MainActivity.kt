@@ -208,6 +208,11 @@ class MainActivity : AppCompatActivity() {
     private val kBrushMaxRadiusDoc = 18.0f
     private val kVectorWidthMin = 0.5f
     private val kVectorWidthMax = 16.0f
+    // Tool-rail tile geometry. Sized so every tool fits on screen at
+    // once — see toolTile() for the height budget. Adding a rail entry
+    // eats ~40dp of the remaining headroom.
+    private val kRailTileSizeDp = 38
+    private val kRailTilePadDp  = 6
     // Brush-alpha mapping: invert the dab-accumulation curve so the
     // slider position equals target *stroke* opacity (not per-dab α).
     // A stroke at position (x, y) is roughly N overlapping dabs deep
@@ -561,7 +566,7 @@ class MainActivity : AppCompatActivity() {
         val rail = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, 8.dp, 0, 8.dp)
+            setPadding(0, 4.dp, 0, 4.dp)
         }
         // Right-edge hairline so the rail visually separates from the
         // sidebar / layer panel even when paperDeep is the same tone.
@@ -640,8 +645,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun railRule(): View = View(this).apply {
         setBackgroundColor(getColor(R.color.rule))
-        layoutParams = LinearLayout.LayoutParams(36.dp, 1.dp).apply {
-            topMargin = 6.dp; bottomMargin = 4.dp
+        layoutParams = LinearLayout.LayoutParams(30.dp, 1.dp).apply {
+            topMargin = 3.dp; bottomMargin = 3.dp
         }
     }
 
@@ -652,7 +657,7 @@ class MainActivity : AppCompatActivity() {
         letterSpacing = 0.12f
         setTextColor(getColor(R.color.inkFaint))
         gravity = Gravity.CENTER
-        setPadding(0, 2.dp, 0, 2.dp)
+        setPadding(0, 1.dp, 0, 1.dp)
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
     }
@@ -665,8 +670,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Generic 44dp icon tile. `isToggle` toggles `isSelected` on tap;
+     * Generic icon tile. `isToggle` toggles `isSelected` on tap;
      * non-toggle tiles fire `onClick` and the caller manages state.
+     *
+     * Geometry is sized so the whole rail fits the MovinkPad's 822dp
+     * landscape height without scrolling — a rail you have to scroll
+     * hides tools and costs a gesture mid-sketch. The 26dp content box
+     * still exceeds the icons' 24dp intrinsic size, so trimming the
+     * tile trims dead space only; CENTER_INSIDE never upscales, so the
+     * glyphs render at exactly the same size they did at 44dp.
+     * Budget: 15 tiles x 40dp pitch + rules/labels ~= 685dp.
      */
     private fun toolTile(iconRes: Int, label: String,
                          isToggle: Boolean,
@@ -676,7 +689,8 @@ class MainActivity : AppCompatActivity() {
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             background = ResourcesCompat.getDrawable(
                 resources, R.drawable.tool_tile_bg, theme)
-            setPadding(10.dp, 10.dp, 10.dp, 10.dp)
+            setPadding(kRailTilePadDp.dp, kRailTilePadDp.dp,
+                       kRailTilePadDp.dp, kRailTilePadDp.dp)
             contentDescription = label
             imageTintList = ColorStateList(
                 arrayOf(intArrayOf(android.R.attr.state_selected),
@@ -690,8 +704,9 @@ class MainActivity : AppCompatActivity() {
                 onClick(this)
             }
         }
-        tile.layoutParams = LinearLayout.LayoutParams(44.dp, 44.dp).apply {
-            topMargin = 2.dp; bottomMargin = 2.dp
+        tile.layoutParams = LinearLayout.LayoutParams(
+            kRailTileSizeDp.dp, kRailTileSizeDp.dp).apply {
+            topMargin = 1.dp; bottomMargin = 1.dp
         }
         return tile
     }

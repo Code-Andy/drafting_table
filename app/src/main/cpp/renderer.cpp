@@ -726,6 +726,28 @@ uniform vec4 uColor;          // straight RGBA; premultiplied at output
 uniform vec2 uPageMin;
 uniform vec2 uPageMax;
 uniform int  uPageActive;
+// Chord edge. The closing chord is the one stretch of the fill's
+// boundary that no dab covers, so left alone it reads as a hard polygon
+// edge butted against the brush's soft one — and the stroke's own dabs
+// at the two endpoints spill past it as nubs on an otherwise straight
+// edge. Both are fixed by treating the chord as if a stroke ran along
+// it: push the shape's edge out to uChordOffset — far enough that the
+// bridge is tangent to the outermost dab rather than letting it poke
+// through, and constant along the chord so the bridge stays straight —
+// then fade to zero across uFeatherBand on kDabFS's quartic.
+//
+// Both are sized CPU-side, and neither is read off the chord's own
+// endpoint samples: pressure at pen-down / pen-lift is near zero and
+// kMinRadius is 0, so endpoint-derived widths collapse to nothing (the
+// feather silently vanishes) or sit inside the largest nearby dab (it
+// protrudes). See chordOutwardOffset / chordFeatherBand.
+uniform vec2  uChord0;        // chord start = last path point, doc-px
+uniform vec2  uChord1;        // chord end   = first path point, doc-px
+uniform float uChordOffset;   // outward offset of the edge, doc-px
+uniform float uFeatherBand;   // soft-edge width, doc-px
+// 0 = ignore the chord (stencil pass), 1 = polygon interior,
+// 2 = the band the chord's offset adds outside the polygon.
+uniform int   uChordMode;
 out vec4 outColor;
 void main() {
     if (uPageActive != 0 && (
@@ -733,7 +755,34 @@ void main() {
         vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
         discard;
     }
-    outColor = vec4(uColor.rgb * uColor.a, uColor.a);
+    float alpha = uColor.a;
+    if (uChordMode != 0) {
+        // Distance to the chord SEGMENT, not its infinite line — a
+        // concave region can wrap around past the chord's ends, and
+        // those parts are nowhere near the chord and must not fade.
+        // Unsigned distance is what keeps that safe: a far-off interior
+        // fragment lands deep in the solid range either way, so the
+        // fade can never reach across the shape and gouge it.
+        vec2  seg  = uChord1 - uChord0;
+        float len2 = dot(seg, seg);
+        float t    = (len2 > 1e-8)
+                   ? clamp(dot(vDocPos - uChord0, seg) / len2, 0.0, 1.0)
+                   : 0.0;
+        float d    = distance(vDocPos, uChord0 + seg * t);
+        // The shape's edge now sits uChordOffset outside the chord, so
+        // moving into the polygon adds to the depth below that edge
+        // while moving out into the offset band subtracts from it. Both
+        // modes agree at d = 0, which keeps the two passes seamless.
+        float depth = (uChordMode == 1) ? (uChordOffset + d)
+                                        : (uChordOffset - d);
+        // max() guards the hard-brush case (band 0) against a divide by
+        // zero; 1e-3 doc-px reads as the same crisp step its dabs give.
+        float f  = clamp(depth / max(uFeatherBand, 1e-3), 0.0, 1.0);
+        float f2 = f * f;
+        alpha *= f2 * f2;
+    }
+    if (alpha <= 0.0) discard;
+    outColor = vec4(uColor.rgb * alpha, alpha);
 }
 )";
 
@@ -1103,13 +1152,18 @@ struct FillProg {
 };
 
 struct PolyProg {
-    GLuint program     = 0;
-    GLint  uTransform  = -1;
-    GLint  uScreen     = -1;
-    GLint  uColor      = -1;
-    GLint  uPageMin    = -1;
-    GLint  uPageMax    = -1;
-    GLint  uPageActive = -1;
+    GLuint program      = 0;
+    GLint  uTransform   = -1;
+    GLint  uScreen      = -1;
+    GLint  uColor       = -1;
+    GLint  uPageMin     = -1;
+    GLint  uPageMax     = -1;
+    GLint  uPageActive  = -1;
+    GLint  uChord0      = -1;
+    GLint  uChord1      = -1;
+    GLint  uChordOffset = -1;
+    GLint  uFeatherBand = -1;
+    GLint  uChordMode   = -1;
 };
 
 struct SelProg {
@@ -1354,6 +1408,11 @@ std::vector<float> g_shadePolyDoc;
 bool  g_shadeBboxValid = false;
 float g_shadeMinX = 0.0f, g_shadeMinY = 0.0f;
 float g_shadeMaxX = 0.0f, g_shadeMaxY = 0.0f;
+// Highest pressure seen among the stroke's REAL samples, i.e. its
+// widest dab. Sizes the chord's soft band (see chordFeatherBand).
+// Real samples only — a predicted tail is transient, and a running max
+// would let one overshooting prediction widen the band for good.
+float g_shadeMaxPressure = 0.0f;
 
 // Extend the shade path with one doc-px sample, growing its bbox.
 inline void shadePathPush(float x, float y) {
@@ -2867,6 +2926,11 @@ void ensureInited() {
     g_poly.uPageMin    = glGetUniformLocation(g_poly.program, "uPageMin");
     g_poly.uPageMax    = glGetUniformLocation(g_poly.program, "uPageMax");
     g_poly.uPageActive = glGetUniformLocation(g_poly.program, "uPageActive");
+    g_poly.uChord0      = glGetUniformLocation(g_poly.program, "uChord0");
+    g_poly.uChord1      = glGetUniformLocation(g_poly.program, "uChord1");
+    g_poly.uChordOffset = glGetUniformLocation(g_poly.program, "uChordOffset");
+    g_poly.uFeatherBand = glGetUniformLocation(g_poly.program, "uFeatherBand");
+    g_poly.uChordMode   = glGetUniformLocation(g_poly.program, "uChordMode");
 
     g_sel.program    = linkProgram(kSelVS, kSelFS);
     g_sel.uTransform = glGetUniformLocation(g_sel.program, "uTransform");
@@ -5620,15 +5684,110 @@ struct ShadePoly {
     bool    valid = false;
     GLsizei count = 0;                        // path vertices
     float   minX = 0, minY = 0, maxX = 0, maxY = 0;
+    // The implicit closing chord, last path point → first.
+    float   chordX0 = 0, chordY0 = 0;
+    float   chordX1 = 0, chordY1 = 0;
 };
+
+// How the fill's boundary behaves at the closing chord.
+struct ChordFill {
+    // How far the fill's edge sits outside the chord, doc-px. Constant
+    // along the chord, so the bridge stays a straight edge, and set to
+    // the furthest any dab reaches past the chord — i.e. tangent to the
+    // stroke's outermost dab, with nothing left protruding through.
+    float offset = 0.0f;
+    // Soft-edge width, doc-px.
+    float band   = 0.0f;
+};
+
+// Width of the soft band the fill fades across at the chord, matching
+// what the brush lays down along the rest of the boundary: widest dab
+// radius in the stroke x (1 - hardness). A hard brush gives 0 — a crisp
+// edge, same as its dabs.
+//
+// Deliberately NOT the dab radius at the chord's own endpoints: those
+// are the pen-down and pen-lift samples, whose pressure (and hence
+// radius, with kMinRadius = 0) is ~0, which zeroes the band and makes
+// the feather silently vanish.
+inline float chordFeatherBand(float maxStrokeRadius) {
+    return maxStrokeRadius * std::max(0.0f, 1.0f - g_strokeBrushHardness);
+}
+
+// Unit normal of the closing chord pointing AWAY from the filled
+// interior. Signed area picks the side; the point test confirms it,
+// which also covers self-intersecting paths where the area is
+// misleading. Returns false for a degenerate (zero-length) chord.
+bool chordOutwardNormal(const float* xy, size_t n, float& nx, float& ny) {
+    if (n < 3) return false;
+    float c0x = xy[2 * (n - 1)], c0y = xy[2 * (n - 1) + 1];
+    float c1x = xy[0],           c1y = xy[1];
+    float dx = c1x - c0x, dy = c1y - c0y;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len < 1e-6f) return false;
+    float ux = dx / len, uy = dy / len;
+
+    double area2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t k = (i + 1) % n;
+        area2 += static_cast<double>(xy[2 * i])     * xy[2 * k + 1]
+               - static_cast<double>(xy[2 * k])     * xy[2 * i + 1];
+    }
+    nx = (area2 > 0.0) ?  uy : -uy;
+    ny = (area2 > 0.0) ? -ux :  ux;
+
+    constexpr float kProbe = 0.5f;
+    if (pointInPolygonNonzero(xy, n,
+                              (c0x + c1x) * 0.5f + nx * kProbe,
+                              (c0y + c1y) * 0.5f + ny * kProbe)) {
+        nx = -nx; ny = -ny;
+    }
+    return true;
+}
+
+// How far past the chord the stroke's dabs actually reach: for each
+// sample, its outward distance from the chord line plus its own dab
+// radius. The largest such reach is where the fill's edge has to sit
+// for the bridge to be tangent to the outermost dab instead of letting
+// it protrude.
+//
+// Note this is a MAX, not an average of the endpoint samples: pressure
+// falls off as the pen lifts (and ramps up as it lands), so the biggest
+// dab near either end is several samples in from the tip, and any
+// averaged or endpoint-only reading sits inside it. Sampling reach
+// rather than radius keeps dabs that are set back inside the shape from
+// inflating the offset.
+//
+// Capped at the stroke's widest dab so the fill can never spill further
+// past the chord than the brush itself spills past its centreline —
+// that bounds the damage when a path swings outside the chord line.
+// `xy` and `samples` are the same points in the same order.
+float chordOutwardOffset(const float* xy, size_t n,
+                         const std::vector<Sample>& samples,
+                         float maxDabRadius) {
+    float nx, ny;
+    if (!chordOutwardNormal(xy, n, nx, ny)) return 0.0f;
+    float c0x = xy[2 * (n - 1)], c0y = xy[2 * (n - 1) + 1];
+
+    float best = 0.0f;
+    for (const auto& s : samples) {
+        float outward = (s.x - c0x) * nx + (s.y - c0y) * ny;
+        best = std::max(best, outward + radiusOf(s.p));
+    }
+    return std::min(best, maxDabRadius);
+}
 
 // Scratch upload buffer — file-scope so a long stroke doesn't
 // reallocate on every batch.
 std::vector<float> g_polyUpload;
 
-// Upload `n` interleaved doc-px path vertices followed by the 4 corners
-// of their AABB (as a triangle strip, used as the stencil cover quad).
-ShadePoly uploadShadePolygon(const float* xy, size_t n) {
+// Upload `n` interleaved doc-px path vertices, then the 4 corners of
+// their AABB (triangle strip; the stencil cover quad), then 4 corners
+// of an oriented box around the chord (triangle strip; covers the band
+// the chord's outward offset adds outside the polygon). Oriented rather
+// than axis-aligned so a long diagonal chord doesn't drag a huge
+// mostly-discarded quad through the fragment stage every batch.
+ShadePoly uploadShadePolygon(const float* xy, size_t n,
+                             const ChordFill& chord) {
     ShadePoly out;
     if (n < 3) return out;
     float minX = xy[0], maxX = xy[0];
@@ -5643,13 +5802,35 @@ ShadePoly uploadShadePolygon(const float* xy, size_t n) {
     if (maxX - minX < 1e-3f || maxY - minY < 1e-3f) return out;
 
     g_polyUpload.clear();
-    g_polyUpload.reserve(n * 2 + 8);
+    g_polyUpload.reserve(n * 2 + 16);
     g_polyUpload.insert(g_polyUpload.end(), xy, xy + n * 2);
     const float quad[8] = {
         minX, minY,  maxX, minY,
         minX, maxY,  maxX, maxY,
     };
     g_polyUpload.insert(g_polyUpload.end(), quad, quad + 8);
+
+    // Oriented box around the chord, padded by the offset it reaches
+    // (coverage is zero past that, so the pad needs no feather slack)
+    // plus a pixel of slack.
+    {
+        float cx0 = xy[2 * (n - 1)], cy0 = xy[2 * (n - 1) + 1];
+        float cx1 = xy[0],           cy1 = xy[1];
+        float dx = cx1 - cx0, dy = cy1 - cy0;
+        float len = std::sqrt(dx * dx + dy * dy);
+        float ux = (len > 1e-6f) ? dx / len : 1.0f;
+        float uy = (len > 1e-6f) ? dy / len : 0.0f;
+        float px = -uy, py = ux;
+        float w = chord.offset + 1.0f;
+        // Extend past both ends so the rounded ends fit inside the box.
+        float ax = cx0 - ux * w, ay = cy0 - uy * w;
+        float bx = cx1 + ux * w, by = cy1 + uy * w;
+        const float band[8] = {
+            ax - px * w, ay - py * w,   bx - px * w, by - py * w,
+            ax + px * w, ay + py * w,   bx + px * w, by + py * w,
+        };
+        g_polyUpload.insert(g_polyUpload.end(), band, band + 8);
+    }
 
     glBindBuffer(GL_ARRAY_BUFFER, g_polyVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -5661,6 +5842,8 @@ ShadePoly uploadShadePolygon(const float* xy, size_t n) {
     out.count = static_cast<GLsizei>(n);
     out.minX = minX; out.minY = minY;
     out.maxX = maxX; out.maxY = maxY;
+    out.chordX0 = xy[2 * (n - 1)]; out.chordY0 = xy[2 * (n - 1) + 1];
+    out.chordX1 = xy[0];           out.chordY1 = xy[1];
     return out;
 }
 
@@ -5676,13 +5859,18 @@ ShadePoly uploadShadePolygon(const float* xy, size_t n) {
 // flat coverage instead of double-darkening where they overlap.
 void drawShadeFill(const ShadePoly& poly, const float* mat4,
                    float screenW, float screenH,
-                   const PageClip& clip, float alpha) {
+                   const PageClip& clip, float alpha,
+                   const ChordFill& chord) {
     if (!poly.valid) return;
 
     glBindVertexArray(g_polyVao);
     glUseProgram(g_poly.program);
     glUniformMatrix4fv(g_poly.uTransform, 1, GL_FALSE, mat4);
     glUniform2f(g_poly.uScreen, screenW, screenH);
+    glUniform2f(g_poly.uChord0, poly.chordX0, poly.chordY0);
+    glUniform2f(g_poly.uChord1, poly.chordX1, poly.chordY1);
+    glUniform1f(g_poly.uChordOffset, chord.offset);
+    glUniform1f(g_poly.uFeatherBand, chord.band);
     uploadPageClip(g_poly.uPageMin, g_poly.uPageMax,
                    g_poly.uPageActive, clip);
 
@@ -5700,7 +5888,12 @@ void drawShadeFill(const ShadePoly& poly, const float* mat4,
     glStencilFunc(GL_ALWAYS, 0, 0xFF);
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
     glStencilOpSeparate(GL_BACK,  GL_KEEP, GL_KEEP, GL_DECR_WRAP);
-    glUniform4f(g_poly.uColor, 0.0f, 0.0f, 0.0f, 0.0f);
+    // Opaque + featherless for the winding pass: color writes are
+    // masked off anyway, and the fragment shader discards at zero
+    // alpha — a transparent or feathered pass 1 would silently drop
+    // stencil writes and punch holes in the fill.
+    glUniform4f(g_poly.uColor, 0.0f, 0.0f, 0.0f, 1.0f);
+    glUniform1i(g_poly.uChordMode, 0);
     glDrawArrays(GL_TRIANGLE_FAN, 0, poly.count);
 
     // Pass 2: cover the AABB, keeping only nonzero-winding pixels.
@@ -5708,7 +5901,19 @@ void drawShadeFill(const ShadePoly& poly, const float* mat4,
     glStencilFunc(GL_NOTEQUAL, 0, 0xFF);
     glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
     glUniform4f(g_poly.uColor, 0.0f, 0.0f, 0.0f, alpha);
+    glUniform1i(g_poly.uChordMode, 1);
     glDrawArrays(GL_TRIANGLE_STRIP, poly.count, 4);
+
+    // Pass 3: the sliver the chord's outward offset adds beyond the
+    // polygon. Stencil off — this is the one part of the fill that is
+    // deliberately outside the path. It overlaps the interior too, but
+    // its own falloff there is never above what pass 2 wrote, and the
+    // caller's GL_MAX keeps whichever is larger.
+    if (chord.offset > 1e-4f) {
+        glDisable(GL_STENCIL_TEST);
+        glUniform1i(g_poly.uChordMode, 2);
+        glDrawArrays(GL_TRIANGLE_STRIP, poly.count + 4, 4);
+    }
 
     glDisable(GL_STENCIL_TEST);
     glBindVertexArray(0);
@@ -5754,15 +5959,23 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     // — every tile draws the same buffer, only the tile-local
     // translation in uTransform differs.
     ShadePoly shadePoly;
+    ChordFill shadeChord;
     std::vector<float> shadePath;
     if (g_strokeFillClosed) {
         shadePath.reserve(g_current.samples.size() * 2);
+        float maxP = 0.0f;
         for (const auto& s : g_current.samples) {
             shadePath.push_back(s.x);
             shadePath.push_back(s.y);
+            maxP = std::max(maxP, s.p);
         }
+        float maxDabR     = radiusOf(maxP);
+        shadeChord.offset = chordOutwardOffset(shadePath.data(),
+                                               g_current.samples.size(),
+                                               g_current.samples, maxDabR);
+        shadeChord.band   = chordFeatherBand(maxDabR);
         shadePoly = uploadShadePolygon(shadePath.data(),
-                                       g_current.samples.size());
+                                       g_current.samples.size(), shadeChord);
     }
     // The fill rides the uniform-alpha coverage path (that's what keeps
     // outline and fill one flat tone); beginStroke guarantees the pair
@@ -5874,10 +6087,15 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                         touched = true;
                     }
                 }
+                // Grow the tile by the chord's outward offset — the fill
+                // reaches that far past the chord, into tiles the chord
+                // itself never enters.
+                float co = shadeChord.offset;
                 if (!touched
                     && segmentIntersectsRect(p[2 * (n - 1)], p[2 * (n - 1) + 1],
                                              p[0], p[1],
-                                             tileX0, tileY0, tileX1, tileY1)) {
+                                             tileX0 - co, tileY0 - co,
+                                             tileX1 + co, tileY1 + co)) {
                     touched = true;
                 }
             }
@@ -5943,7 +6161,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                      -ox,  -oy, 0.0f, 1.0f,
                 };
                 drawShadeFill(shadePoly, tileMat, kTileSizeF, kTileSizeF,
-                              pageClip, g_strokeBrushAlpha);
+                              pageClip, g_strokeBrushAlpha, shadeChord);
                 // Restore what the rest of the loop expects — the fill
                 // swaps in its own program and vertex array.
                 glUseProgram(g_dab.program);
@@ -11784,6 +12002,7 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     g_strokeFillClosed = (g_strokeTool == kToolShade);
     g_shadePolyDoc.clear();
     g_shadeBboxValid = false;
+    g_shadeMaxPressure = 0.0f;
     // Lock prediction's active state for the duration of this stroke.
     // Mid-stroke toggles don't take effect until the next stroke so the
     // coverage mirror can't desync (a toggle on→off mid-stroke would
@@ -11865,6 +12084,7 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
     if (g_strokeFillClosed) {
         for (int i = 0; i < realCount; ++i) {
             shadePathPush(xyp[i * 3], xyp[i * 3 + 1]);
+            g_shadeMaxPressure = std::max(g_shadeMaxPressure, xyp[i * 3 + 2]);
         }
     }
 
@@ -11963,16 +12183,23 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
     // fill half has to be rebuilt every batch because the closing chord
     // sweeps as the pen moves, so the enclosed region can shrink.
     if (g_strokeFillClosed && g_shadeBboxValid) {
-        // Predicted samples extend the path for this batch only. No
-        // revert bookkeeping needed (unlike the dab coverage mirror) —
-        // the next batch rebuilds the fill from the real path anyway.
-        size_t realFloats = g_shadePolyDoc.size();
-        for (int i = realCount; i < realCount + predCount; ++i) {
-            shadePathPush(xyp[i * 3], xyp[i * 3 + 1]);
-        }
+        // Real samples only — the predicted tail is deliberately left
+        // out of the fill. Prediction buys tip latency, which the dabs
+        // still get, but the chord is a long edge anchored at the far
+        // end of the shape: feeding it the predictor's overshoot makes
+        // the whole bridge (and, through the endpoint pressure, its
+        // offset width) shimmer every frame for no perceptual gain.
+        // It also keeps the preview's chord identical to the one the
+        // bake commits, since the bake never sees predicted samples.
+        ChordFill chord;
+        float maxDabR = radiusOf(g_shadeMaxPressure);
+        chord.offset  = chordOutwardOffset(g_shadePolyDoc.data(),
+                                           g_shadePolyDoc.size() / 2,
+                                           g_current.samples, maxDabR);
+        chord.band    = chordFeatherBand(maxDabR);
+
         ShadePoly poly = uploadShadePolygon(g_shadePolyDoc.data(),
-                                            g_shadePolyDoc.size() / 2);
-        g_shadePolyDoc.resize(realFloats);
+                                            g_shadePolyDoc.size() / 2, chord);
 
         float mat[16];
         env->GetFloatArrayRegion(transform, 0, 16, mat);
@@ -11997,7 +12224,7 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
             glBlendEquation(GL_MAX);
             PageClip pageClip = readPageClip();
             drawShadeFill(poly, mat, (float)width, (float)height,
-                          pageClip, g_strokeBrushAlpha);
+                          pageClip, g_strokeBrushAlpha, chord);
 
             // Merge in the accumulated dab coverage. The stamp shader
             // with a black color and brush mode emits (0, 0, 0, c) —
