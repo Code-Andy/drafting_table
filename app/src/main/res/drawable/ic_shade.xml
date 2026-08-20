@@ -1,0 +1,22 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <group android:pivotX="12" android:pivotY="12" android:scaleX="1.2" android:scaleY="1.2">
+    <!-- The enclosed region: everything between the traced profile and
+         the straight chord that closes it. Half-alpha so the tile reads
+         as "fill", not "solid shape" (imageTintList uses SRC_IN, which
+         keeps the source alpha). -->
+    <path android:fillColor="#66000000"
+          android:pathData="M4,18 C5,7 13,3 20,7 L4,18 Z"/>
+    <!-- Traced profile, drawn with the brush. The chord is deliberately
+         unstroked — that's the tool's behavior. -->
+    <path android:strokeColor="#000" android:strokeWidth="1.8"
+          android:strokeLineCap="round" android:fillColor="#00000000"
+          android:pathData="M4,18 C5,7 13,3 20,7"/>
+    <!-- Start / end nodes the chord runs between. -->
+    <path android:fillColor="#000"
+          android:pathData="M4,18 m-1.1,0 a1.1,1.1 0 1,0 2.2,0 a1.1,1.1 0 1,0 -2.2,0 Z"/>
+    <path android:fillColor="#000"
+          android:pathData="M20,7 m-1.1,0 a1.1,1.1 0 1,0 2.2,0 a1.1,1.1 0 1,0 -2.2,0 Z"/>
+    </group>
+</vector>

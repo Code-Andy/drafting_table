@@ -698,6 +698,45 @@ void main() {
 }
 )";
 
+// Closed-path (shade tool) fill. Unlike every other program here the
+// vertex data is a real buffer of positions rather than the shared unit
+// quad: pass 1 draws the sample path as a triangle fan to accumulate a
+// winding number in the stencil buffer, pass 2 draws the path's AABB
+// with a stencil test to convert "winding != 0" into coverage alpha.
+// Positions arrive in doc-pixels; uTransform maps them into the target
+// (buffer-px for the live preview, tile-local for the bake), so
+// vDocPos — and therefore the page clip — is always doc-space.
+const char* kPolyVS = R"(#version 300 es
+layout(location = 0) in vec2 aPos;
+out vec2 vDocPos;
+uniform mat4 uTransform;
+uniform vec2 uScreen;
+void main() {
+    vDocPos = aPos;
+    vec4 bufPx = uTransform * vec4(aPos, 0.0, 1.0);
+    vec2 ndc = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+}
+)";
+
+const char* kPolyFS = R"(#version 300 es
+precision highp float;
+in vec2 vDocPos;
+uniform vec4 uColor;          // straight RGBA; premultiplied at output
+uniform vec2 uPageMin;
+uniform vec2 uPageMax;
+uniform int  uPageActive;
+out vec4 outColor;
+void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
+    outColor = vec4(uColor.rgb * uColor.a, uColor.a);
+}
+)";
+
 // Render a sampled, premultiplied texture to an axis-aligned doc-coord
 // rectangle (uMin..uMax). Used to draw the floating raster selection.
 // Translation lives in (uMin, uMax) — the caller adjusts these by the
@@ -1063,6 +1102,16 @@ struct FillProg {
     GLint  uFillColor = -1;
 };
 
+struct PolyProg {
+    GLuint program     = 0;
+    GLint  uTransform  = -1;
+    GLint  uScreen     = -1;
+    GLint  uColor      = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
+};
+
 struct SelProg {
     GLuint program    = 0;
     GLint  uTransform = -1;
@@ -1083,6 +1132,11 @@ struct ViewFbo {
     GLuint fbo     = 0;
     int    width   = 0;
     int    height  = 0;
+    // Optional stencil renderbuffer. Only the two FBOs the shade tool
+    // fills through (the screen-sized shade coverage and the tile-sized
+    // stroke coverage) carry one — a stencil attachment on every scratch
+    // FBO would be pure memory overhead for the paths that never use it.
+    GLuint stencil = 0;
 };
 
 // ---- State (GL-thread-only unless noted) ----------------------------------
@@ -1097,9 +1151,14 @@ RectProg    g_rectProg;
 PixelGridProg g_pixelGridProg;
 StampProg   g_stamp;
 FillProg    g_fill;
+PolyProg    g_poly;
 SelProg     g_sel;
 GLuint      g_quadVao = 0;
 GLuint      g_quadVbo = 0;
+// Dynamic vertex buffer for the shade tool's closed-path fill. Holds the
+// stroke's sample path followed by 4 AABB corners (see uploadShadePolygon).
+GLuint      g_polyVao = 0;
+GLuint      g_polyVbo = 0;
 bool        g_inited  = false;
 
 // Grid overlay state. Settable from any thread; read at multi-buffer
@@ -1263,6 +1322,55 @@ bool    g_strokePredictionActive = false;
 // tile. Allocated lazily in bakeCurrentStrokeIntoTiles.
 ViewFbo g_strokeCoverageTile;
 
+// ---- Shade tool (closed-path fill) --------------------------------------
+//
+// The shade tool traces a brush stroke like the pen, but the start and
+// end points are joined by an implicit straight chord and the enclosed
+// region is filled. Outline + fill are one flat coverage mask at the
+// brush alpha (no darker rim where they overlap), so the stroke always
+// runs through the uniform-alpha path.
+//
+// The dab half of the coverage accumulates in g_coverage exactly as a
+// normal stroke does — including the prediction mirror. The fill half
+// can SHRINK between batches (the chord sweeps as the pen moves), so it
+// can't accumulate; it is rebuilt every batch into g_shadeCoverage,
+// which is the union (per-pixel MAX) of the freshly-filled polygon and
+// the accumulated dab coverage. Rebuilding the fill is one fan draw
+// call; rebuilding the dabs would be O(samples) per batch, which is
+// exactly the per-event cost the batch path exists to avoid.
+ViewFbo g_shadeCoverage;
+// Per-stroke flag: snapshot of "current tool is shade" taken at
+// beginStroke, so a mid-stroke tool switch can't split the stroke.
+bool    g_strokeFillClosed = false;
+// The stroke's path in doc-px, kept as interleaved x,y for the fill's
+// vertex buffer. Mirrors g_current.samples (real samples only) and is
+// temporarily extended with the predicted tail inside a batch.
+std::vector<float> g_shadePolyDoc;
+// Monotonically-growing doc-px bbox of every sample in the stroke
+// (predicted ones included). Drives a scissor that bounds the per-batch
+// clear + merge to the shaded region instead of the whole surface.
+// Monotonic on purpose: the fill can shrink between batches, and a
+// scissor that shrank with it would strand stale coverage outside.
+bool  g_shadeBboxValid = false;
+float g_shadeMinX = 0.0f, g_shadeMinY = 0.0f;
+float g_shadeMaxX = 0.0f, g_shadeMaxY = 0.0f;
+
+// Extend the shade path with one doc-px sample, growing its bbox.
+inline void shadePathPush(float x, float y) {
+    g_shadePolyDoc.push_back(x);
+    g_shadePolyDoc.push_back(y);
+    if (!g_shadeBboxValid) {
+        g_shadeMinX = g_shadeMaxX = x;
+        g_shadeMinY = g_shadeMaxY = y;
+        g_shadeBboxValid = true;
+        return;
+    }
+    g_shadeMinX = std::min(g_shadeMinX, x);
+    g_shadeMaxX = std::max(g_shadeMaxX, x);
+    g_shadeMinY = std::min(g_shadeMinY, y);
+    g_shadeMaxY = std::max(g_shadeMaxY, y);
+}
+
 // ---- Multi-buffer cache (partial re-composite path) ---------------------
 //
 // GLFrontBufferedRenderer hands us a freshly-cleared MB.back every
@@ -1323,12 +1431,20 @@ inline size_t& activeLayer() {
     return g_pages[g_activePageIdx]->activeLayer;
 }
 
-// Active tool: 0 = brush, 1 = eraser. Settable from any thread (UI thread
-// flips it via setTool() on stylus-button press); the GL thread reads it
-// at beginStroke into g_strokeTool so a stroke uses one consistent tool
+// Active tool: 0 = brush, 1 = eraser, 7 = shade (closed-path fill; see
+// kToolShade). Settable from any thread (UI thread flips it via
+// setTool() on stylus-button press); the GL thread reads it at
+// beginStroke into g_strokeTool so a stroke uses one consistent tool
 // even if the user toggles mid-stroke.
+constexpr int kToolEraser = 1;
+constexpr int kToolShade  = 7;
 std::atomic<int> g_currentTool{0};
 int g_strokeTool = 0;
+
+// Every raster-stroke branch is really "eraser or not" — the shade tool
+// paints like the brush, so testing `== 0` for brush would silently
+// route it down the eraser path.
+inline bool strokeToolIsEraser() { return g_strokeTool == kToolEraser; }
 
 // Brush color: RGB packed into low 24 bits (0xRRGGBB). Settable from any
 // thread; the GL thread snapshots into g_strokeBrushColor at beginStroke.
@@ -1722,6 +1838,10 @@ struct UndoEntry {
     float rebakeBrushHardness = 1.0f;
     int   rebakeTool          = 0;
     bool  rebakeUniformAlpha  = false;
+    // Shade tool: the samples also describe a closed path whose interior
+    // was filled. Without this the redo would re-lay the outline and
+    // drop the fill.
+    bool  rebakeFillClosed    = false;
     // Page-clip snapshot — the bake's edge clipping depends on the
     // page bounds at bake time, so we capture and restore them.
     bool  rebakePageActive    = false;
@@ -2740,6 +2860,14 @@ void ensureInited() {
     g_fill.uMax       = glGetUniformLocation(g_fill.program, "uMax");
     g_fill.uFillColor = glGetUniformLocation(g_fill.program, "uFillColor");
 
+    g_poly.program     = linkProgram(kPolyVS, kPolyFS);
+    g_poly.uTransform  = glGetUniformLocation(g_poly.program, "uTransform");
+    g_poly.uScreen     = glGetUniformLocation(g_poly.program, "uScreen");
+    g_poly.uColor      = glGetUniformLocation(g_poly.program, "uColor");
+    g_poly.uPageMin    = glGetUniformLocation(g_poly.program, "uPageMin");
+    g_poly.uPageMax    = glGetUniformLocation(g_poly.program, "uPageMax");
+    g_poly.uPageActive = glGetUniformLocation(g_poly.program, "uPageActive");
+
     g_sel.program    = linkProgram(kSelVS, kSelFS);
     g_sel.uTransform = glGetUniformLocation(g_sel.program, "uTransform");
     g_sel.uScreen    = glGetUniformLocation(g_sel.program, "uScreen");
@@ -2769,6 +2897,16 @@ void ensureInited() {
     glBindVertexArray(g_quadVao);
     glBindBuffer(GL_ARRAY_BUFFER, g_quadVbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+
+    // Shade-tool path buffer. Contents are re-uploaded per stroke batch
+    // (and once per bake); the VAO just fixes the attribute layout.
+    glGenVertexArrays(1, &g_polyVao);
+    glGenBuffers(1, &g_polyVbo);
+    glBindVertexArray(g_polyVao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_polyVbo);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
@@ -2883,12 +3021,17 @@ void renderPixelGridOverlay(JNIEnv* env, int width, int height,
 
 // ---- Eraser-preview FBO helpers ------------------------------------------
 
-void ensureViewFbo(ViewFbo& v, int width, int height) {
-    if (v.texture != 0 && v.width == width && v.height == height) return;
+void ensureViewFbo(ViewFbo& v, int width, int height,
+                   bool withStencil = false) {
+    if (v.texture != 0 && v.width == width && v.height == height
+        && (!withStencil || v.stencil != 0)) {
+        return;
+    }
 
     if (v.fbo)     glDeleteFramebuffers(1, &v.fbo);
     if (v.texture) glDeleteTextures(1, &v.texture);
-    v.fbo = 0; v.texture = 0;
+    if (v.stencil) glDeleteRenderbuffers(1, &v.stencil);
+    v.fbo = 0; v.texture = 0; v.stencil = 0;
 
     glGenTextures(1, &v.texture);
     glBindTexture(GL_TEXTURE_2D, v.texture);
@@ -2903,6 +3046,15 @@ void ensureViewFbo(ViewFbo& v, int width, int height) {
     glBindFramebuffer(GL_FRAMEBUFFER, v.fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                            GL_TEXTURE_2D, v.texture, 0);
+    if (withStencil) {
+        glGenRenderbuffers(1, &v.stencil);
+        glBindRenderbuffer(GL_RENDERBUFFER, v.stencil);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8,
+                              width, height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                  GL_RENDERBUFFER, v.stencil);
+    }
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE) {
         LOGE("view FBO incomplete: 0x%x (size %dx%d)", status, width, height);
@@ -2998,6 +3150,16 @@ void preparePreviewBuffers(JNIEnv* env, int width, int height,
     glBindFramebuffer(GL_FRAMEBUFFER, g_coverageReal.fbo);
     glViewport(0, 0, width, height);
     glClear(GL_COLOR_BUFFER_BIT);
+    // Shade tool: merged (dabs ∪ fill) coverage. Per-batch rebuilds are
+    // scissored to the shaded region, so the one full-surface clear has
+    // to happen here — it's what makes the untouched remainder of the
+    // texture reliably zero for the whole stroke.
+    if (g_strokeFillClosed) {
+        ensureViewFbo(g_shadeCoverage, width, height, /*withStencil=*/true);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_shadeCoverage.fbo);
+        glViewport(0, 0, width, height);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     g_predictionInFlight = false;
     g_liveEmitterReal = g_liveEmitter;   // both freshly reset()
 }
@@ -5362,6 +5524,196 @@ void drainPendingSaveTilesForBbox(size_t layerIdx,
     }
 }
 
+// ---- Shade tool: closed-path fill ----------------------------------------
+
+// Compute a buffer-px AABB scissor for a doc-px bbox, given the
+// column-major doc→buffer mat4. uTransform's output is buffer-px in
+// the same convention glScissor expects (origin bottom-left, Y up), so
+// no Y flip is needed. The result is padded and clamped to the
+// drawable size; if the bbox lies entirely off-screen the rect's w or
+// h come back zero.
+struct PartialScissor { int x, y, w, h; };
+PartialScissor dirtyBboxToScissor(const float* m,
+                                  float x0, float y0,
+                                  float x1, float y1,
+                                  int width, int height,
+                                  int pad) {
+    const float cornersX[4] = { x0, x1, x1, x0 };
+    const float cornersY[4] = { y0, y0, y1, y1 };
+    float minBX = std::numeric_limits<float>::infinity();
+    float minBY = std::numeric_limits<float>::infinity();
+    float maxBX = -std::numeric_limits<float>::infinity();
+    float maxBY = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < 4; ++i) {
+        float bx = m[0] * cornersX[i] + m[4] * cornersY[i] + m[12];
+        float by = m[1] * cornersX[i] + m[5] * cornersY[i] + m[13];
+        if (bx < minBX) minBX = bx;
+        if (by < minBY) minBY = by;
+        if (bx > maxBX) maxBX = bx;
+        if (by > maxBY) maxBY = by;
+    }
+    int ix0 = static_cast<int>(std::floor(minBX)) - pad;
+    int iy0 = static_cast<int>(std::floor(minBY)) - pad;
+    int ix1 = static_cast<int>(std::ceil (maxBX)) + pad;
+    int iy1 = static_cast<int>(std::ceil (maxBY)) + pad;
+    if (ix0 < 0)      ix0 = 0;
+    if (iy0 < 0)      iy0 = 0;
+    if (ix1 > width)  ix1 = width;
+    if (iy1 > height) iy1 = height;
+    int w = ix1 - ix0; if (w < 0) w = 0;
+    int h = iy1 - iy0; if (h < 0) h = 0;
+    return { ix0, iy0, w, h };
+}
+
+// Nonzero-winding point-in-polygon over the closed path xy[0..n) (the
+// closing edge from the last vertex back to the first is implicit).
+// Matches what the stencil fill draws, and is used by the bake to
+// decide whether a tile with no samples near it is nonetheless in the
+// filled interior.
+bool pointInPolygonNonzero(const float* xy, size_t n, float px, float py) {
+    int wind = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t k = (i + 1) % n;
+        float ax = xy[2 * i],     ay = xy[2 * i + 1];
+        float bx = xy[2 * k],     by = xy[2 * k + 1];
+        // Signed area of (a, b, p): >0 means p is on one side of a→b.
+        float side = (bx - ax) * (py - ay) - (px - ax) * (by - ay);
+        if (ay <= py) {
+            if (by > py && side > 0.0f) ++wind;        // upward crossing
+        } else {
+            if (by <= py && side < 0.0f) --wind;       // downward crossing
+        }
+    }
+    return wind != 0;
+}
+
+// Liang-Barsky segment-vs-AABB overlap test.
+bool segmentIntersectsRect(float x0, float y0, float x1, float y1,
+                           float rx0, float ry0, float rx1, float ry1) {
+    if ((x0 >= rx0 && x0 <= rx1 && y0 >= ry0 && y0 <= ry1) ||
+        (x1 >= rx0 && x1 <= rx1 && y1 >= ry0 && y1 <= ry1)) {
+        return true;
+    }
+    float dx = x1 - x0, dy = y1 - y0;
+    float t0 = 0.0f, t1 = 1.0f;
+    const float p[4] = { -dx, dx, -dy, dy };
+    const float q[4] = { x0 - rx0, rx1 - x0, y0 - ry0, ry1 - y0 };
+    for (int i = 0; i < 4; ++i) {
+        if (std::fabs(p[i]) < 1e-12f) {
+            if (q[i] < 0.0f) return false;   // parallel and outside
+            continue;
+        }
+        float r = q[i] / p[i];
+        if (p[i] < 0.0f) {
+            if (r > t1) return false;
+            if (r > t0) t0 = r;
+        } else {
+            if (r < t0) return false;
+            if (r < t1) t1 = r;
+        }
+    }
+    return true;
+}
+
+// A shade path uploaded to g_polyVbo and ready to fill.
+struct ShadePoly {
+    bool    valid = false;
+    GLsizei count = 0;                        // path vertices
+    float   minX = 0, minY = 0, maxX = 0, maxY = 0;
+};
+
+// Scratch upload buffer — file-scope so a long stroke doesn't
+// reallocate on every batch.
+std::vector<float> g_polyUpload;
+
+// Upload `n` interleaved doc-px path vertices followed by the 4 corners
+// of their AABB (as a triangle strip, used as the stencil cover quad).
+ShadePoly uploadShadePolygon(const float* xy, size_t n) {
+    ShadePoly out;
+    if (n < 3) return out;
+    float minX = xy[0], maxX = xy[0];
+    float minY = xy[1], maxY = xy[1];
+    for (size_t i = 1; i < n; ++i) {
+        minX = std::min(minX, xy[2 * i]);
+        maxX = std::max(maxX, xy[2 * i]);
+        minY = std::min(minY, xy[2 * i + 1]);
+        maxY = std::max(maxY, xy[2 * i + 1]);
+    }
+    // A path with no area encloses nothing.
+    if (maxX - minX < 1e-3f || maxY - minY < 1e-3f) return out;
+
+    g_polyUpload.clear();
+    g_polyUpload.reserve(n * 2 + 8);
+    g_polyUpload.insert(g_polyUpload.end(), xy, xy + n * 2);
+    const float quad[8] = {
+        minX, minY,  maxX, minY,
+        minX, maxY,  maxX, maxY,
+    };
+    g_polyUpload.insert(g_polyUpload.end(), quad, quad + 8);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_polyVbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(g_polyUpload.size() * sizeof(float)),
+                 g_polyUpload.data(), GL_STREAM_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    out.valid = true;
+    out.count = static_cast<GLsizei>(n);
+    out.minX = minX; out.minY = minY;
+    out.maxX = maxX; out.maxY = maxY;
+    return out;
+}
+
+// Fill the uploaded path's interior into the bound FBO as flat coverage
+// (rgb 0, alpha `alpha`), using the nonzero winding rule. The FBO MUST
+// have a stencil attachment — without one the stencil test always
+// passes and the whole AABB would fill. `mat4` maps the path's doc-px
+// coordinates into the target (buffer-px for the live preview, a
+// tile-local translation for the bake); `clip` is in doc-px either way.
+//
+// Caller owns the blend state: both the live preview and the bake run
+// this with GL_MAX so the fill and the dabbed outline merge into one
+// flat coverage instead of double-darkening where they overlap.
+void drawShadeFill(const ShadePoly& poly, const float* mat4,
+                   float screenW, float screenH,
+                   const PageClip& clip, float alpha) {
+    if (!poly.valid) return;
+
+    glBindVertexArray(g_polyVao);
+    glUseProgram(g_poly.program);
+    glUniformMatrix4fv(g_poly.uTransform, 1, GL_FALSE, mat4);
+    glUniform2f(g_poly.uScreen, screenW, screenH);
+    uploadPageClip(g_poly.uPageMin, g_poly.uPageMax,
+                   g_poly.uPageActive, clip);
+
+    // Pass 1: accumulate a winding number per pixel. Drawing the path as
+    // a triangle fan makes each edge contribute exactly one signed
+    // crossing (INCR_WRAP on front faces, DECR_WRAP on back), so the
+    // stencil ends up holding the winding number — self-intersecting
+    // scribbles come out solid rather than punched through.
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0xFF);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glStencilFunc(GL_ALWAYS, 0, 0xFF);
+    glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
+    glStencilOpSeparate(GL_BACK,  GL_KEEP, GL_KEEP, GL_DECR_WRAP);
+    glUniform4f(g_poly.uColor, 0.0f, 0.0f, 0.0f, 0.0f);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, poly.count);
+
+    // Pass 2: cover the AABB, keeping only nonzero-winding pixels.
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glStencilFunc(GL_NOTEQUAL, 0, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glUniform4f(g_poly.uColor, 0.0f, 0.0f, 0.0f, alpha);
+    glDrawArrays(GL_TRIANGLE_STRIP, poly.count, 4);
+
+    glDisable(GL_STENCIL_TEST);
+    glBindVertexArray(0);
+}
+
 // ---- Bake -----------------------------------------------------------------
 
 void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
@@ -5397,6 +5749,27 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     minX -= pad; maxX += pad;
     minY -= pad; maxY += pad;
 
+    // Shade tool: the stroke's samples double as a closed path whose
+    // interior is filled. Build the doc-px path once for the whole bake
+    // — every tile draws the same buffer, only the tile-local
+    // translation in uTransform differs.
+    ShadePoly shadePoly;
+    std::vector<float> shadePath;
+    if (g_strokeFillClosed) {
+        shadePath.reserve(g_current.samples.size() * 2);
+        for (const auto& s : g_current.samples) {
+            shadePath.push_back(s.x);
+            shadePath.push_back(s.y);
+        }
+        shadePoly = uploadShadePolygon(shadePath.data(),
+                                       g_current.samples.size());
+    }
+    // The fill rides the uniform-alpha coverage path (that's what keeps
+    // outline and fill one flat tone); beginStroke guarantees the pair
+    // move together, and the guard keeps a mismatched snapshot from
+    // dumping raw coverage into a tile.
+    const bool shading = shadePoly.valid && g_strokeUniformAlpha;
+
     int tx0 = static_cast<int>(std::floor(minX / kTileSizeF));
     int tx1 = static_cast<int>(std::floor(maxX / kTileSizeF));
     int ty0 = static_cast<int>(std::floor(minY / kTileSizeF));
@@ -5415,7 +5788,10 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
     // overlap. Both paths share the outer dab-program setup; only the
     // per-tile inner work differs.
     if (g_strokeUniformAlpha) {
-        ensureViewFbo(g_strokeCoverageTile, kTileSize, kTileSize);
+        // Stencil attachment is for the shade tool's fill; harmless (and
+        // one-time) for plain uniform-alpha strokes.
+        ensureViewFbo(g_strokeCoverageTile, kTileSize, kTileSize,
+                      /*withStencil=*/true);
         // Coverage dab output: zero RGB, brush alpha. The stamp shader
         // supplies the brush color so the dab pass only needs to track
         // the max alpha. Same setup for brush and eraser; eraser is
@@ -5423,7 +5799,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
         float coverageColor[4] = { 0.0f, 0.0f, 0.0f, g_strokeBrushAlpha };
         glUniform4fv(g_dab.uColor, 1, coverageColor);
         glBlendEquation(GL_MAX);
-    } else if (g_strokeTool == 0) {
+    } else if (!strokeToolIsEraser()) {
         // Brush: additive premultiplied.
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glUniform4fv(g_dab.uColor, 1, g_strokeBrushColor);
@@ -5480,6 +5856,31 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                     break;
                 }
             }
+            // A shaded region's interior tiles can sit far from any
+            // sample, so the outline test above misses them. Add the
+            // fill's own coverage: the tile is in the interior (corner
+            // or centre inside the path), or the closing chord — the
+            // one stretch of the fill boundary with no dabs on it —
+            // crosses the tile.
+            if (!touched && shading) {
+                const float* p = shadePath.data();
+                size_t n = g_current.samples.size();
+                const float testX[5] = { tileX0, tileX1, tileX1, tileX0,
+                                         (tileX0 + tileX1) * 0.5f };
+                const float testY[5] = { tileY0, tileY0, tileY1, tileY1,
+                                         (tileY0 + tileY1) * 0.5f };
+                for (int i = 0; i < 5 && !touched; ++i) {
+                    if (pointInPolygonNonzero(p, n, testX[i], testY[i])) {
+                        touched = true;
+                    }
+                }
+                if (!touched
+                    && segmentIntersectsRect(p[2 * (n - 1)], p[2 * (n - 1) + 1],
+                                             p[0], p[1],
+                                             tileX0, tileY0, tileX1, tileY1)) {
+                    touched = true;
+                }
+            }
             if (!touched) continue;
 
             Tile& tile = getOrCreateTile(layer, tx, ty);
@@ -5528,6 +5929,27 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                 e.extend(s.x - ox, s.y - oy, s.p);
             }
 
+            if (shading) {
+                // Merge the enclosed region into the coverage the dabs
+                // just built (still GL_MAX, so the shared border stays
+                // one flat tone). The path stays in doc-px and the
+                // tile's origin goes into the transform, so the page
+                // clip here is the plain doc-space rect — not the
+                // tile-local one the dab program needs.
+                const float tileMat[16] = {
+                    1.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 1.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 1.0f, 0.0f,
+                     -ox,  -oy, 0.0f, 1.0f,
+                };
+                drawShadeFill(shadePoly, tileMat, kTileSizeF, kTileSizeF,
+                              pageClip, g_strokeBrushAlpha);
+                // Restore what the rest of the loop expects — the fill
+                // swaps in its own program and vertex array.
+                glUseProgram(g_dab.program);
+                glBindVertexArray(g_quadVao);
+            }
+
             if (g_strokeUniformAlpha) {
                 // Stamp coverage onto the tile in one OVER (brush) or
                 // DESTOUT (eraser) pass. The dab program's MAX state
@@ -5536,7 +5958,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                 glBindFramebuffer(GL_FRAMEBUFFER, tile.fbo);
                 glViewport(kApron, kApron, kTileSize, kTileSize);
                 glBlendEquation(GL_FUNC_ADD);
-                if (g_strokeTool == 0) {
+                if (!strokeToolIsEraser()) {
                     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
                 } else {
                     glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
@@ -5546,7 +5968,7 @@ void bakeCurrentStrokeIntoTiles(std::vector<int64_t>* dirtyOut,
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, g_strokeCoverageTile.texture);
                 glUniform4fv(g_stamp.uColor, 1, g_strokeBrushColor);
-                glUniform1i(g_stamp.uMode, g_strokeTool);
+                glUniform1i(g_stamp.uMode, strokeToolIsEraser() ? 1 : 0);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
                 // Back to the dab program + MAX blend for the next
                 // tile's coverage build.
@@ -5598,6 +6020,7 @@ static void rebakeStroke(const UndoEntry& e) {
     float saveHard  = g_strokeBrushHardness;
     int   saveTool  = g_strokeTool;
     bool  saveUniformAlpha = g_strokeUniformAlpha;
+    bool  saveFillClosed   = g_strokeFillClosed;
     std::vector<Sample> saveSamples = std::move(g_current.samples);
     g_current.samples.clear();
     float savePageX0, savePageY0, savePageX1, savePageY1;
@@ -5617,6 +6040,7 @@ static void rebakeStroke(const UndoEntry& e) {
     g_strokeBrushHardness  = e.rebakeBrushHardness;
     g_strokeTool           = e.rebakeTool;
     g_strokeUniformAlpha   = e.rebakeUniformAlpha;
+    g_strokeFillClosed     = e.rebakeFillClosed;
     g_current.samples      = e.rebakeSamples;     // copy (re-bakeable)
     {
         std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
@@ -5659,6 +6083,7 @@ static void rebakeStroke(const UndoEntry& e) {
     g_strokeBrushHardness  = saveHard;
     g_strokeTool           = saveTool;
     g_strokeUniformAlpha   = saveUniformAlpha;
+    g_strokeFillClosed     = saveFillClosed;
     g_current.samples      = std::move(saveSamples);
     {
         std::lock_guard<std::mutex> lock(g_pageBoundsMutex);
@@ -10821,6 +11246,8 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_discardStroke(JNIEnv*, jobject) {
     g_current.samples.clear();
     g_liveEmitter.reset();
+    g_shadePolyDoc.clear();
+    g_shadeBboxValid = false;
 }
 
 // Read accessors for UI display. Called from the UI thread; the values may
@@ -11301,14 +11728,18 @@ static void renderPreviewOverlayToBoundFbo(int width, int height) {
     glUniform1i(g_preview.uBelow,    0);
     glUniform1i(g_preview.uAbove,    1);
     glUniform1i(g_preview.uCoverage, 2);
-    glUniform1i(g_preview.uMode,     g_strokeTool);
+    glUniform1i(g_preview.uMode,     strokeToolIsEraser() ? 1 : 0);
     glUniform3fv(g_preview.uBrushRgb, 1, g_strokeBrushColor);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_belowFbo.texture);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, g_aboveFbo.texture);
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, g_coverage.texture);
+    // Shade strokes preview from the merged (dabs ∪ fill) coverage that
+    // extendStrokeBatch rebuilds each batch; every other tool previews
+    // from the accumulated dab coverage directly.
+    glBindTexture(GL_TEXTURE_2D, g_strokeFillClosed ? g_shadeCoverage.texture
+                                                    : g_coverage.texture);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
@@ -11347,6 +11778,12 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     g_needsPreviewPrep = true;
     g_current.samples.clear();
     g_liveEmitter.reset();
+    // Shade tool: the stroke doubles as a closed path to fill. Snapshot
+    // it per-stroke like the rest of the brush state, and reset the
+    // fill's own scratch state.
+    g_strokeFillClosed = (g_strokeTool == kToolShade);
+    g_shadePolyDoc.clear();
+    g_shadeBboxValid = false;
     // Lock prediction's active state for the duration of this stroke.
     // Mid-stroke toggles don't take effect until the next stroke so the
     // coverage mirror can't desync (a toggle on→off mid-stroke would
@@ -11358,6 +11795,10 @@ Java_com_bk_drawing_NativeRenderer_beginStroke(JNIEnv*, jobject) {
     // would otherwise render the head of the stroke with one mode and the
     // tail with the other.
     g_strokeUniformAlpha = g_strokeUniformAlphaEnabled.load();
+    // Shade always runs uniform: outline and fill are one coverage mask
+    // stamped once, so the shared border can't darken and the opacity
+    // slider means exactly "tone of the shaded region".
+    if (g_strokeFillClosed) g_strokeUniformAlpha = true;
 
     // In stacking mode the OVER-blend asymptote at the stroke spine is
     // ~1 - (1 - α)^N where N is the typical per-pixel dab overlap (4-10
@@ -11417,6 +11858,14 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
     for (int i = 0; i < realCount; ++i) {
         g_current.samples.push_back(
             { xyp[i * 3], xyp[i * 3 + 1], xyp[i * 3 + 2] });
+    }
+    // Mirror them into the shade path (same points, packed for the fill's
+    // vertex buffer). Appending here keeps the per-batch cost proportional
+    // to the new samples rather than to the whole stroke.
+    if (g_strokeFillClosed) {
+        for (int i = 0; i < realCount; ++i) {
+            shadePathPush(xyp[i * 3], xyp[i * 3 + 1]);
+        }
     }
 
     // Drop predicted dabs entirely if the stroke didn't begin with
@@ -11509,6 +11958,67 @@ Java_com_bk_drawing_NativeRenderer_extendStrokeBatch(
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     }
 
+    // Shade tool: rebuild the merged coverage the overlay renders from.
+    // The dab half lives in g_coverage and accumulates as usual; the
+    // fill half has to be rebuilt every batch because the closing chord
+    // sweeps as the pen moves, so the enclosed region can shrink.
+    if (g_strokeFillClosed && g_shadeBboxValid) {
+        // Predicted samples extend the path for this batch only. No
+        // revert bookkeeping needed (unlike the dab coverage mirror) —
+        // the next batch rebuilds the fill from the real path anyway.
+        size_t realFloats = g_shadePolyDoc.size();
+        for (int i = realCount; i < realCount + predCount; ++i) {
+            shadePathPush(xyp[i * 3], xyp[i * 3 + 1]);
+        }
+        ShadePoly poly = uploadShadePolygon(g_shadePolyDoc.data(),
+                                            g_shadePolyDoc.size() / 2);
+        g_shadePolyDoc.resize(realFloats);
+
+        float mat[16];
+        env->GetFloatArrayRegion(transform, 0, 16, mat);
+        float maxR = kMaxRadius * g_strokeBrushSizeScale;
+        PartialScissor sc = dirtyBboxToScissor(
+            mat, g_shadeMinX - maxR, g_shadeMinY - maxR,
+                 g_shadeMaxX + maxR, g_shadeMaxY + maxR,
+            width, height, /*pad=*/2);
+
+        if (sc.w > 0 && sc.h > 0) {
+            ensureViewFbo(g_shadeCoverage, width, height,
+                          /*withStencil=*/true);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_shadeCoverage.fbo);
+            glViewport(0, 0, width, height);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(sc.x, sc.y, sc.w, sc.h);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            // MAX for both halves: outline and fill share a border, and
+            // OVER there would show as a darker rim at low opacity.
+            glBlendEquation(GL_MAX);
+            PageClip pageClip = readPageClip();
+            drawShadeFill(poly, mat, (float)width, (float)height,
+                          pageClip, g_strokeBrushAlpha);
+
+            // Merge in the accumulated dab coverage. The stamp shader
+            // with a black color and brush mode emits (0, 0, 0, c) —
+            // exactly the coverage format the dab pass writes.
+            const float kZeroRgb[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            glUseProgram(g_stamp.program);
+            glBindVertexArray(g_quadVao);
+            glUniform1i(g_stamp.uCoverage, 0);
+            glUniform1i(g_stamp.uMode, 0);
+            glUniform4fv(g_stamp.uColor, 1, kZeroRgb);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_coverage.texture);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindVertexArray(0);
+
+            glBlendEquation(GL_FUNC_ADD);
+            glDisable(GL_SCISSOR_TEST);
+        }
+    }
+
     // Single front-buffer overlay render. Normally we clear FB first
     // and then run the preview overlay shader, so the FB pixels are
     // exactly the current stroke's coverage. EXCEPTION: on the first
@@ -11585,6 +12095,7 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
         entry.rebakeBrushHardness = g_strokeBrushHardness;
         entry.rebakeTool          = g_strokeTool;
         entry.rebakeUniformAlpha  = g_strokeUniformAlpha;
+        entry.rebakeFillClosed    = g_strokeFillClosed;
         PageClip pc = readPageClip();
         entry.rebakePageActive    = pc.active;
         entry.rebakePageX0        = pc.minX;
@@ -11646,45 +12157,6 @@ Java_com_bk_drawing_NativeRenderer_commitStroke(JNIEnv*, jobject) {
 
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
     g_liveEmitter.reset();
-}
-
-// Compute a buffer-px AABB scissor for a doc-px bbox, given the
-// column-major doc→buffer mat4. uTransform's output is buffer-px in
-// the same convention glScissor expects (origin bottom-left, Y up), so
-// no Y flip is needed. The result is padded and clamped to the
-// drawable size; if the bbox lies entirely off-screen the rect's w or
-// h come back zero.
-struct PartialScissor { int x, y, w, h; };
-static PartialScissor dirtyBboxToScissor(const float* m,
-                                         float x0, float y0,
-                                         float x1, float y1,
-                                         int width, int height,
-                                         int pad) {
-    const float cornersX[4] = { x0, x1, x1, x0 };
-    const float cornersY[4] = { y0, y0, y1, y1 };
-    float minBX = std::numeric_limits<float>::infinity();
-    float minBY = std::numeric_limits<float>::infinity();
-    float maxBX = -std::numeric_limits<float>::infinity();
-    float maxBY = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < 4; ++i) {
-        float bx = m[0] * cornersX[i] + m[4] * cornersY[i] + m[12];
-        float by = m[1] * cornersX[i] + m[5] * cornersY[i] + m[13];
-        if (bx < minBX) minBX = bx;
-        if (by < minBY) minBY = by;
-        if (bx > maxBX) maxBX = bx;
-        if (by > maxBY) maxBY = by;
-    }
-    int ix0 = static_cast<int>(std::floor(minBX)) - pad;
-    int iy0 = static_cast<int>(std::floor(minBY)) - pad;
-    int ix1 = static_cast<int>(std::ceil (maxBX)) + pad;
-    int iy1 = static_cast<int>(std::ceil (maxBY)) + pad;
-    if (ix0 < 0)      ix0 = 0;
-    if (iy0 < 0)      iy0 = 0;
-    if (ix1 > width)  ix1 = width;
-    if (iy1 > height) iy1 = height;
-    int w = ix1 - ix0; if (w < 0) w = 0;
-    int h = iy1 - iy0; if (h < 0) h = 0;
-    return { ix0, iy0, w, h };
 }
 
 JNIEXPORT void JNICALL

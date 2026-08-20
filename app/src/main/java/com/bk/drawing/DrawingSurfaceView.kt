@@ -149,7 +149,11 @@ enum class Tool(val nativeId: Int) {
     ELLIPSE    (5),
     SELECT     (6),
     SELECT_RECT (-1),    // raster rectangle marquee; no native tool id
-    SELECT_LASSO(-1);    // raster freeform marquee; no native tool id
+    SELECT_LASSO(-1),    // raster freeform marquee; no native tool id
+    // Closed-path fill: traces a brush stroke, joins start to end with a
+    // straight chord, and fills the enclosed region. Same raster stroke
+    // pipeline as BRUSH — see kToolShade in renderer.cpp.
+    SHADE      (7);
 
     /** Shape-type code passed to NativeRenderer for shape tools. */
     val shapeType: Int
@@ -163,6 +167,10 @@ enum class Tool(val nativeId: Int) {
 
     val isShape: Boolean
         get() = this == LINE || this == RECTANGLE || this == CIRCLE || this == ELLIPSE
+
+    /** Tools that drive the raster stroke pipeline (begin/extend/commit). */
+    val isRasterStroke: Boolean
+        get() = this == BRUSH || this == ERASER || this == SHADE
 }
 
 class DrawingSurfaceView @JvmOverloads constructor(
@@ -738,7 +746,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
             forceRedraw()
         }
         currentTool = tool
-        if (currentTool == Tool.BRUSH || currentTool == Tool.ERASER) {
+        if (currentTool.isRasterStroke) {
             NativeRenderer.setTool(currentTool.nativeId)
         }
         Log.i("DrawingApp", "tool -> ${currentTool.name.lowercase()}")
@@ -783,6 +791,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
         val nextTool = when (currentTool) {
             Tool.BRUSH  -> Tool.ERASER
             Tool.ERASER -> Tool.BRUSH
+            // Shade drives the same raster stroke pipeline, so swapping
+            // to the brush is safe even mid-stroke (the in-flight
+            // StrokeAction keeps its type).
+            Tool.SHADE  -> Tool.BRUSH
             else        -> {
                 // Cross-family swap (e.g. LINE → BRUSH) mid-stroke is
                 // unsafe — the in-flight StrokeAction batch on the
@@ -1022,7 +1034,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // Cancel any in-progress draw / interaction so the user's drag
         // doesn't bleed into a stroke or transform on gesture release.
         when (currentTool) {
-            Tool.BRUSH, Tool.ERASER -> {
+            Tool.BRUSH, Tool.ERASER, Tool.SHADE -> {
                 NativeRenderer.discardStroke()
                 cancelNextCommit = true
                 renderer?.commit()
@@ -1231,7 +1243,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
             return true
         }
         return when (currentTool) {
-            Tool.BRUSH, Tool.ERASER -> handleStrokeEvent(r, event)
+            Tool.BRUSH, Tool.ERASER, Tool.SHADE -> handleStrokeEvent(r, event)
             Tool.BUCKET             -> handleBucketEvent(event)
             Tool.SELECT             -> handleSelectEvent(event)
             // The marquee/rectangle selection tool dispatches by active

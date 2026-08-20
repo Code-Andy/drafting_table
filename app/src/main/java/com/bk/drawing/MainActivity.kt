@@ -579,6 +579,7 @@ class MainActivity : AppCompatActivity() {
         rail.addView(makeRailToolTile(Tool.BRUSH,   R.drawable.ic_pen,    "brush"))
         rail.addView(makeRailToolTile(Tool.ERASER,  R.drawable.ic_eraser, "eraser"))
         rail.addView(makeRailToolTile(Tool.BUCKET,  R.drawable.ic_bucket, "bucket"))
+        rail.addView(makeRailToolTile(Tool.SHADE,   R.drawable.ic_shade,  "shade"))
 
         rail.addView(railRule())
         rail.addView(railSectionLabel("VECTOR"))
@@ -708,8 +709,7 @@ class MainActivity : AppCompatActivity() {
         // Brush preview only makes sense for raster stroke tools; hide
         // immediately on switch so a stale circle doesn't linger until
         // the next pen event.
-        if (::brushPreviewView.isInitialized
-            && tool != Tool.BRUSH && tool != Tool.ERASER) {
+        if (::brushPreviewView.isInitialized && !tool.isRasterStroke) {
             brushPreviewView.hide()
         }
     }
@@ -719,6 +719,7 @@ class MainActivity : AppCompatActivity() {
             Tool.BRUSH        -> "brush"
             Tool.ERASER       -> "eraser"
             Tool.BUCKET       -> "bucket"
+            Tool.SHADE        -> "shade"
             Tool.LINE         -> "line"
             Tool.RECTANGLE    -> "rect"
             Tool.CIRCLE       -> "circle"
@@ -1631,6 +1632,7 @@ class MainActivity : AppCompatActivity() {
             brushSectionHeader.text = when (currentToolMirror) {
                 Tool.ERASER                                              -> "ERASER"
                 Tool.BUCKET                                              -> "BUCKET"
+                Tool.SHADE                                               -> "SHADE"
                 Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE     -> "VECTOR"
                 Tool.SELECT, Tool.SELECT_RECT, Tool.SELECT_LASSO         -> "SELECT"
                 else                                                     -> "BRUSH"
@@ -1643,16 +1645,16 @@ class MainActivity : AppCompatActivity() {
         // makes sense alongside size.
         if (::brushSizeRow.isInitialized) {
             val tool = currentToolMirror
-            val showSize  = tool == Tool.BRUSH || tool == Tool.ERASER
-                            || currentToolEditsVector()
-            val showAlpha = tool == Tool.BRUSH || tool == Tool.ERASER
-                            || tool == Tool.BUCKET
+            val showSize  = tool.isRasterStroke || currentToolEditsVector()
+            val showAlpha = tool.isRasterStroke || tool == Tool.BUCKET
             // Uniform-α toggle is meaningful only for the stroke-based
             // raster tools (brush + eraser). Bucket is a single fill,
-            // not a stroke, so the mode has no effect there.
+            // not a stroke, so the mode has no effect there — and shade
+            // forces uniform alpha so its outline and fill read as one
+            // flat tone, which leaves the user nothing to toggle.
             val showUniformAlpha = tool == Tool.BRUSH || tool == Tool.ERASER
-            val showHard  = tool == Tool.BRUSH || tool == Tool.ERASER
-            val showPress = tool == Tool.BRUSH || tool == Tool.ERASER
+            val showHard  = tool.isRasterStroke
+            val showPress = tool.isRasterStroke
             val showBleed = tool == Tool.BUCKET
             brushSizeRow.visibility   = if (showSize)         View.VISIBLE else View.GONE
             brushAlphaRow.visibility  = if (showAlpha)        View.VISIBLE else View.GONE
@@ -3216,9 +3218,7 @@ class MainActivity : AppCompatActivity() {
      *  view-px (kBrushMaxRadiusDoc * brushSizeScale * viewScale). */
     private fun updateBrushPreview(viewPxX: Float, viewPxY: Float) {
         if (!::brushPreviewView.isInitialized) return
-        if (!brushPreviewEnabled
-            || (currentToolMirror != Tool.BRUSH
-                && currentToolMirror != Tool.ERASER)) {
+        if (!brushPreviewEnabled || !currentToolMirror.isRasterStroke) {
             brushPreviewView.hide()
             return
         }

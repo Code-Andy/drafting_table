@@ -96,6 +96,16 @@ Stroke lifecycle:
 2. `ACTION_MOVE` → `BatchSamples(real + predicted tail)` → native `extendStrokeBatch` reverts any pending prediction, applies real dabs (mirror after), applies predicted dabs (if active), and renders the front-buffer overlay once.
 3. `ACTION_UP` → `r.commit()` → native `commitStroke` bakes the real samples into tile FBOs (predicted samples are never persisted), snapshots tiles for undo, saves to disk.
 
+### Shade tool (closed-path fill)
+
+`Tool.SHADE` (native id 7, `kToolShade`) runs the *same* stroke pipeline as the brush; the stroke's samples additionally describe a closed path (implicit chord from the last sample back to the first) whose interior is filled. Rules, all deliberate: the chord is **not** stroked, only filled to; the region uses **nonzero winding** so self-crossing scribbles come out solid; and outline + fill are one flat coverage mask (`beginStroke` forces `g_strokeUniformAlpha`) so the shared border can't darken at partial opacity.
+
+Filling is `kPolyVS/FS` + a two-pass stencil (winding via `GL_INCR/DECR_WRAP` on a triangle fan, then a cover quad with `GL_NOTEQUAL 0`). Consequences worth knowing:
+- The two FBOs it fills through — `g_shadeCoverage` (screen-sized) and `g_strokeCoverageTile` — are the only ones created with a stencil renderbuffer (`ensureViewFbo(..., withStencil=true)`). **Without a stencil attachment the stencil test always passes and the whole path AABB fills**, so keep that flag if you touch those call sites.
+- The dab half of the coverage accumulates in `g_coverage` exactly as a normal stroke; the fill half is **rebuilt every batch** into `g_shadeCoverage` (the chord sweeps, so the region can shrink) and merged with the dabs under `GL_MAX`. The rebuild is one fan draw scissored to a monotonically-growing bbox — don't "optimize" it into accumulating, and don't rebuild the dabs, which would make per-batch cost O(stroke length).
+- Bake reuses the uniform-alpha per-tile coverage path, drawing the same uploaded path per tile with the tile origin folded into `uTransform` (so the poly program's page clip is doc-space, unlike the dab program's tile-local one). Interior tiles hold no samples, so the tile-touched test additionally checks corner/centre-inside-path and chord-crosses-tile.
+- `g_strokeTool` is no longer "0 = brush, anything else = eraser" — use `strokeToolIsEraser()`.
+
 ### Undo / redo
 
 Single global stack on the native side (`g_undoStack` / `g_redoStack`, `std::deque<UndoEntry>`, mutex-guarded). Bounded by **50 entries / 200 MB combined**; oldest entries evict first. Not persisted across app restart.
