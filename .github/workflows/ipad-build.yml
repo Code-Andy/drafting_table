@@ -94,8 +94,9 @@ jobs:
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/ios/DraftingTable.ipa --clobber
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/ios/DraftingTable.ipa --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$tag" dist/ios/DraftingTable.ipa --generate-notes --title "Drafting Table $tag"
+            gh release create "$tag" dist/ios/DraftingTable.ipa --generate-notes \
+              --title "Drafting Table $tag" --repo "$GITHUB_REPOSITORY"
           fi
