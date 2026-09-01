@@ -35,6 +35,25 @@ typedef struct {
     DTPencilSampleFlags flags;
 } DTPencilSample;
 
+typedef NS_ENUM(uint8_t, DTTool) {
+    DTToolBrush = 0,
+    DTToolEraser = 1,
+};
+
+/// Immutable render snapshot carrying the stroke's style as well as its
+/// points.  Points are NSValue-wrapped DTRenderPoint values.
+@interface DTRenderStroke : NSObject
+@property(nonatomic, readonly) NSArray<NSValue *> *points;
+@property(nonatomic, readonly) DTTool tool;
+@property(nonatomic, readonly) CGFloat brushSize;
+@property(nonatomic, readonly) CGFloat brushOpacity;
+- (instancetype)initWithPoints:(NSArray<NSValue *> *)points
+                           tool:(DTTool)tool
+                      brushSize:(CGFloat)brushSize
+                    brushOpacity:(CGFloat)brushOpacity NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 /// Objective-C ownership boundary around the platform-neutral C++ engine.
 /// Swift only sees this small API; no C++ types leak into the application.
 @interface DTEngineBridge : NSObject
@@ -42,6 +61,11 @@ typedef struct {
 @property(nonatomic, readonly) NSUInteger strokeCount;
 @property(nonatomic, readonly) NSUInteger sampleCount;
 @property(nonatomic, readonly) uint64_t revision;
+@property(nonatomic) DTTool tool;
+@property(nonatomic) CGFloat brushSize;
+@property(nonatomic) CGFloat brushOpacity;
+@property(nonatomic, readonly) BOOL canUndo;
+@property(nonatomic, readonly) BOOL canRedo;
 
 - (void)beginStroke;
 - (void)appendSamples:(const DTPencilSample *_Nullable)samples
@@ -53,10 +77,14 @@ typedef struct {
 - (void)cancelStroke;
 - (void)clearCanvas;
 - (BOOL)undoLastStroke;
+- (BOOL)redoLastStroke;
 
-/// Snapshot is an array of polylines. Each polyline contains NSValue-wrapped
-/// DTRenderPoint values and is safe to retain while the engine receives input.
-- (NSArray<NSArray<NSValue *> *> *)renderableStrokes;
+- (NSData *)archiveData;
+- (BOOL)loadArchiveData:(NSData *)data;
+
+/// Snapshot entries are immutable DTRenderStroke instances and are safe to
+/// retain while the engine receives input.
+- (NSArray<DTRenderStroke *> *)renderableStrokes;
 
 @end
 

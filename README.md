@@ -4,6 +4,7 @@
 > **iPad port:** local development is on the `ipad-native-port` branch. See
 > [IOS_PORT.md](IOS_PORT.md) for iPad implementation status,
 > [PORTING.md](PORTING.md) for the extraction plan, and
+> [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for the full milestone DAG, and
 > [AGENTIC_SETUP.md](AGENTIC_SETUP.md) for the current orchestration workflow.
 
 Ben's notes:

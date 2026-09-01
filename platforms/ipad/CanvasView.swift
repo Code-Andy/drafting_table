@@ -15,6 +15,11 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     /// the C++ document model.
     var onDrawingBegan: (() -> Void)?
 
+    /// Called once when a document mutation is committed (stroke lift-off),
+    /// cancelled, or otherwise finalized. This intentionally is not called
+    /// for every Pencil sample so autosave remains inexpensive.
+    var onDocumentChanged: (() -> Void)?
+
     /// Minimum normalized Apple Pencil force needed to put the pen down. A
     /// small amount of hysteresis is used on lift-off so force estimates that
     /// wobble around the threshold do not fragment a stroke.
@@ -181,6 +186,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
                                 includePredicted: false,
                                 minimumPencilPressure: releasePressure)
                     engineBridge.endStroke()
+                    onDocumentChanged?()
                     strokeEngaged = false
                 } else {
                     appendBatch(for: activeTouch, event: event)
@@ -209,6 +215,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
                 }
             }
             engineBridge.endStroke()
+            onDocumentChanged?()
         }
         strokeEngaged = false
         self.activeTouch = nil
@@ -216,7 +223,10 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch != nil else { return }
-        if strokeEngaged { engineBridge.cancelStroke() }
+        if strokeEngaged {
+            engineBridge.cancelStroke()
+            onDocumentChanged?()
+        }
         strokeEngaged = false
         activeTouch = nil
     }

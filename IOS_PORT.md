@@ -33,6 +33,21 @@ app-level contact/lift-off filter for light-touch noise and different screen
 feel. UIKit does not expose a way for an app to change Apple Pencil's physical
 hover or hardware detection height.
 
+Version 0.4 establishes the retained drawing-session layer used by later
+document milestones:
+
+- Brush and Eraser tools with per-stroke size and opacity snapshots;
+- Undo and Redo stacks;
+- versioned, bounded, little-endian stroke archives;
+- atomic autosave in Application Support and restore on launch;
+- a dedicated Settings sheet for activation pressure, brush size, and opacity;
+- Catmull-Rom curve subdivision before thick Metal join/cap generation.
+
+The current eraser replays paper-colored geometry in retained stroke order. It
+is useful on the single paper canvas, but it is not the final destination-out
+tile eraser. The archive likewise stores retained strokes for this milestone;
+Files document packages and Android tile migration remain separate work.
+
 ## Implemented architecture
 
 ### Portable C++20
@@ -57,6 +72,7 @@ hover or hardware detection height.
 - Pressure, altitude, azimuth, barrel roll, and estimated-value updates
 - Pencil double-tap and squeeze event capture
 - Persistent Pencil activation threshold with lift-off hysteresis
+- Brush/Eraser selection, retained stroke styles, Undo/Redo, and autosave
 - Thin Objective-C++ ownership bridge
 - Diagnostics overlay
 - XcodeGen project generation

@@ -27,4 +27,10 @@ final class DraftingTableSceneDelegate: UIResponder, UIWindowSceneDelegate {
         self.window = window
         window.makeKeyAndVisible()
     }
+
+    func sceneDidEnterBackground(_ scene: UIScene) {
+        guard let navigation = window?.rootViewController as? UINavigationController,
+              let canvasController = navigation.viewControllers.first as? DraftingTableViewController else { return }
+        canvasController.saveDocument()
+    }
 }
