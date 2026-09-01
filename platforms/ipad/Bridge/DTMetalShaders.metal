@@ -16,13 +16,29 @@ struct DTVertexOut {
     float eraser;
 };
 
+// Must remain layout-compatible with DTMetalUniforms in DTMetalRenderer.mm:
+// two tightly packed float4 values (32 bytes total).
+struct DTMetalUniforms {
+    float4 viewportScaleRotation;
+    float4 translation;
+};
+
 vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
-                             constant float2 &viewport [[buffer(1)]],
+                             constant DTMetalUniforms &uniforms [[buffer(1)]],
                              uint vertexID [[vertex_id]]) {
     DTMetalVertex input = vertices[vertexID];
-    float2 safeViewport = max(viewport, float2(1.0));
-    float2 clip = float2((input.position.x / safeViewport.x) * 2.0 - 1.0,
-                         1.0 - (input.position.y / safeViewport.y) * 2.0);
+    float2 safeViewport = max(uniforms.viewportScaleRotation.xy, float2(1.0));
+    float scale = max(uniforms.viewportScaleRotation.z, 0.01);
+    float rotation = uniforms.viewportScaleRotation.w;
+    float2 translation = uniforms.translation.xy;
+    float sine = sin(rotation);
+    float cosine = cos(rotation);
+    float2 transformed = float2(
+        scale * (cosine * input.position.x - sine * input.position.y),
+        scale * (sine * input.position.x + cosine * input.position.y)
+    ) + translation;
+    float2 clip = float2((transformed.x / safeViewport.x) * 2.0 - 1.0,
+                         1.0 - (transformed.y / safeViewport.y) * 2.0);
     return {float4(clip, 0.0, 1.0), input.predicted,
             saturate(input.opacity), input.eraser};
 }

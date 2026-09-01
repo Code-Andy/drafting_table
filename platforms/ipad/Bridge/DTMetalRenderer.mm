@@ -2,6 +2,7 @@
 
 #import <simd/simd.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -18,6 +19,22 @@ typedef struct {
 
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
+
+// Keep the transform as independent atomics so UIKit gesture updates never
+// race the MTKView delegate. A four-float snapshot is inexpensive and avoids
+// locking the render callback. The initial values are the identity transform.
+struct DTCanvasTransformState {
+    std::atomic<float> scale{1.0f};
+    std::atomic<float> rotation{0.0f};
+    std::atomic<float> translationX{0.0f};
+    std::atomic<float> translationY{0.0f};
+};
+
+static DTCanvasTransformState gCanvasTransform;
+
+static float finiteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
 
 static float clamp01(float value) { return fmaxf(0.0f, fminf(1.0f, value)); }
 
@@ -97,6 +114,14 @@ static std::vector<DTSampledPoint> smoothedPoints(
     output.push_back(input.back());
     return output;
 }
+
+// This layout intentionally contains only float4 values. float4 alignment is
+// identical in C++/simd and Metal, making the uniform safe for setVertexBytes
+// without relying on compiler-specific padding between scalar fields.
+typedef struct {
+    vector_float4 viewportScaleRotation;
+    vector_float4 translation;
+} DTMetalUniforms;
 }
 
 @interface DTMetalRenderer ()
@@ -141,6 +166,26 @@ static std::vector<DTSampledPoint> smoothedPoints(
     return self;
 }
 
+- (void)updateCanvasScale:(CGFloat)scale
+                 rotation:(CGFloat)rotation
+             translationX:(CGFloat)x
+             translationY:(CGFloat)y {
+    // A zero/negative/NaN scale would invert or collapse the canvas. Keep a
+    // small positive minimum and a practical upper bound for gesture input;
+    // invalid values fall back to identity rather than poisoning the frame.
+    const float requestedScale = static_cast<float>(scale);
+    const float safeScale = std::isfinite(requestedScale)
+        ? std::max(0.01f, std::min(100.0f, requestedScale))
+        : 1.0f;
+    const float safeRotation = finiteOr(static_cast<float>(rotation), 0.0f);
+    const float safeX = finiteOr(static_cast<float>(x), 0.0f);
+    const float safeY = finiteOr(static_cast<float>(y), 0.0f);
+    gCanvasTransform.scale.store(safeScale, std::memory_order_relaxed);
+    gCanvasTransform.rotation.store(safeRotation, std::memory_order_relaxed);
+    gCanvasTransform.translationX.store(safeX, std::memory_order_relaxed);
+    gCanvasTransform.translationY.store(safeY, std::memory_order_relaxed);
+}
+
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
     (void)view; (void)size;
 }
@@ -162,8 +207,20 @@ static std::vector<DTSampledPoint> smoothedPoints(
         return;
     }
     [encoder setRenderPipelineState:self.pipeline];
-    vector_float2 viewport = {(float)view.bounds.size.width, (float)view.bounds.size.height};
-    [encoder setVertexBytes:&viewport length:sizeof(viewport) atIndex:1];
+    DTMetalUniforms uniforms{};
+    uniforms.viewportScaleRotation = (vector_float4){
+        (float)view.bounds.size.width,
+        (float)view.bounds.size.height,
+        gCanvasTransform.scale.load(std::memory_order_relaxed),
+        gCanvasTransform.rotation.load(std::memory_order_relaxed)
+    };
+    uniforms.translation = (vector_float4){
+        gCanvasTransform.translationX.load(std::memory_order_relaxed),
+        gCanvasTransform.translationY.load(std::memory_order_relaxed),
+        0.0f,
+        0.0f
+    };
+    [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
     NSArray<DTRenderStroke *> *strokes = [self.engine renderableStrokes];
     for (DTRenderStroke *stroke in strokes) {
