@@ -66,7 +66,7 @@ jobs:
           bash scripts/ios/build_ipa.sh
 
       - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DraftingTable-ipa-${{ github.sha }}
           path: dist/ios/DraftingTable.ipa
@@ -82,7 +82,7 @@ jobs:
       contents: write
     steps:
       - name: Download IPA artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: DraftingTable-ipa-${{ github.sha }}
           path: dist/ios

@@ -27,6 +27,8 @@ targets:
       - path: core/src
       - path: renderer/common
       - path: renderer/metal
+        excludes:
+          - README.md
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.draftingtable.ipad
