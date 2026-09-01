@@ -1,33 +1,30 @@
 #pragma once
 
+#include "DTCore.hpp"
+
 #include <cstddef>
-#include <cstdint>
 #include <mutex>
+#include <span>
 #include <vector>
 
 namespace drafting_table {
 
-/// A platform-neutral sample. Coordinates are in CanvasView points.
-struct StrokePoint {
-    float x = 0.0f;
-    float y = 0.0f;
-    float pressure = 1.0f;
-    double timestamp = 0.0;
-    bool predicted = false;
-};
-
 struct Stroke {
-    std::vector<StrokePoint> points;
+    std::vector<PencilSample> points;
 };
 
-/// Small, deterministic drawing model used by the iPad shell. The Android
-/// renderer remains the production engine; this class gives the UIKit port a
-/// real ownership/lifetime boundary until that engine is shared.
+/// Thread-safe ownership boundary around the portable DrawingEngine. The
+/// retained stroke list is temporary renderer state; document/layer storage
+/// will replace it as the Android model is extracted into core/.
 class Engine final {
 public:
     void beginStroke();
-    void appendPoint(const StrokePoint& point);
+    void appendSamples(std::span<const PencilSample> real,
+                       std::span<const PencilSample> predicted);
+    bool updateEstimatedSample(std::uint64_t estimationUpdateIndex,
+                               const PencilSample& replacement);
     void endStroke();
+    void cancelStroke();
     void clear();
 
     std::vector<Stroke> snapshot() const;
@@ -35,8 +32,12 @@ public:
     std::size_t sampleCount() const;
 
 private:
+    void rebuildActiveStroke();
+
     mutable std::mutex mutex_;
     std::vector<Stroke> strokes_;
+    Stroke activeStroke_;
+    DrawingEngine inputEngine_;
     bool strokeInProgress_ = false;
 };
 

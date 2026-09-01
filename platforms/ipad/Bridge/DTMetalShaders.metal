@@ -25,5 +25,6 @@ vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
 
 fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
     float alpha = (0.45 + 0.55 * saturate(in.pressure)) * (in.predicted > 0.5 ? 0.35 : 1.0);
-    return float4(0.10, 0.58, 0.98, alpha);
+    const float3 color = float3(0.10, 0.58, 0.98);
+    return float4(color * alpha, alpha);
 }

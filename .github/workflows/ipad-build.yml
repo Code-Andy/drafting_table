@@ -1,0 +1,101 @@
+name: iPad unsigned IPA
+
+on:
+  push:
+    branches: ["**"]
+    # Version tags use the conventional v1.2.3 form.
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipad-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned iOS device IPA
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK $sdk_version"
+          [[ "${sdk_version%%.*}" -ge 18 ]]
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen version
+
+      - name: Generate Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f project.yml ]]; then
+            echo "error: project.yml is required for the iPad target" >&2
+            exit 1
+          fi
+          xcodegen generate --spec project.yml
+          test -d DraftingTable.xcodeproj
+
+      - name: Build and package unsigned IPA
+        shell: bash
+        env:
+          # These are repeated here as an audit-friendly guard in addition to
+          # the settings passed by build_ipa.sh.
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGNING_REQUIRED: "NO"
+        run: |
+          set -euo pipefail
+          bash scripts/ios/build_ipa.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DraftingTable-ipa-${{ github.sha }}
+          path: dist/ios/DraftingTable.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish tagged IPA
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DraftingTable-ipa-${{ github.sha }}
+          path: dist/ios
+
+      - name: Publish version tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/ios/DraftingTable.ipa --clobber
+          else
+            gh release create "$tag" dist/ios/DraftingTable.ipa --generate-notes --title "Drafting Table $tag"
+          fi

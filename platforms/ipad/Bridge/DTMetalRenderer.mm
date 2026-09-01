@@ -40,6 +40,13 @@ typedef struct {
     descriptor.vertexFunction = vertex;
     descriptor.fragmentFunction = fragment;
     descriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat;
+    descriptor.colorAttachments[0].blendingEnabled = YES;
+    descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     _pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&libraryError];
     if (libraryError) NSLog(@"DraftingTable Metal pipeline: %@", libraryError);
     return self;
@@ -52,7 +59,8 @@ typedef struct {
 
 - (void)drawInMTKView:(MTKView *)view {
     self.frameCount += 1;
-    if (!self.commandQueue || !self.pipeline || !view.currentDrawable) return;
+    id<CAMetalDrawable> drawable = view.currentDrawable;
+    if (!self.commandQueue || !self.pipeline || !drawable) return;
 
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     if (!pass) return;
@@ -60,7 +68,7 @@ typedef struct {
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
     [encoder setRenderPipelineState:self.pipeline];
 
-    vector_float2 viewport = {(float)view.drawableSize.width, (float)view.drawableSize.height};
+    vector_float2 viewport = {(float)view.bounds.size.width, (float)view.bounds.size.height};
     [encoder setVertexBytes:&viewport length:sizeof(viewport) atIndex:1];
 
     NSArray<NSArray<NSValue *> *> *strokes = [self.engine renderableStrokes];
@@ -83,7 +91,7 @@ typedef struct {
         [encoder drawPrimitives:MTLPrimitiveTypeLineStrip vertexStart:0 vertexCount:count];
     }
     [encoder endEncoding];
-    [commandBuffer presentDrawable:view.currentDrawable];
+    [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 }
 

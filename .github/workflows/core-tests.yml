@@ -1,0 +1,29 @@
+name: Portable core tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: C++20 core on Windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build/core -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build/core --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build/core -C Release --output-on-failure

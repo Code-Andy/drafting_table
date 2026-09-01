@@ -1,5 +1,10 @@
 # Drafting Table
 <img src="tools/drafting_table.png">
+
+> **iPad port:** local development is on the `ipad-native-port` branch. See
+> [PORTING.md](PORTING.md) for the implemented C++/UIKit/Metal/IPA foundation,
+> required tools, licensing constraint, and the remaining feature-parity work.
+
 Ben's notes:
 
 I wanted a drawing app for my [Wacom MovinkPad 11](https://estore.wacom.com/en-us/wacom-movinkpad-11-dtha116cl0z.html) tablet that combines features from conventional drawing programs, slide decks, and paper engineering notebooks.  This is a  attempt at creating that.  This is *not* intended to be a full-blown painting program: it's designed for making technical sketches.

@@ -19,3 +19,13 @@ local.properties
 .DS_Store
 Thumbs.db
 *.mp4
+
+# Native/Xcode build products
+*.obj
+*.xcodeproj/
+DerivedData/
+dist/
+
+# Python tooling
+__pycache__/
+*.pyc

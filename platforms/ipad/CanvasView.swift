@@ -3,7 +3,7 @@ import UIKit
 
 /// MTKView input surface for Apple Pencil. UIKit owns gesture recognition and
 /// event prediction; DTEngineBridge owns the thread-safe document samples.
-final class CanvasView: MTKView {
+final class CanvasView: MTKView, UIPencilInteractionDelegate {
     let engineBridge = DTEngineBridge()
 
     /// Called periodically on the main thread with a human-readable state
@@ -15,6 +15,8 @@ final class CanvasView: MTKView {
     private var displayLink: CADisplayLink?
     private var lastDiagnosticTime = CACurrentMediaTime()
     private var lastDiagnosticFrame: UInt = 0
+    private var nextSampleID: UInt64 = 1
+    private var lastPencilAction = "none"
 
     override init(frame frameRect: CGRect, device: MTLDevice?) {
         let selectedDevice = device ?? MTLCreateSystemDefaultDevice()
@@ -36,8 +38,11 @@ final class CanvasView: MTKView {
         isOpaque = true
         enableSetNeedsDisplay = false
         isPaused = false
+        preferredFramesPerSecond = UIScreen.main.maximumFramesPerSecond
+        presentsWithTransaction = false
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
+        addInteraction(UIPencilInteraction(delegate: self))
     }
 
     override func didMoveToWindow() {
@@ -62,63 +67,98 @@ final class CanvasView: MTKView {
         touch.type == .pencil
     }
 
-    private func append(_ touch: UITouch, predicted: Bool) {
+    private func makeSample(_ touch: UITouch,
+                            predicted: Bool,
+                            coalesced: Bool = false) -> DTPencilSample {
         let location = touch.preciseLocation(in: self)
         let force = touch.maximumPossibleForce > 0
             ? touch.force / touch.maximumPossibleForce
             : 1.0
-        engineBridge.appendPoint(atX: location.x,
-                                 y: location.y,
-                                 pressure: CGFloat(max(0.05, min(1.0, force))),
-                                 timestamp: touch.timestamp,
-                                 predicted: predicted)
+        var flags: DTPencilSampleFlags = predicted ? .predicted : .real
+        if coalesced { flags.insert(.coalesced) }
+        let estimated = touch.estimatedProperties
+        if estimated.contains(.force) { flags.insert(.pressureEstimated) }
+        if estimated.contains(.altitude) { flags.insert(.altitudeEstimated) }
+        if estimated.contains(.azimuth) { flags.insert(.azimuthEstimated) }
+        if estimated.contains(.roll) { flags.insert(.rollEstimated) }
+
+        var sample = DTPencilSample()
+        sample.x = Float(location.x)
+        sample.y = Float(location.y)
+        sample.pressure = Float(max(0, min(1, force)))
+        sample.altitude = Float(touch.altitudeAngle)
+        sample.azimuth = Float(touch.azimuthAngle(in: self))
+        sample.roll = Float(touch.rollAngle)
+        sample.hoverDistance = 0
+        sample.timestamp = touch.timestamp
+        sample.sampleID = nextSampleID
+        nextSampleID &+= 1
+        sample.estimationUpdateIndex = touch.estimationUpdateIndex?.uint64Value ?? 0
+        sample.flags = flags
+        return sample
     }
 
-    private func appendRealSamples(for touch: UITouch, event: UIEvent?) {
-        let samples = event?.coalescedTouches(for: touch) ?? [touch]
-        for sample in samples { append(sample, predicted: false) }
-    }
-
-    private func appendPredictedSamples(for touch: UITouch, event: UIEvent?) {
-        guard let predicted = event?.predictedTouches(for: touch) else { return }
-        for sample in predicted { append(sample, predicted: true) }
+    private func appendBatch(for touch: UITouch, event: UIEvent?) {
+        let coalescedTouches = event?.coalescedTouches(for: touch) ?? [touch]
+        let real = coalescedTouches.map {
+            makeSample($0, predicted: false, coalesced: $0 !== touch)
+        }
+        let predicted = (event?.predictedTouches(for: touch) ?? []).map {
+            makeSample($0, predicted: true)
+        }
+        let samples = real + predicted
+        samples.withUnsafeBufferPointer { buffer in
+            engineBridge.appendSamples(buffer.baseAddress,
+                                       count: buffer.count,
+                                       realCount: real.count)
+        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch == nil, let touch = touches.first(where: accepts) else { return }
         activeTouch = touch
         engineBridge.beginStroke()
-        appendRealSamples(for: touch, event: event)
-        appendPredictedSamples(for: touch, event: event)
+        appendBatch(for: touch, event: event)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let activeTouch, touches.contains(activeTouch) else { return }
-        appendRealSamples(for: activeTouch, event: event)
-        appendPredictedSamples(for: activeTouch, event: event)
+        appendBatch(for: activeTouch, event: event)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let activeTouch, touches.contains(activeTouch) else { return }
-        appendRealSamples(for: activeTouch, event: event)
+        var finalSample = makeSample(activeTouch, predicted: false)
+        withUnsafePointer(to: &finalSample) { pointer in
+            engineBridge.appendSamples(pointer, count: 1, realCount: 1)
+        }
         engineBridge.endStroke()
         self.activeTouch = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch != nil else { return }
-        engineBridge.endStroke()
+        engineBridge.cancelStroke()
         activeTouch = nil
     }
 
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
-        guard let activeTouch else { return }
-        for touch in touches where touch == activeTouch {
-            // UIKit may revise force/location after the initial event. The
-            // engine accepts this as another real sample; consumers can use
-            // timestamps to replace an estimated sample in a future engine.
-            append(touch, predicted: false)
+        guard activeTouch != nil else { return }
+        for touch in touches where touch.type == .pencil {
+            guard let index = touch.estimationUpdateIndex?.uint64Value else { continue }
+            let corrected = makeSample(touch, predicted: false)
+            _ = engineBridge.updateEstimatedSample(atIndex: index, sample: corrected)
         }
+    }
+
+    func pencilInteraction(_ interaction: UIPencilInteraction,
+                           didReceiveTap tap: UIPencilInteraction.Tap) {
+        lastPencilAction = "double tap"
+    }
+
+    func pencilInteraction(_ interaction: UIPencilInteraction,
+                           didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        lastPencilAction = "squeeze \(squeeze.phase)"
     }
 
     @objc private func displayTick() {
@@ -131,10 +171,11 @@ final class CanvasView: MTKView {
         lastDiagnosticTime = now
         lastDiagnosticFrame = frames
         let state = activeTouch == nil ? "idle" : "pencil input"
-        onDiagnostics?(String(format: "Metal  %.0f fps\nStrokes  %lu   Samples  %lu\nState  %@",
+        onDiagnostics?(String(format: "Metal  %.0f fps\nStrokes  %lu   Samples  %lu\nState  %@\nPencil  %@",
                              fps,
                              engineBridge.strokeCount,
                              engineBridge.sampleCount,
-                             state))
+                             state,
+                             lastPencilAction))
     }
 }

@@ -9,7 +9,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.10"
-    CLANG_CXX_LANGUAGE_STANDARD: c++17
+    CLANG_CXX_LANGUAGE_STANDARD: c++20
     CLANG_CXX_LIBRARY: libc++
     ENABLE_BITCODE: NO
 
@@ -22,17 +22,24 @@ targets:
       - path: platforms/ipad
         excludes:
           - Info.plist
+      - path: core/include
+        buildPhase: none
+      - path: core/src
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.bgkatz.draftingtable.ipad
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.draftingtable.ipad
         PRODUCT_NAME: DraftingTable
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
         INFOPLIST_FILE: platforms/ipad/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: platforms/ipad/DraftingTable-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: "2"
         SUPPORTS_MACCATALYST: NO
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/core/include"
         OTHER_CPLUSPLUSFLAGS:
-          - -std=c++17
-          - -fobjc-arc
+          - -std=c++20
     info:
       path: platforms/ipad/Info.plist
     dependencies:
