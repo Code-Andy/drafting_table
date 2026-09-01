@@ -24,7 +24,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         configure()
     }
 
-    required init?(coder: NSCoder) {
+    required init(coder: NSCoder) {
         super.init(coder: coder)
         device = MTLCreateSystemDefaultDevice()
         configure()
@@ -109,8 +109,8 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         let samples = real + predicted
         samples.withUnsafeBufferPointer { buffer in
             engineBridge.appendSamples(buffer.baseAddress,
-                                       count: buffer.count,
-                                       realCount: real.count)
+                                       count: UInt(buffer.count),
+                                       realCount: UInt(real.count))
         }
     }
 
@@ -147,7 +147,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         for touch in touches where touch.type == .pencil {
             guard let index = touch.estimationUpdateIndex?.uint64Value else { continue }
             let corrected = makeSample(touch, predicted: false)
-            _ = engineBridge.updateEstimatedSample(atIndex: index, sample: corrected)
+            _ = engineBridge.updateEstimatedSample(at: index, sample: corrected)
         }
     }
 
