@@ -25,6 +25,8 @@ targets:
       - path: core/include
         buildPhase: none
       - path: core/src
+      - path: renderer/common
+      - path: renderer/metal
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.draftingtable.ipad
@@ -38,6 +40,8 @@ targets:
         CLANG_ENABLE_OBJC_ARC: YES
         HEADER_SEARCH_PATHS:
           - "$(SRCROOT)/core/include"
+          - "$(SRCROOT)/renderer/common"
+          - "$(SRCROOT)/renderer/metal"
         OTHER_CPLUSPLUSFLAGS:
           - -std=c++20
     info:

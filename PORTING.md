@@ -9,36 +9,45 @@ with the Android application.
 - A portable C++20 core with canonical Pencil samples, estimated-property IDs,
   replaceable prediction tails, pressure mapping, canvas transforms, and
   signed sparse-tile addressing.
+- A portable multi-page document/layer model with sparse premultiplied RGBA
+  tiles, vector primitives, deterministic versioned serialization, and an
+  explicit VEC0/VEC1 compatibility codec.
+- Platform-neutral round/pencil/marker dab generation, quartic coverage math,
+  negative-coordinate tile enumeration, and a prediction-reset boundary.
 - Dependency-free Windows tests for the portable core.
 - A UIKit/Metal iPad application shell generated with XcodeGen.
 - Batched real, coalesced, and predicted Apple Pencil input through a thin
   Objective-C++ bridge into the portable core.
 - Pressure, altitude, azimuth, barrel roll, estimated-value correction,
   double-tap, and squeeze event capture.
-- A minimal premultiplied-alpha Metal line renderer and diagnostics overlay.
+- A minimal premultiplied-alpha Metal line renderer and diagnostics overlay,
+  plus an unconnected sparse 258-by-258 Metal tile backend with oriented dabs,
+  neighbor aprons, OVER compositing, and MAX coverage.
 - An unsigned device build and IPA packaging workflow. Version tags can publish
   `DraftingTable.ipa` to a GitHub Release when this work is eventually pushed.
 - An optional AltStore/SideStore source JSON generator.
 
 ## What is not ported yet
 
-The production Android engine remains in `app/src/main/cpp/renderer.cpp`. Its
-document/page/layer model, sparse GPU tiles, binary persistence, undo/redo,
-brush coverage, shade fill, vector tools, selection system, snapping, imports,
-exports, and GLES compositor still need to be separated from JNI/OpenGL and
-connected to a Metal backend. The current iPad renderer draws only a diagnostic
-polyline; it is not yet the Drafting Table renderer.
+The production Android engine remains in `app/src/main/cpp/renderer.cpp`. The
+new portable document and brush modules are foundations; Android does not use
+them yet, and the iPad shell does not yet connect its retained strokes to the
+sparse Metal backend. Production persistence, undo/redo, shade fill, vector
+tools, selections, snapping, imports, exports, and the full compositor still
+need extraction or a Metal implementation. The current iPad renderer draws
+only a diagnostic polyline; it is not yet the Drafting Table renderer.
 
 Recommended extraction order:
 
-1. Version and extract the document, page, layer, vector, and persistence
-   codecs without changing existing Android files on disk.
-2. Extract brush emission, pressure response, snapping, transforms, selection
-   geometry, and undo commands into platform-neutral modules.
-3. Define a renderer-backend boundary and retain GLES as the Android backend.
-4. Implement sparse 258-by-258 apron textures, coverage masks, premultiplied
-   compositing, vector SDFs, shade stencil passes, and selection overlays in
-   Metal.
+1. Connect the extracted document/vector codec to the Android legacy package
+   layout and add golden migration fixtures before changing existing files.
+2. Extract snapping, selection geometry, undo commands, and transactional
+   persistence into platform-neutral modules.
+3. Define a shared renderer command boundary and retain GLES as the Android
+   backend while wiring brush batches to the Metal tile foundation.
+4. Complete uniform-alpha coverage-to-color composition, vector SDFs, shade
+   stencil passes, page clipping, neighbor-apron dirty scheduling, and
+   selection overlays in Metal.
 5. Port the surrounding document UI, Files document packages, PNG/PDF export,
    image import, Pencil hover/palette/haptics, and on-device diagnostics.
 6. Run latency and deterministic undo/redo fidelity tests on real iPad hardware.
