@@ -52,14 +52,16 @@ static void addRoundCap(std::vector<DTMetalVertex>& out,
     }
 }
 
-struct Point {
+struct DTSampledPoint {
     vector_float2 position;
     float pressure;
     float predicted;
 };
 
-static Point catmullRom(const Point& p0, const Point& p1,
-                        const Point& p2, const Point& p3, float t) {
+static DTSampledPoint catmullRom(const DTSampledPoint& p0,
+                                 const DTSampledPoint& p1,
+                                 const DTSampledPoint& p2,
+                                 const DTSampledPoint& p3, float t) {
     const float t2 = t * t;
     const float t3 = t2 * t;
     const vector_float2 position = 0.5f * ((2.0f * p1.position) +
@@ -75,15 +77,16 @@ static Point catmullRom(const Point& p0, const Point& p1,
     return {position, pressure, predicted};
 }
 
-static std::vector<Point> smoothedPoints(const std::vector<Point>& input) {
+static std::vector<DTSampledPoint> smoothedPoints(
+    const std::vector<DTSampledPoint>& input) {
     if (input.size() < 3) return input;
-    std::vector<Point> output;
+    std::vector<DTSampledPoint> output;
     output.reserve(input.size() * 3);
     for (size_t i = 0; i + 1 < input.size(); ++i) {
-        const Point& p0 = input[i == 0 ? i : i - 1];
-        const Point& p1 = input[i];
-        const Point& p2 = input[i + 1];
-        const Point& p3 = input[(i + 2 < input.size()) ? i + 2 : i + 1];
+        const DTSampledPoint& p0 = input[i == 0 ? i : i - 1];
+        const DTSampledPoint& p1 = input[i];
+        const DTSampledPoint& p2 = input[i + 1];
+        const DTSampledPoint& p3 = input[(i + 2 < input.size()) ? i + 2 : i + 1];
         const float length = simd_length(p2.position - p1.position);
         const int subdivisions = std::max(1, std::min(12, static_cast<int>(ceilf(length / 3.0f))));
         for (int step = 0; step < subdivisions; ++step) {
@@ -169,7 +172,7 @@ static std::vector<Point> smoothedPoints(const std::vector<Point>& input) {
         const BOOL eraser = stroke.tool == DTToolEraser;
         const float opacity = clamp01(stroke.brushOpacity);
         const float brushSize = stroke.brushSize;
-        std::vector<Point> points;
+        std::vector<DTSampledPoint> points;
         points.reserve(strokeValues.count);
         for (NSValue *value in strokeValues) {
             DTRenderPoint point = {0, 0, 1, 0};
@@ -188,8 +191,8 @@ static std::vector<Point> smoothedPoints(const std::vector<Point>& input) {
                         points[0].predicted, opacity, eraseFlag);
         } else {
             for (size_t index = 1; index < points.size(); ++index) {
-                const Point& p0 = points[index - 1];
-                const Point& p1 = points[index];
+                const DTSampledPoint& p0 = points[index - 1];
+                const DTSampledPoint& p1 = points[index];
                 const vector_float2 delta = p1.position - p0.position;
                 const float length = simd_length(delta);
                 if (length < 0.001f) continue;
@@ -203,7 +206,7 @@ static std::vector<Point> smoothedPoints(const std::vector<Point>& input) {
                 addTriangle(geometry, a0, b0, a1, p0.pressure, p0.predicted, opacity, eraseFlag);
                 addTriangle(geometry, a1, b0, b1, p1.pressure, p1.predicted, opacity, eraseFlag);
             }
-            for (const Point& point : points) {
+            for (const DTSampledPoint& point : points) {
                 addRoundCap(geometry, point.position,
                             strokeRadius(point.pressure, brushSize), point.pressure,
                             point.predicted, opacity, eraseFlag);
