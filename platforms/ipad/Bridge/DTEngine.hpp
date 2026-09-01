@@ -26,10 +26,14 @@ public:
     void endStroke();
     void cancelStroke();
     void clear();
+    /// Remove the most recently committed stroke. Returns false when empty.
+    bool undoLastStroke();
 
     std::vector<Stroke> snapshot() const;
     std::size_t strokeCount() const;
     std::size_t sampleCount() const;
+    /// Monotonically increasing mutation counter for render/snapshot clients.
+    std::uint64_t revision() const;
 
 private:
     void rebuildActiveStroke();
@@ -39,6 +43,7 @@ private:
     Stroke activeStroke_;
     DrawingEngine inputEngine_;
     bool strokeInProgress_ = false;
+    std::uint64_t revision_ = 0;
 };
 
 } // namespace drafting_table

@@ -24,7 +24,12 @@ vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
 }
 
 fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
-    float alpha = (0.45 + 0.55 * saturate(in.pressure)) * (in.predicted > 0.5 ? 0.35 : 1.0);
-    const float3 color = float3(0.10, 0.58, 0.98);
+    float alpha = (0.76 + 0.24 * saturate(in.pressure)) *
+                  (in.predicted > 0.5 ? 0.30 : 1.0);
+    // Graphite ink over warm paper. The pipeline uses source-alpha-one, so
+    // return premultiplied RGB to avoid dark fringes at segment boundaries.
+    const float3 color = in.predicted > 0.5
+        ? float3(0.28, 0.30, 0.31)
+        : float3(0.075, 0.080, 0.082);
     return float4(color * alpha, alpha);
 }

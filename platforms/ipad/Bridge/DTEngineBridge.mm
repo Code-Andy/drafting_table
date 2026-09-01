@@ -37,6 +37,7 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 
 - (NSUInteger)strokeCount { return _engine ? _engine->strokeCount() : 0; }
 - (NSUInteger)sampleCount { return _engine ? _engine->sampleCount() : 0; }
+- (uint64_t)revision { return _engine ? _engine->revision() : 0; }
 
 - (void)beginStroke { if (_engine) _engine->beginStroke(); }
 
@@ -63,6 +64,7 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 - (void)endStroke { if (_engine) _engine->endStroke(); }
 - (void)cancelStroke { if (_engine) _engine->cancelStroke(); }
 - (void)clearCanvas { if (_engine) _engine->clear(); }
+- (BOOL)undoLastStroke { return _engine && _engine->undoLastStroke(); }
 
 - (NSArray<NSArray<NSValue *> *> *)renderableStrokes {
     if (!_engine) return @[];

@@ -2,8 +2,9 @@
 <img src="tools/drafting_table.png">
 
 > **iPad port:** local development is on the `ipad-native-port` branch. See
-> [PORTING.md](PORTING.md) for the implemented C++/UIKit/Metal/IPA foundation,
-> required tools, licensing constraint, and the remaining feature-parity work.
+> [IOS_PORT.md](IOS_PORT.md) for iPad implementation status,
+> [PORTING.md](PORTING.md) for the extraction plan, and
+> [AGENTIC_SETUP.md](AGENTIC_SETUP.md) for the current orchestration workflow.
 
 Ben's notes:
 

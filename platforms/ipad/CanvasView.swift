@@ -10,6 +10,11 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     /// string suitable for the diagnostics overlay.
     var onDiagnostics: ((String) -> Void)?
 
+    /// Called when the first point of a new stroke is received. The controller
+    /// uses this to dismiss the empty-canvas hint without coupling the UI to
+    /// the C++ document model.
+    var onDrawingBegan: (() -> Void)?
+
     private var activeTouch: UITouch?
     private var renderer: DTMetalRenderer?
     private var displayLink: CADisplayLink?
@@ -32,7 +37,9 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
 
     private func configure() {
         colorPixelFormat = .bgra8Unorm
-        clearColor = MTLClearColor(red: 0.055, green: 0.065, blue: 0.08, alpha: 1.0)
+        // Keep the canvas useful even when no Metal pipeline is available. A
+        // light, warm paper tone also makes the first blank state obvious.
+        clearColor = MTLClearColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1.0)
         framebufferOnly = true
         isMultipleTouchEnabled = true
         isOpaque = true
@@ -43,6 +50,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
+
     }
 
     override func didMoveToWindow() {
@@ -61,10 +69,8 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     deinit { displayLink?.invalidate() }
 
     private func accepts(_ touch: UITouch) -> Bool {
-        // Pencil-only input prevents a palm or a resting finger from creating
-        // a stroke. A mouse/finger can still be used in UI tests by setting
-        // the accessibility identifier and sending pencil events in XCTest.
-        touch.type == .pencil
+        touch.type == .pencil ||
+            (!UIPencilInteraction.prefersPencilOnlyDrawing && touch.type == .direct)
     }
 
     private func makeSample(_ touch: UITouch,
@@ -118,6 +124,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         guard activeTouch == nil, let touch = touches.first(where: accepts) else { return }
         activeTouch = touch
         engineBridge.beginStroke()
+        onDrawingBegan?()
         appendBatch(for: touch, event: event)
     }
 

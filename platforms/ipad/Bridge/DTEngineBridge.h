@@ -41,6 +41,7 @@ typedef struct {
 
 @property(nonatomic, readonly) NSUInteger strokeCount;
 @property(nonatomic, readonly) NSUInteger sampleCount;
+@property(nonatomic, readonly) uint64_t revision;
 
 - (void)beginStroke;
 - (void)appendSamples:(const DTPencilSample *_Nullable)samples
@@ -51,6 +52,7 @@ typedef struct {
 - (void)endStroke;
 - (void)cancelStroke;
 - (void)clearCanvas;
+- (BOOL)undoLastStroke;
 
 /// Snapshot is an array of polylines. Each polyline contains NSValue-wrapped
 /// DTRenderPoint values and is safe to retain while the engine receives input.

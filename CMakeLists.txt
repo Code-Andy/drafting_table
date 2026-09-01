@@ -72,7 +72,17 @@ if (BUILD_TESTING)
     target_link_libraries(drafting_table_metal_layout_tests PRIVATE drafting_table_core)
     target_compile_features(drafting_table_metal_layout_tests PRIVATE cxx_std_20)
 
-    foreach(test_target drafting_table_document_tests drafting_table_brush_tests drafting_table_metal_layout_tests)
+    add_executable(drafting_table_ipad_engine_tests
+        platforms/ipad/Bridge/DTEngine.cpp
+        tests/core/test_ipad_engine.cpp
+    )
+    target_include_directories(drafting_table_ipad_engine_tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/platforms/ipad/Bridge
+    )
+    target_link_libraries(drafting_table_ipad_engine_tests PRIVATE drafting_table_core)
+    target_compile_features(drafting_table_ipad_engine_tests PRIVATE cxx_std_20)
+
+    foreach(test_target drafting_table_document_tests drafting_table_brush_tests drafting_table_metal_layout_tests drafting_table_ipad_engine_tests)
         if (MSVC)
             target_compile_options(${test_target} PRIVATE /W4 /permissive-)
         else()
@@ -83,4 +93,5 @@ if (BUILD_TESTING)
     add_test(NAME drafting_table_document_tests COMMAND drafting_table_document_tests)
     add_test(NAME drafting_table_brush_tests COMMAND drafting_table_brush_tests)
     add_test(NAME drafting_table_metal_layout_tests COMMAND drafting_table_metal_layout_tests)
+    add_test(NAME drafting_table_ipad_engine_tests COMMAND drafting_table_ipad_engine_tests)
 endif()
