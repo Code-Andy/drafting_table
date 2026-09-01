@@ -164,12 +164,17 @@ static void addRoundCap(std::vector<DTMetalVertex>& out,
                 addTriangle(geometry, a0, b0, a1, p0.pressure, p0.predicted);
                 addTriangle(geometry, a1, b0, b1, p1.pressure, p1.predicted);
             }
-            const Point& first = points.front();
-            const Point& last = points.back();
-            addRoundCap(geometry, first.position, strokeRadius(first.pressure),
-                        first.pressure, first.predicted);
-            addRoundCap(geometry, last.position, strokeRadius(last.pressure),
-                        last.pressure, last.predicted);
+            // A round dab at every sample closes the outside of curved joins
+            // and keeps very short/repeated segments visible.  The old
+            // endpoint-only caps left angular gaps whenever the segment
+            // normal changed quickly (which is common with Pencil curves).
+            // These dabs also provide the round cap for the first and last
+            // samples without requiring a special endpoint path.
+            for (const Point& point : points) {
+                addRoundCap(geometry, point.position,
+                            strokeRadius(point.pressure), point.pressure,
+                            point.predicted);
+            }
         }
         if (geometry.empty()) continue;
         id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()

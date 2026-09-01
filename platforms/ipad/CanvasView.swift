@@ -15,7 +15,17 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     /// the C++ document model.
     var onDrawingBegan: (() -> Void)?
 
+    /// Minimum normalized Apple Pencil force needed to put the pen down. A
+    /// small amount of hysteresis is used on lift-off so force estimates that
+    /// wobble around the threshold do not fragment a stroke.
+    var activationPressure: CGFloat {
+        get { activationPressureValue }
+        set { activationPressureValue = min(max(newValue, 0), 0.20) }
+    }
+
     private var activeTouch: UITouch?
+    private var activationPressureValue: CGFloat = 0.03
+    private var strokeEngaged = false
     private var renderer: DTMetalRenderer?
     private var displayLink: CADisplayLink?
     private var lastDiagnosticTime = CACurrentMediaTime()
@@ -50,7 +60,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
-
     }
 
     override func didMoveToWindow() {
@@ -71,6 +80,15 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     private func accepts(_ touch: UITouch) -> Bool {
         touch.type == .pencil ||
             (!UIPencilInteraction.prefersPencilOnlyDrawing && touch.type == .direct)
+    }
+
+    private func normalizedForce(of touch: UITouch) -> CGFloat {
+        guard touch.maximumPossibleForce > 0 else { return 1.0 }
+        return min(max(CGFloat(touch.force / touch.maximumPossibleForce), 0), 1)
+    }
+
+    private var releasePressure: CGFloat {
+        activationPressure == 0 ? 0 : max(0.001, activationPressure * 0.55)
     }
 
     private func makeSample(_ touch: UITouch,
@@ -104,14 +122,28 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         return sample
     }
 
-    private func appendBatch(for touch: UITouch, event: UIEvent?) {
+    private func appendBatch(for touch: UITouch,
+                             event: UIEvent?,
+                             includePredicted: Bool = true,
+                             minimumPencilPressure: CGFloat? = nil) {
         let coalescedTouches = event?.coalescedTouches(for: touch) ?? [touch]
-        let real = coalescedTouches.map {
+        let eligibleTouches: [UITouch]
+        if touch.type == .pencil, let minimumPencilPressure {
+            eligibleTouches = coalescedTouches.filter {
+                normalizedForce(of: $0) >= minimumPencilPressure
+            }
+        } else {
+            eligibleTouches = coalescedTouches
+        }
+        let real = eligibleTouches.map {
             makeSample($0, predicted: false, coalesced: $0 !== touch)
         }
-        let predicted = (event?.predictedTouches(for: touch) ?? []).map {
+        let predicted = includePredicted && !real.isEmpty
+            ? (event?.predictedTouches(for: touch) ?? []).map {
             makeSample($0, predicted: true)
-        }
+            }
+            : []
+        guard !real.isEmpty || !predicted.isEmpty else { return }
         let samples = real + predicted
         samples.withUnsafeBufferPointer { buffer in
             engineBridge.appendSamples(buffer.baseAddress,
@@ -123,36 +155,86 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch == nil, let touch = touches.first(where: accepts) else { return }
         activeTouch = touch
+        if touch.type == .pencil && normalizedForce(of: touch) < activationPressure {
+            // Keep tracking this contact, but do not create an engine stroke
+            // until the user has intentionally pressed the Pencil down.
+            return
+        }
+        strokeEngaged = true
         engineBridge.beginStroke()
         onDrawingBegan?()
-        appendBatch(for: touch, event: event)
+        appendBatch(for: touch,
+                    event: event,
+                    minimumPencilPressure: touch.type == .pencil ? activationPressure : nil)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let activeTouch, touches.contains(activeTouch) else { return }
+        if activeTouch.type == .pencil {
+            let latest = event?.coalescedTouches(for: activeTouch)?.last ?? activeTouch
+            if strokeEngaged {
+                if normalizedForce(of: latest) < releasePressure {
+                    // Flush real samples before ending; predicted points are
+                    // intentionally discarded at lift-off.
+                    appendBatch(for: activeTouch,
+                                event: event,
+                                includePredicted: false,
+                                minimumPencilPressure: releasePressure)
+                    engineBridge.endStroke()
+                    strokeEngaged = false
+                } else {
+                    appendBatch(for: activeTouch, event: event)
+                }
+            } else if normalizedForce(of: latest) >= activationPressure {
+                strokeEngaged = true
+                engineBridge.beginStroke()
+                onDrawingBegan?()
+                appendBatch(for: activeTouch,
+                            event: event,
+                            includePredicted: false,
+                            minimumPencilPressure: activationPressure)
+            }
+            return
+        }
         appendBatch(for: activeTouch, event: event)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let activeTouch, touches.contains(activeTouch) else { return }
-        var finalSample = makeSample(activeTouch, predicted: false)
-        withUnsafePointer(to: &finalSample) { pointer in
-            engineBridge.appendSamples(pointer, count: 1, realCount: 1)
+        if strokeEngaged {
+            if activeTouch.type != .pencil || normalizedForce(of: activeTouch) >= releasePressure {
+                var finalSample = makeSample(activeTouch, predicted: false)
+                withUnsafePointer(to: &finalSample) { pointer in
+                    engineBridge.appendSamples(pointer, count: 1, realCount: 1)
+                }
+            }
+            engineBridge.endStroke()
         }
-        engineBridge.endStroke()
+        strokeEngaged = false
         self.activeTouch = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch != nil else { return }
-        engineBridge.cancelStroke()
+        if strokeEngaged { engineBridge.cancelStroke() }
+        strokeEngaged = false
         activeTouch = nil
     }
 
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
-        guard activeTouch != nil else { return }
+        guard let activeTouch else { return }
         for touch in touches where touch.type == .pencil {
+            if !strokeEngaged && normalizedForce(of: touch) >= activationPressure {
+                strokeEngaged = true
+                engineBridge.beginStroke()
+                onDrawingBegan?()
+                appendBatch(for: touch,
+                            event: nil,
+                            includePredicted: false,
+                            minimumPencilPressure: activationPressure)
+            }
             guard let index = touch.estimationUpdateIndex?.uint64Value else { continue }
+            guard strokeEngaged, touch === activeTouch else { continue }
             let corrected = makeSample(touch, predicted: false)
             _ = engineBridge.updateEstimatedSample(at: index, sample: corrected)
         }

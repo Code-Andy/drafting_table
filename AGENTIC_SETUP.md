@@ -40,6 +40,7 @@ Completed delegated tracks:
 - platform-neutral brush/coverage geometry;
 - sparse Metal tile backend;
 - current visible-UI and immediate-stroke iteration.
+- curved-stroke join smoothing and software Pencil activation/lift-off tuning.
 
 ## Delegation rules
 
@@ -90,8 +91,8 @@ Before tagging:
 
 ## Current next steps
 
-- finish and validate the version 0.2 visible-canvas iteration;
-- publish the first tagged GitHub Release;
-- collect iPad screenshots/behavior notes;
+- validate the version 0.3 activation-threshold and curve-smoothing iteration;
+- publish the next tagged GitHub Release;
+- collect iPad screenshots and threshold/curve behavior notes;
 - then connect the sparse tile renderer through an ordered command path rather
   than expanding the diagnostic renderer into a second production engine.

@@ -24,12 +24,17 @@ vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
 }
 
 fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
-    float alpha = (0.76 + 0.24 * saturate(in.pressure)) *
-                  (in.predicted > 0.5 ? 0.30 : 1.0);
+    // Real graphite is intentionally opaque.  Segment quads and the round
+    // join dabs overlap by design; alpha below one would accumulate and make
+    // curved lines visibly darker than straight ones.  Predicted samples are
+    // still rendered as a lighter tail until UIKit replaces them with real
+    // samples.
+    float alpha = in.predicted > 0.5 ? 0.30 : 1.0;
     // Graphite ink over warm paper. The pipeline uses source-alpha-one, so
     // return premultiplied RGB to avoid dark fringes at segment boundaries.
-    const float3 color = in.predicted > 0.5
-        ? float3(0.28, 0.30, 0.31)
-        : float3(0.075, 0.080, 0.082);
+    // Use the same graphite hue for prediction. Lower alpha makes it lighter
+    // on paper without brightening an already-rendered real segment where the
+    // prediction tail overlaps the last real sample.
+    const float3 color = float3(0.075, 0.080, 0.082);
     return float4(color * alpha, alpha);
 }

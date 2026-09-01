@@ -19,12 +19,15 @@ private final class InsetLabel: UILabel {
 /// model is connected; they make the canvas orientation and interaction model
 /// clear in an unsigned development build.
 final class DraftingTableViewController: UIViewController {
+    private static let penActivationDefaultsKey = "draftingTable.penActivationPressure"
+
     private let canvas = CanvasView(frame: .zero)
     private let diagnostics = DiagnosticsOverlay(frame: .zero)
     private let emptyState = InsetLabel()
     private let pagesRail = UIView()
     private let layersRail = UIView()
     private let toolRail = UIView()
+    private weak var penActivationReadout: UILabel?
 
     override func loadView() {
         let root = UIView()
@@ -70,7 +73,7 @@ final class DraftingTableViewController: UIViewController {
             toolRail.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 16),
             toolRail.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -16),
             toolRail.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -10),
-            toolRail.heightAnchor.constraint(equalToConstant: 62),
+            toolRail.heightAnchor.constraint(equalToConstant: 74),
 
             emptyState.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             emptyState.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: -12),
@@ -162,12 +165,20 @@ final class DraftingTableViewController: UIViewController {
         styleRail(toolRail)
         let stack = UIStackView()
         stack.axis = .horizontal
-        stack.distribution = .fillEqually
+        stack.alignment = .fill
+        stack.distribution = .fill
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(toolButton(title: "✎  Brush", action: nil))
-        stack.addArrangedSubview(toolButton(title: "↶  Undo", action: #selector(undoCanvas)))
-        stack.addArrangedSubview(toolButton(title: "⌫  Clear", action: #selector(clearCanvas)))
+        let brush = toolButton(title: "✎  Brush", action: nil)
+        let undo = toolButton(title: "↶  Undo", action: #selector(undoCanvas))
+        let clear = toolButton(title: "⌫  Clear", action: #selector(clearCanvas))
+        [brush, undo, clear].forEach {
+            $0.widthAnchor.constraint(greaterThanOrEqualToConstant: 94).isActive = true
+        }
+        stack.addArrangedSubview(brush)
+        stack.addArrangedSubview(undo)
+        stack.addArrangedSubview(clear)
+        stack.addArrangedSubview(penActivationControl())
         toolRail.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: toolRail.leadingAnchor, constant: 10),
@@ -175,6 +186,73 @@ final class DraftingTableViewController: UIViewController {
             stack.topAnchor.constraint(equalTo: toolRail.topAnchor, constant: 8),
             stack.bottomAnchor.constraint(equalTo: toolRail.bottomAnchor, constant: -8)
         ])
+    }
+
+    private func penActivationControl() -> UIView {
+        let panel = UIView()
+        panel.backgroundColor = UIColor.white.withAlphaComponent(0.64)
+        panel.layer.cornerRadius = 9
+        panel.layer.borderWidth = 1
+        panel.layer.borderColor = UIColor.black.withAlphaComponent(0.08).cgColor
+        panel.widthAnchor.constraint(greaterThanOrEqualToConstant: 205).isActive = true
+
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
+        label.textAlignment = .center
+        label.adjustsFontForContentSizeCategory = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        penActivationReadout = label
+
+        let slider = UISlider()
+        slider.minimumValue = 0
+        slider.maximumValue = 20
+        slider.isContinuous = true
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.accessibilityLabel = "Pen activation threshold"
+        slider.accessibilityHint = "Higher values ignore lighter contact and screen-protector noise."
+        slider.addTarget(self, action: #selector(penActivationChanged(_:)), for: .valueChanged)
+
+        let storedPercent = UserDefaults.standard.object(forKey: Self.penActivationDefaultsKey) as? NSNumber
+        let initialPercent = min(max(storedPercent?.floatValue ?? 3, 0), 20)
+        slider.value = initialPercent
+        canvas.activationPressure = CGFloat(initialPercent / 100)
+        updatePenActivationReadout(label, slider: slider)
+
+        let controls = UIStackView(arrangedSubviews: [label, slider])
+        controls.axis = .vertical
+        controls.alignment = .fill
+        controls.spacing = 0
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(controls)
+        NSLayoutConstraint.activate([
+            controls.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 8),
+            controls.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -8),
+            controls.topAnchor.constraint(equalTo: panel.topAnchor, constant: 4),
+            controls.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -3)
+        ])
+        panel.accessibilityLabel = "Pen activation control"
+        panel.accessibilityHint = "Higher values ignore lighter contact and screen-protector noise."
+        return panel
+    }
+
+    @objc private func penActivationChanged(_ sender: UISlider) {
+        let percent = min(max(sender.value, 0), 20)
+        sender.value = percent
+        canvas.activationPressure = CGFloat(percent / 100)
+        UserDefaults.standard.set(percent, forKey: Self.penActivationDefaultsKey)
+        if let label = penActivationReadout {
+            updatePenActivationReadout(label, slider: sender)
+        }
+    }
+
+    private func updatePenActivationReadout(_ label: UILabel, slider: UISlider) {
+        let value = slider.value
+        let percent = abs(value.rounded() - value) < 0.05
+            ? "\(Int(value.rounded()))%"
+            : String(format: "%.1f%%", value)
+        label.text = "Pen activation " + percent
+        slider.accessibilityValue = percent
     }
 
     private func styleRail(_ rail: UIView) {

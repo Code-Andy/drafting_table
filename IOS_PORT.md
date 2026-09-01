@@ -27,6 +27,12 @@ Version 0.2.x is the first interactive-canvas iteration. Its acceptance gate is:
 Passing this gate does **not** imply feature parity with Android. It establishes
 a useful on-device feedback loop for subsequent renderer and document work.
 
+Version 0.3 adds the first device-tuning control: a persistent 0–20% Pencil
+activation-pressure threshold with a lower 55% release threshold. This is an
+app-level contact/lift-off filter for light-touch noise and different screen
+feel. UIKit does not expose a way for an app to change Apple Pencil's physical
+hover or hardware detection height.
+
 ## Implemented architecture
 
 ### Portable C++20
@@ -50,6 +56,7 @@ a useful on-device feedback loop for subsequent renderer and document work.
 - Batched coalesced and predicted Apple Pencil input
 - Pressure, altitude, azimuth, barrel roll, and estimated-value updates
 - Pencil double-tap and squeeze event capture
+- Persistent Pencil activation threshold with lift-off hysteresis
 - Thin Objective-C++ ownership bridge
 - Diagnostics overlay
 - XcodeGen project generation
