@@ -13,7 +13,7 @@ IPA that SideStore can sign and install.
 
 ## Current user-visible milestone
 
-Version 0.2 is the first interactive-canvas iteration. Its acceptance gate is:
+Version 0.2.x is the first interactive-canvas iteration. Its acceptance gate is:
 
 - a real home-screen icon and light launch appearance;
 - a visibly paper-colored canvas rather than a black frame;
