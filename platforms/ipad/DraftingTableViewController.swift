@@ -33,7 +33,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var settingsButton: UIButton!
     private var selectedTool: DTTool = .brush
     private var pendingDocumentExportURL: URL?
-    private var didGenerateInitialThumbnails = false
     private var pageThumbnailCache: [UInt: UIImage] = [:]
 
     override func loadView() {
@@ -89,13 +88,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         )
         navigationItem.rightBarButtonItems = [reset, commandMenuButton()]
         restoreDocument(); applyStoredSettings(); refreshRails(); updateToolSelection(); updateUndoRedoState()
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        guard !didGenerateInitialThumbnails, canvas.bounds.width > 1, canvas.bounds.height > 1 else { return }
-        didGenerateInitialThumbnails = true
-        refreshRails()
     }
 
     /// Called by the scene delegate before suspension as a final autosave.
@@ -202,7 +194,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func configurePagesRail() {
-        pagesRail.thumbnailForPage = { [weak self] index in self?.thumbnail(forPageAt: index) }
+        // Thumbnail generation is disabled for the v0.7.1 launch hotfix. It
+        // previously ran synchronously from layout and is being moved to an
+        // isolated background cache before re-enabling.
+        pagesRail.thumbnailForPage = nil
         pagesRail.onSelect = { [weak self] index in
             guard let self else { return }
             self.canvas.engineBridge.setActivePageIndex(UInt(index))

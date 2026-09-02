@@ -125,15 +125,10 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
-        // UIHoverGestureRecognizer receives Pencil hover on iPadOS 16+ and is
-        // harmless on devices without hover support. It does not feed the
-        // touch/sample path, so preview updates can never create strokes.
-        addGestureRecognizer(hoverGesture)
-        hoverPreviewLayer.fillColor = UIColor.clear.cgColor
-        hoverPreviewLayer.lineWidth = 1.5
-        hoverPreviewLayer.zPosition = 1000
-        hoverPreviewLayer.isHidden = true
-        layer.addSublayer(hoverPreviewLayer)
+        // Hover is temporarily not attached in v0.7.1. Adding a CAShapeLayer
+        // directly under MTKView's CAMetalLayer is part of the v0.7 launch
+        // crash surface; it will return as a sibling overlay after device
+        // validation rather than mutating the Metal layer tree.
         addGestureRecognizer(panGesture)
         addGestureRecognizer(pinchGesture)
         addGestureRecognizer(rotationGesture)
@@ -528,7 +523,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldReceive touch: UITouch) -> Bool {
         // Pencil input remains exclusively owned by the sample path.
-        if gestureRecognizer === hoverGesture { return true }
         return touch.type == .direct
     }
 
