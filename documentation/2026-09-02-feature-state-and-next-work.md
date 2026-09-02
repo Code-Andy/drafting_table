@@ -25,15 +25,15 @@ ported iPad features.
 | Documents | One autosaved application session | Files-compatible packages and multi-document browser |
 | Import/export | Not connected on iPad | System image import, page PNG, multi-page PDF, share sheet |
 | Diagnostics | Basic overlay/foundations | Latency, queue, tile, memory, prediction, exportable logs |
-| Release | v0.5.0 public IPA; v0.6 branch candidate builds and is inspected | Tagged v0.6 IPA, checksum, device acceptance |
+| Release | v0.6.0 public IPA built from green tag and inspected | Device acceptance, then next tagged raster milestone |
 
 ## Dependency-ordered next work
 
 ### Immediate — close v0.6
 
-The context-menu declarations are fixed and the branch IPA passed inspection.
-Release `v0.6.0`, then test page/layer selection, persistence, visibility,
-opacity, deletion guards, gestures, and Pencil strokes on the iPad.
+`v0.6.0` is released. Test page/layer selection, persistence, visibility,
+opacity, deletion guards, gestures, and Pencil strokes on the iPad, then record
+the results before changing the renderer architecture.
 
 ### Next — sparse raster command path
 

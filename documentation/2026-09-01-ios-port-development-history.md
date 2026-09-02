@@ -108,7 +108,7 @@ Direct IPA: <https://github.com/Code-Andy/drafting_table/releases/download/v0.5.
 Recorded SHA-256:
 `479AE65F0EE38C4FF4F3D2AA04350B7F767396821063C2351ADC4FCD4E4D3D37`.
 
-### v0.6.0 candidate — retained pages and layers
+### v0.6.0 — retained pages and layers
 
 Key commits: `310928c`, `6d11522`.
 
@@ -122,11 +122,12 @@ Key commits: `310928c`, `6d11522`.
 - Added migration of v1 flat-stroke archives into `Page 1 / Ink` and added real
   v1 fixture, v2 round-trip, and malformed archive tests.
 
-This candidate is not yet tagged as of this record. The initial macOS build was
-blocked by inherited UIKit context-menu declarations. Commits `4828724` and
-`5341b3c` applied the class-specific fix: `UIButton` uses its inherited override
-while the plain `UIView` layer row explicitly conforms to the delegate. Both
-portable and macOS build workflows then passed and the branch IPA was inspected.
+The initial macOS build was blocked by inherited UIKit context-menu
+declarations. Commits `4828724` and `5341b3c` applied the class-specific fix:
+`UIButton` uses its inherited override while the plain `UIView` layer row
+explicitly conforms to the delegate. Both portable and macOS workflows then
+passed. Commit `57b11c5` was tagged and published as `v0.6.0`; the release IPA
+was downloaded and inspected.
 
 ## Release history
 
@@ -137,7 +138,7 @@ portable and macOS build workflows then passed and the branch IPA was inspected.
 | v0.3.0 | released | Curved-line smoothing and Pencil activation tuning |
 | v0.4.0 | released | Retained tools, settings, Undo/Redo, autosave |
 | v0.5.0 | latest released | Two-finger canvas transform and coordinate boundary |
-| v0.6.0 | release-ready candidate | Retained pages/layers and archive v2 |
+| v0.6.0 | latest released | Retained pages/layers and archive v2 |
 
 The release list is maintained at
 <https://github.com/Code-Andy/drafting_table/releases>.

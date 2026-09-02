@@ -12,7 +12,7 @@ This is the exact resume point as of 2026-09-02 in Toronto.
 - Upstream: <https://github.com/bgkatz/drafting_table>
 - Upstream push URL: disabled as `no_push`
 - Project version in `project.yml`: `0.6.0` build `7`
-- Latest released version: `v0.5.0`
+- Latest released version: `v0.6.0`
 - Documentation baseline: `ad0c5f8`
 
 ## What HEAD contains
@@ -67,15 +67,26 @@ The downloaded branch artifact was inspected with these results:
 - SHA-256
   `F49B1BED7F10778F236D940F734C1247B1CD26A6625EE2F8182A8D02CB2EC321`.
 
+## Release result
+
+`57b11c5` was tagged as `v0.6.0`. The tagged build and publish workflow passed:
+<https://github.com/Code-Andy/drafting_table/actions/runs/33599450183>.
+
+The release IPA reports version `0.6.0` build `7`, is arm64, and contains its
+compiled assets and Metal library. Its SHA-256 is
+`82F55DE895B293F5967A3A61775ED46C85E0C69B1821B8BFE205EABD5CF57311`.
+
+- Release: <https://github.com/Code-Andy/drafting_table/releases/tag/v0.6.0>
+- IPA: <https://github.com/Code-Andy/drafting_table/releases/download/v0.6.0/DraftingTable.ipa>
+
 ## Exact continuation sequence
 
-1. Push this documentation update and require both workflows to pass on the
-   final documentation/source commit.
-2. Write release notes that say "retained pages/layers" and do not claim sparse
-   raster tiles, thumbnails, reorder, or Files document packages.
-3. Tag and push `v0.6.0`.
-4. Verify the tagged workflow, release asset, SHA-256, and direct IPA URL.
-5. Collect real-iPad feedback before beginning the sparse raster milestone.
+1. Install `v0.6.0` and test page/layer selection, add, rename, guarded delete,
+   visibility, opacity, autosave/relaunch, active-layer Undo/Redo/Clear, Pencil
+   curves, and two-finger gestures.
+2. Record device feedback as a new dated key-change file.
+3. Begin the sparse raster command-path milestone only after obvious v0.6
+   regressions are addressed.
 
 ## Known boundaries of the candidate
 

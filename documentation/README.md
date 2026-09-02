@@ -33,6 +33,8 @@ handoffs belong here.
    — how delegated work is scoped, reviewed, and retired.
 6. [2026-09-02-feature-state-and-next-work.md](2026-09-02-feature-state-and-next-work.md)
    — honest feature matrix and dependency-ordered next work.
+7. [2026-09-02-v0.6-pages-layers-release.md](2026-09-02-v0.6-pages-layers-release.md)
+   — tagged feature notes, CI evidence, IPA checksum, and download links.
 
 ## Other source-of-truth documents
 
