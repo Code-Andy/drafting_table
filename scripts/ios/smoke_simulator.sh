@@ -70,6 +70,12 @@ if ! xcrun simctl spawn "$device_udid" /bin/kill -0 "$pid"; then
     echo "Latest host crash report: $latest_report" >&2
     tail -n 1200 "$latest_report" || true
   fi
+  simulator_report_dir="$HOME/Library/Developer/CoreSimulator/Devices/$device_udid/data/Library/Logs/CrashReporter"
+  simulator_report="$(find "$simulator_report_dir" -type f -name 'DraftingTable*' -print 2>/dev/null | sort | tail -n 1 || true)"
+  if [[ -n "$simulator_report" ]]; then
+    echo "Latest simulator crash report: $simulator_report" >&2
+    cat "$simulator_report" || true
+  fi
   exit 1
 fi
 
