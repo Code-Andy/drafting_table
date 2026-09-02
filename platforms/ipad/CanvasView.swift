@@ -3,7 +3,7 @@ import UIKit
 
 /// MTKView input surface for Apple Pencil. UIKit owns gesture recognition and
 /// event prediction; DTEngineBridge owns the thread-safe document samples.
-final class CanvasView: MTKView, UIPencilInteractionDelegate {
+final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognizerDelegate {
     let engineBridge = DTEngineBridge()
 
     /// Called periodically on the main thread with a human-readable state
@@ -28,6 +28,12 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         set { activationPressureValue = min(max(newValue, 0), 0.20) }
     }
 
+    /// Document-to-view viewport transform. Translation is in view points;
+    /// scale and rotation are applied around the document origin.
+    private(set) var canvasScale: CGFloat = 1.0
+    private(set) var canvasRotation: CGFloat = 0.0
+    private(set) var canvasTranslation: CGPoint = .zero
+
     private var activeTouch: UITouch?
     private var activationPressureValue: CGFloat = 0.03
     private var strokeEngaged = false
@@ -37,6 +43,32 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     private var lastDiagnosticFrame: UInt = 0
     private var nextSampleID: UInt64 = 1
     private var lastPencilAction = "none"
+
+    private lazy var panGesture: UIPanGestureRecognizer = {
+        let gesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        gesture.minimumNumberOfTouches = 2
+        gesture.maximumNumberOfTouches = 2
+        gesture.delegate = self
+        gesture.cancelsTouchesInView = false
+        return gesture
+    }()
+    private lazy var pinchGesture: UIPinchGestureRecognizer = {
+        let gesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        gesture.delegate = self
+        gesture.cancelsTouchesInView = false
+        return gesture
+    }()
+    private lazy var rotationGesture: UIRotationGestureRecognizer = {
+        let gesture = UIRotationGestureRecognizer(target: self, action: #selector(handleRotation(_:)))
+        gesture.delegate = self
+        gesture.cancelsTouchesInView = false
+        return gesture
+    }()
+
+    private static let scaleDefaultsKey = "draftingTable.canvasScale"
+    private static let rotationDefaultsKey = "draftingTable.canvasRotation"
+    private static let translationXDefaultsKey = "draftingTable.canvasTranslationX"
+    private static let translationYDefaultsKey = "draftingTable.canvasTranslationY"
 
     override init(frame frameRect: CGRect, device: MTLDevice?) {
         let selectedDevice = device ?? MTLCreateSystemDefaultDevice()
@@ -65,6 +97,10 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
+        addGestureRecognizer(panGesture)
+        addGestureRecognizer(pinchGesture)
+        addGestureRecognizer(rotationGesture)
+        restoreViewTransform()
     }
 
     override func didMoveToWindow() {
@@ -99,7 +135,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
     private func makeSample(_ touch: UITouch,
                             predicted: Bool,
                             coalesced: Bool = false) -> DTPencilSample {
-        let location = touch.preciseLocation(in: self)
+        let location = documentPoint(for: touch.preciseLocation(in: self))
         let force = touch.maximumPossibleForce > 0
             ? touch.force / touch.maximumPossibleForce
             : 1.0
@@ -229,6 +265,167 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate {
         }
         strokeEngaged = false
         activeTouch = nil
+    }
+
+    // MARK: - Canvas transform and gestures
+
+    private func restoreViewTransform() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Self.scaleDefaultsKey) != nil {
+            canvasScale = clampedScale(CGFloat(defaults.double(forKey: Self.scaleDefaultsKey)))
+        }
+        if defaults.object(forKey: Self.rotationDefaultsKey) != nil {
+            let value = CGFloat(defaults.double(forKey: Self.rotationDefaultsKey))
+            canvasRotation = value.isFinite ? value : 0
+        }
+        if defaults.object(forKey: Self.translationXDefaultsKey) != nil {
+            let value = CGFloat(defaults.double(forKey: Self.translationXDefaultsKey))
+            canvasTranslation.x = value.isFinite ? value : 0
+        }
+        if defaults.object(forKey: Self.translationYDefaultsKey) != nil {
+            let value = CGFloat(defaults.double(forKey: Self.translationYDefaultsKey))
+            canvasTranslation.y = value.isFinite ? value : 0
+        }
+        publishViewTransform()
+    }
+
+    private func persistViewTransform() {
+        let defaults = UserDefaults.standard
+        defaults.set(Double(canvasScale), forKey: Self.scaleDefaultsKey)
+        defaults.set(Double(canvasRotation), forKey: Self.rotationDefaultsKey)
+        defaults.set(Double(canvasTranslation.x), forKey: Self.translationXDefaultsKey)
+        defaults.set(Double(canvasTranslation.y), forKey: Self.translationYDefaultsKey)
+    }
+
+    private func clampedScale(_ value: CGFloat) -> CGFloat {
+        min(max(value.isFinite ? value : 1.0, 0.1), 8.0)
+    }
+
+    private func publishViewTransform(persist: Bool = false) {
+        renderer?.updateCanvasScale(canvasScale,
+                                    rotation: canvasRotation,
+                                    translationX: canvasTranslation.x,
+                                    translationY: canvasTranslation.y)
+        if persist { persistViewTransform() }
+        setNeedsDisplay()
+    }
+
+    /// Resets zoom, rotation and pan to the default page viewport.
+    func resetView() {
+        cancelDirectFingerStrokeIfNeeded()
+        canvasScale = 1.0
+        canvasRotation = 0.0
+        canvasTranslation = .zero
+        publishViewTransform(persist: true)
+    }
+
+    private func documentPoint(for viewPoint: CGPoint) -> CGPoint {
+        let translated = CGPoint(x: (viewPoint.x - canvasTranslation.x) / canvasScale,
+                                 y: (viewPoint.y - canvasTranslation.y) / canvasScale)
+        let cosine = cos(canvasRotation)
+        let sine = sin(canvasRotation)
+        // Inverse of the document-to-view rotation.
+        return CGPoint(x: translated.x * cosine + translated.y * sine,
+                       y: -translated.x * sine + translated.y * cosine)
+    }
+
+    private func applyTransform(scale newScale: CGFloat? = nil,
+                                rotation newRotation: CGFloat? = nil,
+                                around centroid: CGPoint?) {
+        let pivot = centroid ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        let documentPivot = documentPoint(for: pivot)
+        if let newScale { canvasScale = clampedScale(newScale) }
+        if let newRotation {
+            canvasRotation = newRotation.isFinite
+                ? newRotation.truncatingRemainder(dividingBy: .pi * 2)
+                : 0
+        }
+
+        // Keep the document point beneath the gesture centroid stationary.
+        let cosine = cos(canvasRotation)
+        let sine = sin(canvasRotation)
+        let rotated = CGPoint(
+            x: (documentPivot.x * cosine - documentPivot.y * sine) * canvasScale,
+            y: (documentPivot.x * sine + documentPivot.y * cosine) * canvasScale
+        )
+        canvasTranslation = CGPoint(x: pivot.x - rotated.x,
+                                    y: pivot.y - rotated.y)
+        publishViewTransform()
+    }
+
+    private func cancelDirectFingerStrokeIfNeeded() {
+        guard activeTouch?.type == .direct else { return }
+        if strokeEngaged {
+            engineBridge.cancelStroke()
+            onDocumentChanged?()
+        }
+        strokeEngaged = false
+        activeTouch = nil
+    }
+
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            cancelDirectFingerStrokeIfNeeded()
+        case .changed:
+            let delta = gesture.translation(in: self)
+            gesture.setTranslation(.zero, in: self)
+            canvasTranslation.x += delta.x
+            canvasTranslation.y += delta.y
+            publishViewTransform()
+        case .ended, .cancelled, .failed:
+            persistViewTransform()
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            cancelDirectFingerStrokeIfNeeded()
+        case .changed:
+            applyTransform(scale: canvasScale * gesture.scale,
+                           around: gesture.location(in: self))
+            gesture.scale = 1.0
+        case .ended, .cancelled, .failed:
+            persistViewTransform()
+        default:
+            break
+        }
+    }
+
+    @objc private func handleRotation(_ gesture: UIRotationGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            cancelDirectFingerStrokeIfNeeded()
+        case .changed:
+            applyTransform(rotation: canvasRotation + gesture.rotation,
+                           around: gesture.location(in: self))
+            gesture.rotation = 0.0
+        case .ended, .cancelled, .failed:
+            persistViewTransform()
+        default:
+            break
+        }
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldReceive touch: UITouch) -> Bool {
+        // Pencil input remains exclusively owned by the sample path.
+        touch.type == .direct
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Never change the view transform under an active Pencil stroke; the
+        // input samples for one stroke must remain in a single coordinate map.
+        activeTouch?.type != .pencil
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        (gestureRecognizer === panGesture || gestureRecognizer === pinchGesture || gestureRecognizer === rotationGesture) &&
+            (otherGestureRecognizer === panGesture || otherGestureRecognizer === pinchGesture || otherGestureRecognizer === rotationGesture)
     }
 
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {

@@ -48,6 +48,19 @@ is useful on the single paper canvas, but it is not the final destination-out
 tile eraser. The archive likewise stores retained strokes for this milestone;
 Files document packages and Android tile migration remain separate work.
 
+Version 0.5 introduces the document/view coordinate boundary required by
+snapping, selections, and vector tools:
+
+- all new Pencil/finger samples are converted from view points to document
+  coordinates before entering C++;
+- Metal applies the matching document-to-view scale/rotation/translation;
+- simultaneous two-finger pan, pinch, and rotation preserve the document point
+  under the gesture centroid;
+- a direct-finger drawing stroke is cancelled when a two-finger gesture takes
+  ownership, while active Pencil strokes block transform changes;
+- the view transform persists in UserDefaults and can be reset from the
+  navigation bar.
+
 ## Implemented architecture
 
 ### Portable C++20
@@ -73,6 +86,7 @@ Files document packages and Android tile migration remain separate work.
 - Pencil double-tap and squeeze event capture
 - Persistent Pencil activation threshold with lift-off hysteresis
 - Brush/Eraser selection, retained stroke styles, Undo/Redo, and autosave
+- Document/view transform with two-finger pan, pinch, rotation, and Reset View
 - Thin Objective-C++ ownership bridge
 - Diagnostics overlay
 - XcodeGen project generation

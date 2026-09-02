@@ -58,6 +58,8 @@ entire structure survives relaunch.
 
 ## M4 — canvas gestures and input separation
 
+Status: **initial implementation complete; awaiting device validation**
+
 - Two-finger pan, pinch, and rotation
 - Reset/fit view and persistent canvas transform
 - Strict Pencil drawing versus finger gesture routing

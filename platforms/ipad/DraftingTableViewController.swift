@@ -67,6 +67,12 @@ final class DraftingTableViewController: UIViewController {
         navigationController?.navigationBar.standardAppearance = appearance
         navigationController?.navigationBar.scrollEdgeAppearance = appearance
         navigationController?.navigationBar.compactAppearance = appearance
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            title: "Reset View",
+            style: .plain,
+            target: self,
+            action: #selector(resetCanvasView)
+        )
         applyStoredSettings(); restoreDocument(); updateToolSelection(); updateUndoRedoState()
     }
 
@@ -185,4 +191,5 @@ final class DraftingTableViewController: UIViewController {
     @objc private func redoCanvas() { guard canvas.engineBridge.canRedo else { return }; _ = canvas.engineBridge.redoLastStroke(); documentDidChange() }
     @objc private func clearCanvas() { guard canvas.engineBridge.strokeCount > 0 else { return }; canvas.engineBridge.clearCanvas(); documentDidChange() }
     @objc private func openSettings() { showSettings() }
+    @objc private func resetCanvasView() { canvas.resetView() }
 }

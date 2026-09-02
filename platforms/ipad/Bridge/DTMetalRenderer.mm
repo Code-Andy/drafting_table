@@ -2,8 +2,8 @@
 
 #import <simd/simd.h>
 #include <algorithm>
-#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <vector>
 
 // Immediate retained-snapshot renderer. Eraser strokes are warm-paper geometry
@@ -20,14 +20,14 @@ typedef struct {
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
 
-// Keep the transform as independent atomics so UIKit gesture updates never
-// race the MTKView delegate. A four-float snapshot is inexpensive and avoids
-// locking the render callback. The initial values are the identity transform.
+// Keep the transform behind one small lock so a frame always sees one coherent
+// scale/rotation/translation snapshot rather than a mixture of gesture states.
 struct DTCanvasTransformState {
-    std::atomic<float> scale{1.0f};
-    std::atomic<float> rotation{0.0f};
-    std::atomic<float> translationX{0.0f};
-    std::atomic<float> translationY{0.0f};
+    std::mutex mutex;
+    float scale = 1.0f;
+    float rotation = 0.0f;
+    float translationX = 0.0f;
+    float translationY = 0.0f;
 };
 
 static DTCanvasTransformState gCanvasTransform;
@@ -180,10 +180,11 @@ typedef struct {
     const float safeRotation = finiteOr(static_cast<float>(rotation), 0.0f);
     const float safeX = finiteOr(static_cast<float>(x), 0.0f);
     const float safeY = finiteOr(static_cast<float>(y), 0.0f);
-    gCanvasTransform.scale.store(safeScale, std::memory_order_relaxed);
-    gCanvasTransform.rotation.store(safeRotation, std::memory_order_relaxed);
-    gCanvasTransform.translationX.store(safeX, std::memory_order_relaxed);
-    gCanvasTransform.translationY.store(safeY, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
+    gCanvasTransform.scale = safeScale;
+    gCanvasTransform.rotation = safeRotation;
+    gCanvasTransform.translationX = safeX;
+    gCanvasTransform.translationY = safeY;
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
@@ -207,16 +208,27 @@ typedef struct {
         return;
     }
     [encoder setRenderPipelineState:self.pipeline];
+    float transformScale = 1.0f;
+    float transformRotation = 0.0f;
+    float transformX = 0.0f;
+    float transformY = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
+        transformScale = gCanvasTransform.scale;
+        transformRotation = gCanvasTransform.rotation;
+        transformX = gCanvasTransform.translationX;
+        transformY = gCanvasTransform.translationY;
+    }
     DTMetalUniforms uniforms{};
     uniforms.viewportScaleRotation = (vector_float4){
         (float)view.bounds.size.width,
         (float)view.bounds.size.height,
-        gCanvasTransform.scale.load(std::memory_order_relaxed),
-        gCanvasTransform.rotation.load(std::memory_order_relaxed)
+        transformScale,
+        transformRotation
     };
     uniforms.translation = (vector_float4){
-        gCanvasTransform.translationX.load(std::memory_order_relaxed),
-        gCanvasTransform.translationY.load(std::memory_order_relaxed),
+        transformX,
+        transformY,
         0.0f,
         0.0f
     };
