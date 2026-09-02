@@ -529,7 +529,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                            shouldReceive touch: UITouch) -> Bool {
         // Pencil input remains exclusively owned by the sample path.
         if gestureRecognizer === hoverGesture { return true }
-        touch.type == .direct
+        return touch.type == .direct
     }
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {

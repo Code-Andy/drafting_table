@@ -430,13 +430,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        let wasExporting = pendingDocumentExportURL != nil
         defer {
             if let pendingDocumentExportURL {
                 try? FileManager.default.removeItem(at: pendingDocumentExportURL)
                 self.pendingDocumentExportURL = nil
             }
         }
-        guard controller.documentPickerMode == .open, let url = urls.first else { return }
+        guard !wasExporting, let url = urls.first else { return }
         let accessed = url.startAccessingSecurityScopedResource()
         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
         do {
