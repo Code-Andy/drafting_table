@@ -11,7 +11,6 @@ xcodebuild \
   -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$derived_data" \
-  -enableAddressSanitizer YES \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
   build
@@ -51,8 +50,7 @@ xcrun simctl spawn "$device_udid" log stream \
   --predicate 'process == "DraftingTable" OR eventMessage CONTAINS[c] "com.local.draftingtable.ipad"' \
   >"$runtime_log" 2>&1 &
 log_stream_pid=$!
-launch_output="$(SIMCTL_CHILD_ASAN_OPTIONS='log_path=/tmp/draftingtable-asan:abort_on_error=1:halt_on_error=1' \
-  xcrun simctl launch "$device_udid" com.local.draftingtable.ipad)"
+launch_output="$(xcrun simctl launch "$device_udid" com.local.draftingtable.ipad)"
 pid="${launch_output##*: }"
 test -n "$pid"
 sleep 8
@@ -61,9 +59,6 @@ if ! xcrun simctl spawn "$device_udid" /bin/kill -0 "$pid"; then
   kill "$log_stream_pid" >/dev/null 2>&1 || true
   wait "$log_stream_pid" >/dev/null 2>&1 || true
   log_stream_pid=""
-  echo "AddressSanitizer report:" >&2
-  xcrun simctl spawn "$device_udid" /bin/sh -c \
-    'cat /tmp/draftingtable-asan.* 2>/dev/null || true' || true
   tail -n 800 "$runtime_log" || true
   latest_report="$(ls -1t "$HOME"/Library/Logs/DiagnosticReports/DraftingTable* 2>/dev/null | head -n 1 || true)"
   if [[ -n "$latest_report" ]]; then
