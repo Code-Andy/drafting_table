@@ -416,7 +416,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         touch.type == .direct
     }
 
-    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         // Never change the view transform under an active Pencil stroke; the
         // input samples for one stroke must remain in a single coordinate map.
         activeTouch?.type != .pencil
