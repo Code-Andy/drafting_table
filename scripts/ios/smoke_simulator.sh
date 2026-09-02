@@ -42,6 +42,17 @@ launch_output="$(xcrun simctl launch "$device_udid" com.local.draftingtable.ipad
 pid="${launch_output##*: }"
 test -n "$pid"
 sleep 8
-xcrun simctl spawn "$device_udid" /bin/kill -0 "$pid"
+if ! xcrun simctl spawn "$device_udid" /bin/kill -0 "$pid"; then
+  echo "Drafting Table exited during launch smoke test; recent simulator log follows" >&2
+  xcrun simctl spawn "$device_udid" log show \
+    --last 3m \
+    --style compact \
+    --predicate 'process == "DraftingTable" OR eventMessage CONTAINS[c] "com.local.draftingtable.ipad"' \
+    || true
+  echo "Crash reports:" >&2
+  xcrun simctl spawn "$device_udid" find /Users/mobile/Library/Logs/CrashReporter \
+    -type f -maxdepth 2 -print 2>/dev/null || true
+  exit 1
+fi
 
 echo "Drafting Table simulator launch smoke test passed (pid $pid)"
