@@ -31,10 +31,6 @@ raise SystemExit("No available iPad simulator")
 ')"
 
 cleanup() {
-  if [[ -n "${console_launcher_pid:-}" ]]; then
-    kill "$console_launcher_pid" >/dev/null 2>&1 || true
-    wait "$console_launcher_pid" >/dev/null 2>&1 || true
-  fi
   if [[ -n "${log_stream_pid:-}" ]]; then
     kill "$log_stream_pid" >/dev/null 2>&1 || true
     wait "$log_stream_pid" >/dev/null 2>&1 || true
@@ -42,7 +38,6 @@ cleanup() {
   xcrun simctl terminate "$device_udid" com.local.draftingtable.ipad >/dev/null 2>&1 || true
   xcrun simctl shutdown "$device_udid" >/dev/null 2>&1 || true
   [[ -z "${runtime_log:-}" ]] || rm -f "$runtime_log"
-  [[ -z "${console_log:-}" ]] || rm -f "$console_log"
 }
 trap cleanup EXIT
 
@@ -56,18 +51,19 @@ xcrun simctl spawn "$device_udid" log stream \
   --predicate 'process == "DraftingTable" OR eventMessage CONTAINS[c] "com.local.draftingtable.ipad"' \
   >"$runtime_log" 2>&1 &
 log_stream_pid=$!
-console_log="$(mktemp)"
-xcrun simctl launch --console "$device_udid" com.local.draftingtable.ipad \
-  >"$console_log" 2>&1 &
-console_launcher_pid=$!
+launch_output="$(SIMCTL_CHILD_ASAN_OPTIONS='log_path=/tmp/draftingtable-asan:abort_on_error=1:halt_on_error=1' \
+  xcrun simctl launch "$device_udid" com.local.draftingtable.ipad)"
+pid="${launch_output##*: }"
+test -n "$pid"
 sleep 8
-if ! kill -0 "$console_launcher_pid" >/dev/null 2>&1; then
+if ! xcrun simctl spawn "$device_udid" /bin/kill -0 "$pid"; then
   echo "Drafting Table exited during launch smoke test; recent simulator log follows" >&2
   kill "$log_stream_pid" >/dev/null 2>&1 || true
   wait "$log_stream_pid" >/dev/null 2>&1 || true
   log_stream_pid=""
-  echo "Application stdout/stderr:" >&2
-  tail -n 1200 "$console_log" || true
+  echo "AddressSanitizer report:" >&2
+  xcrun simctl spawn "$device_udid" /bin/sh -c \
+    'cat /tmp/draftingtable-asan.* 2>/dev/null || true' || true
   tail -n 800 "$runtime_log" || true
   latest_report="$(ls -1t "$HOME"/Library/Logs/DiagnosticReports/DraftingTable* 2>/dev/null | head -n 1 || true)"
   if [[ -n "$latest_report" ]]; then
@@ -77,4 +73,4 @@ if ! kill -0 "$console_launcher_pid" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Drafting Table simulator launch smoke test passed"
+echo "Drafting Table simulator launch smoke test passed (pid $pid)"
