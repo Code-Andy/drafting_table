@@ -37,6 +37,8 @@ handoffs belong here.
    — tagged feature notes, CI evidence, IPA checksum, and download links.
 8. [2026-09-02-v0.7-major-feature-batch.md](2026-09-02-v0.7-major-feature-batch.md)
    — broad drawing, document, Pencil, Files, and export implementation jump.
+9. [2026-09-02-v0.7.1-launch-crash-hotfix.md](2026-09-02-v0.7.1-launch-crash-hotfix.md)
+   — beige-screen crash reproduction, renderer/memory hardening, and verified IPA.
 
 ## Other source-of-truth documents
 

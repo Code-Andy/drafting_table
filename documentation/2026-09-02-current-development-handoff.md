@@ -12,7 +12,7 @@ This is the exact resume point as of 2026-09-02 in Toronto.
 - Upstream: <https://github.com/bgkatz/drafting_table>
 - Upstream push URL: disabled as `no_push`
 - Project version in `project.yml`: `0.7.0` build `8`
-- Latest released version: `v0.7.0`
+- Latest released version: `v0.7.1`
 - Documentation baseline: `ad0c5f8`
 
 ## What HEAD contains
@@ -115,6 +115,18 @@ pre-tag SHA-256 is
 - IPA: <https://github.com/Code-Andy/drafting_table/releases/download/v0.7.0/DraftingTable.ipa>
 - SHA-256:
   `5A957E175198B6C34D5612CBC095720C075F768D4326CC3CF59C33646CBC31B0`
+
+## v0.7.1 launch hotfix
+
+The v0.7 beige-screen launch crash was reproduced as allocator corruption and
+`SIGABRT` in a clean simulator. The compact Metal vertex ABI was restored,
+style moved to aligned fragment uniforms, display/geometry allocations were
+bounded, and startup hover/thumbnails were disabled pending safer designs.
+
+- Release: <https://github.com/Code-Andy/drafting_table/releases/tag/v0.7.1>
+- IPA: <https://github.com/Code-Andy/drafting_table/releases/download/v0.7.1/DraftingTable.ipa>
+- SHA-256:
+  `68BD04E62921679789FC19A3F88173270ACDABD5473F7C5406B6288CACDD167F`
 
 ## Known boundaries of the candidate
 

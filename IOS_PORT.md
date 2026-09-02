@@ -95,6 +95,12 @@ The new outline tools are persistent and exportable, but are not yet editable
 vector-layer shapes with snapping/selection. The Files document is a flat DTAR
 archive, not yet the final lazy sparse-tile package.
 
+Version 0.7.1 fixes the v0.7 beige-screen launch abort. It restores the compact
+Metal vertex ABI, moves style to aligned fragment uniforms, bounds display and
+geometry allocations, guards Metal buffer creation, and adds a clean-simulator
+process-survival gate. Automatic thumbnails and the hover layer are temporarily
+disabled while they are redesigned off the synchronous startup/Metal layer path.
+
 ## Implemented architecture
 
 ### Portable C++20
