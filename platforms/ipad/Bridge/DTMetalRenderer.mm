@@ -15,6 +15,8 @@ typedef struct {
     float predicted;
     float opacity;
     float eraser;
+    vector_float4 color;
+    float hardness;
 } DTMetalVertex;
 
 namespace {
@@ -28,6 +30,8 @@ struct DTCanvasTransformState {
     float rotation = 0.0f;
     float translationX = 0.0f;
     float translationY = 0.0f;
+    bool gridVisible = false;
+    float gridSpacing = 32.0f;
 };
 
 static DTCanvasTransformState gCanvasTransform;
@@ -37,6 +41,19 @@ static float finiteOr(float value, float fallback) {
 }
 
 static float clamp01(float value) { return fmaxf(0.0f, fminf(1.0f, value)); }
+
+static vector_float4 graphiteColor() {
+    return (vector_float4){0.075f, 0.080f, 0.082f, 1.0f};
+}
+
+static vector_float4 colorFromRGBA(uint32_t rgba) {
+    return (vector_float4){
+        ((rgba >> 24) & 0xffu) / 255.0f,
+        ((rgba >> 16) & 0xffu) / 255.0f,
+        ((rgba >> 8) & 0xffu) / 255.0f,
+        (rgba & 0xffu) / 255.0f
+    };
+}
 
 static float strokeRadius(float pressure, float brushSize) {
     // brushSize is nominal diameter in points; force provides a smooth,
@@ -50,9 +67,20 @@ static void addTriangle(std::vector<DTMetalVertex>& out,
                         vector_float2 a, vector_float2 b, vector_float2 c,
                         float pressure, float predicted,
                         float opacity, float eraser) {
-    out.push_back({a, pressure, predicted, opacity, eraser});
-    out.push_back({b, pressure, predicted, opacity, eraser});
-    out.push_back({c, pressure, predicted, opacity, eraser});
+    const vector_float4 color = eraser > 0.5f
+        ? (vector_float4){0.965f, 0.945f, 0.900f, 1.0f} : graphiteColor();
+    out.push_back({a, pressure, predicted, opacity, eraser, color, 1.0f});
+    out.push_back({b, pressure, predicted, opacity, eraser, color, 1.0f});
+    out.push_back({c, pressure, predicted, opacity, eraser, color, 1.0f});
+}
+
+static void addTriangleStyled(std::vector<DTMetalVertex>& out,
+                              vector_float2 a, vector_float2 b, vector_float2 c,
+                              float pressure, float predicted, float opacity,
+                              float eraser, vector_float4 color, float hardness) {
+    out.push_back({a, pressure, predicted, opacity, eraser, color, hardness});
+    out.push_back({b, pressure, predicted, opacity, eraser, color, hardness});
+    out.push_back({c, pressure, predicted, opacity, eraser, color, hardness});
 }
 
 static void addRoundCap(std::vector<DTMetalVertex>& out,
@@ -66,6 +94,78 @@ static void addRoundCap(std::vector<DTMetalVertex>& out,
         const vector_float2 p0 = center + (vector_float2){cosf(a0) * radius, sinf(a0) * radius};
         const vector_float2 p1 = center + (vector_float2){cosf(a1) * radius, sinf(a1) * radius};
         addTriangle(out, center, p0, p1, pressure, predicted, opacity, eraser);
+    }
+}
+
+static void addRoundCapStyled(std::vector<DTMetalVertex>& out,
+                              vector_float2 center, float radius,
+                              float pressure, float predicted, float opacity,
+                              float eraser, vector_float4 color, float hardness) {
+    constexpr int kSlices = 16;
+    for (int i = 0; i < kSlices; ++i) {
+        const float a0 = (2.0f * kPi * static_cast<float>(i)) / kSlices;
+        const float a1 = (2.0f * kPi * static_cast<float>(i + 1)) / kSlices;
+        const vector_float2 p0 = center + (vector_float2){cosf(a0) * radius, sinf(a0) * radius};
+        const vector_float2 p1 = center + (vector_float2){cosf(a1) * radius, sinf(a1) * radius};
+        addTriangleStyled(out, center, p0, p1, pressure, predicted, opacity,
+                          eraser, color, hardness);
+    }
+}
+
+static void addSegmentStyled(std::vector<DTMetalVertex>& out,
+                             vector_float2 p0, vector_float2 p1, float radius,
+                             float opacity, float eraser, vector_float4 color,
+                             float hardness, bool caps = true) {
+    const vector_float2 delta = p1 - p0;
+    const float length = simd_length(delta);
+    if (length < 0.001f) return;
+    const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
+    const vector_float2 a0 = p0 + normal * radius;
+    const vector_float2 b0 = p0 - normal * radius;
+    const vector_float2 a1 = p1 + normal * radius;
+    const vector_float2 b1 = p1 - normal * radius;
+    addTriangleStyled(out, a0, b0, a1, 1.0f, 0.0f, opacity, eraser, color, hardness);
+    addTriangleStyled(out, a1, b0, b1, 1.0f, 0.0f, opacity, eraser, color, hardness);
+    if (caps) {
+        addRoundCapStyled(out, p0, radius, 1.0f, 0.0f, opacity, eraser, color, hardness);
+        addRoundCapStyled(out, p1, radius, 1.0f, 0.0f, opacity, eraser, color, hardness);
+    }
+}
+
+static void addShapeOutline(std::vector<DTMetalVertex>& out,
+                            uint32_t tool, vector_float2 first, vector_float2 last,
+                            float radius, float opacity, vector_float4 color,
+                            float hardness) {
+    if (tool == 2u) { // line
+        addSegmentStyled(out, first, last, radius, opacity, 0.0f, color, hardness);
+        return;
+    }
+    if (tool == 3u) { // rectangle
+        const vector_float2 a = first;
+        const vector_float2 b = (vector_float2){last.x, first.y};
+        const vector_float2 c = last;
+        const vector_float2 d = (vector_float2){first.x, last.y};
+        addSegmentStyled(out, a, b, radius, opacity, 0.0f, color, hardness, false);
+        addSegmentStyled(out, b, c, radius, opacity, 0.0f, color, hardness, false);
+        addSegmentStyled(out, c, d, radius, opacity, 0.0f, color, hardness, false);
+        addSegmentStyled(out, d, a, radius, opacity, 0.0f, color, hardness, false);
+        addRoundCapStyled(out, a, radius, 1.0f, 0.0f, opacity, 0.0f, color, hardness);
+        addRoundCapStyled(out, c, radius, 1.0f, 0.0f, opacity, 0.0f, color, hardness);
+        return;
+    }
+    if (tool == 4u) { // ellipse
+        const vector_float2 center = (first + last) * 0.5f;
+        const vector_float2 radii = (vector_float2){
+            fmaxf(0.5f, fabsf(last.x - first.x) * 0.5f),
+            fmaxf(0.5f, fabsf(last.y - first.y) * 0.5f)};
+        constexpr int kSegments = 64;
+        for (int i = 0; i < kSegments; ++i) {
+            const float t0 = (2.0f * kPi * i) / kSegments;
+            const float t1 = (2.0f * kPi * (i + 1)) / kSegments;
+            const vector_float2 p0 = center + (vector_float2){cosf(t0) * radii.x, sinf(t0) * radii.y};
+            const vector_float2 p1 = center + (vector_float2){cosf(t1) * radii.x, sinf(t1) * radii.y};
+            addSegmentStyled(out, p0, p1, radius, opacity, 0.0f, color, hardness, false);
+        }
     }
 }
 
@@ -187,6 +287,15 @@ typedef struct {
     gCanvasTransform.translationY = safeY;
 }
 
+- (void)updateGridVisible:(BOOL)visible spacing:(CGFloat)spacing {
+    const float requestedSpacing = static_cast<float>(spacing);
+    const float safeSpacing = std::isfinite(requestedSpacing)
+        ? std::max(4.0f, std::min(2048.0f, requestedSpacing)) : 32.0f;
+    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
+    gCanvasTransform.gridVisible = visible;
+    gCanvasTransform.gridSpacing = safeSpacing;
+}
+
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
     (void)view; (void)size;
 }
@@ -212,12 +321,16 @@ typedef struct {
     float transformRotation = 0.0f;
     float transformX = 0.0f;
     float transformY = 0.0f;
+    bool gridVisible = false;
+    float gridSpacing = 32.0f;
     {
         std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
         transformScale = gCanvasTransform.scale;
         transformRotation = gCanvasTransform.rotation;
         transformX = gCanvasTransform.translationX;
         transformY = gCanvasTransform.translationY;
+        gridVisible = gCanvasTransform.gridVisible;
+        gridSpacing = gCanvasTransform.gridSpacing;
     }
     DTMetalUniforms uniforms{};
     uniforms.viewportScaleRotation = (vector_float4){
@@ -234,13 +347,50 @@ typedef struct {
     };
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
+    // Draw the optional document-space grid first. Lines are generated in
+    // document coordinates and therefore rotate/scale with the canvas.
+    if (gridVisible) {
+        const float inverseScale = 1.0f / std::max(0.01f, transformScale);
+        const float extentX = static_cast<float>(view.bounds.size.width) * inverseScale + gridSpacing * 2.0f;
+        const float extentY = static_cast<float>(view.bounds.size.height) * inverseScale + gridSpacing * 2.0f;
+        const int maxColumns = 256;
+        const int columns = std::min(maxColumns, static_cast<int>(ceilf(extentX / gridSpacing)) + 1);
+        const int rows = std::min(maxColumns, static_cast<int>(ceilf(extentY / gridSpacing)) + 1);
+        const vector_float4 gridColor = (vector_float4){0.52f, 0.56f, 0.55f, 0.20f};
+        std::vector<DTMetalVertex> grid;
+        grid.reserve(static_cast<size_t>(columns + rows) * 6);
+        const float halfX = columns * gridSpacing;
+        const float halfY = rows * gridSpacing;
+        const float width = std::max(0.35f, 0.75f * inverseScale);
+        for (int i = -columns; i <= columns; ++i) {
+            const float x = static_cast<float>(i) * gridSpacing;
+            addSegmentStyled(grid, (vector_float2){x, -halfY}, (vector_float2){x, halfY},
+                             width, 1.0f, 0.0f, gridColor, 1.0f, false);
+        }
+        for (int i = -rows; i <= rows; ++i) {
+            const float y = static_cast<float>(i) * gridSpacing;
+            addSegmentStyled(grid, (vector_float2){-halfX, y}, (vector_float2){halfX, y},
+                             width, 1.0f, 0.0f, gridColor, 1.0f, false);
+        }
+        if (!grid.empty()) {
+            id<MTLBuffer> gridBuffer = [view.device newBufferWithBytes:grid.data()
+                                                                  length:sizeof(DTMetalVertex) * grid.size()
+                                                                 options:MTLResourceStorageModeShared];
+            [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
+        }
+    }
+
     NSArray<DTRenderStroke *> *strokes = [self.engine renderableStrokes];
     for (DTRenderStroke *stroke in strokes) {
         NSArray<NSValue *> *strokeValues = stroke.points;
         if (strokeValues.count == 0) continue;
-        const BOOL eraser = stroke.tool == DTToolEraser;
+        const uint32_t tool = static_cast<uint32_t>(stroke.tool);
+        const BOOL eraser = tool == 1u;
         const float opacity = clamp01(stroke.brushOpacity);
-        const float brushSize = stroke.brushSize;
+        const float brushSize = std::max(0.5f, static_cast<float>(stroke.brushSize));
+        const float hardness = clamp01(static_cast<float>(stroke.brushHardness));
+        const vector_float4 strokeColor = colorFromRGBA(static_cast<uint32_t>(stroke.brushColorRGBA));
         std::vector<DTSampledPoint> points;
         points.reserve(strokeValues.count);
         for (NSValue *value in strokeValues) {
@@ -250,43 +400,79 @@ typedef struct {
                               clamp01(fmaxf(0.1f, point.pressure)),
                               point.predicted ? 1.0f : 0.0f});
         }
-        points = smoothedPoints(points);
-        std::vector<DTMetalVertex> geometry;
-        geometry.reserve(points.size() * 96);
         const float eraseFlag = eraser ? 1.0f : 0.0f;
-        if (points.size() == 1) {
-            addRoundCap(geometry, points[0].position,
-                        strokeRadius(points[0].pressure, brushSize), points[0].pressure,
-                        points[0].predicted, opacity, eraseFlag);
-        } else {
-            for (size_t index = 1; index < points.size(); ++index) {
-                const DTSampledPoint& p0 = points[index - 1];
-                const DTSampledPoint& p1 = points[index];
-                const vector_float2 delta = p1.position - p0.position;
-                const float length = simd_length(delta);
-                if (length < 0.001f) continue;
-                const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
-                const float r0 = strokeRadius(p0.pressure, brushSize);
-                const float r1 = strokeRadius(p1.pressure, brushSize);
-                const vector_float2 a0 = p0.position + normal * r0;
-                const vector_float2 b0 = p0.position - normal * r0;
-                const vector_float2 a1 = p1.position + normal * r1;
-                const vector_float2 b1 = p1.position - normal * r1;
-                addTriangle(geometry, a0, b0, a1, p0.pressure, p0.predicted, opacity, eraseFlag);
-                addTriangle(geometry, a1, b0, b1, p1.pressure, p1.predicted, opacity, eraseFlag);
+        // Shape tools use first/last real samples, excluding predicted tail
+        // points so a transient prediction never reaches the retained result.
+        if (tool >= 2u && tool <= 4u) {
+            size_t firstReal = 0;
+            while (firstReal + 1 < points.size() && points[firstReal].predicted > 0.5f) ++firstReal;
+            size_t lastReal = points.size() - 1;
+            while (lastReal > firstReal && points[lastReal].predicted > 0.5f) --lastReal;
+            const float radius = fmaxf(0.5f, brushSize * 0.5f);
+            std::vector<DTMetalVertex> geometry;
+            addShapeOutline(geometry, tool, points[firstReal].position, points[lastReal].position,
+                            radius, opacity * (0.22f + 0.78f * hardness), strokeColor, hardness);
+            if (!geometry.empty()) {
+                id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
+                                                                      length:sizeof(DTMetalVertex) * geometry.size()
+                                                                     options:MTLResourceStorageModeShared];
+                [encoder setVertexBuffer:buffer offset:0 atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
             }
-            for (const DTSampledPoint& point : points) {
-                addRoundCap(geometry, point.position,
-                            strokeRadius(point.pressure, brushSize), point.pressure,
-                            point.predicted, opacity, eraseFlag);
-            }
+            continue;
         }
-        if (geometry.empty()) continue;
-        id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
-                                                          length:sizeof(DTMetalVertex) * geometry.size()
-                                                         options:MTLResourceStorageModeShared];
-        [encoder setVertexBuffer:buffer offset:0 atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+
+        points = smoothedPoints(points);
+        const vector_float4 color = eraser
+            ? (vector_float4){0.965f, 0.945f, 0.900f, 1.0f} : strokeColor;
+        // A low-hardness fringe plus a full-opacity core gives the control a
+        // visible effect while retaining the existing smooth curve geometry.
+        const float fringeRadiusScale = 1.08f + 0.24f * (1.0f - hardness);
+        const float fringeOpacity = opacity * (0.12f + 0.30f * (1.0f - hardness));
+        for (int pass = 0; pass < (eraser ? 1 : 2); ++pass) {
+            const bool fringe = pass == 0 && !eraser;
+            const float passScale = fringe ? fringeRadiusScale : 1.0f;
+            const float passOpacity = fringe ? fringeOpacity : opacity;
+            std::vector<DTMetalVertex> geometry;
+            geometry.reserve(points.size() * 96);
+            if (points.size() == 1) {
+                addRoundCapStyled(geometry, points[0].position,
+                                  strokeRadius(points[0].pressure, brushSize) * passScale,
+                                  points[0].pressure, points[0].predicted, passOpacity,
+                                  eraseFlag, color, hardness);
+            } else {
+                for (size_t index = 1; index < points.size(); ++index) {
+                    const DTSampledPoint& p0 = points[index - 1];
+                    const DTSampledPoint& p1 = points[index];
+                    const vector_float2 delta = p1.position - p0.position;
+                    const float length = simd_length(delta);
+                    if (length < 0.001f) continue;
+                    const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
+                    const float r0 = strokeRadius(p0.pressure, brushSize) * passScale;
+                    const float r1 = strokeRadius(p1.pressure, brushSize) * passScale;
+                    const vector_float2 a0 = p0.position + normal * r0;
+                    const vector_float2 b0 = p0.position - normal * r0;
+                    const vector_float2 a1 = p1.position + normal * r1;
+                    const vector_float2 b1 = p1.position - normal * r1;
+                    addTriangleStyled(geometry, a0, b0, a1, p0.pressure, p0.predicted,
+                                      passOpacity, eraseFlag, color, hardness);
+                    addTriangleStyled(geometry, a1, b0, b1, p1.pressure, p1.predicted,
+                                      passOpacity, eraseFlag, color, hardness);
+                }
+                for (const DTSampledPoint& point : points) {
+                    addRoundCapStyled(geometry, point.position,
+                                      strokeRadius(point.pressure, brushSize) * passScale,
+                                      point.pressure, point.predicted, passOpacity,
+                                      eraseFlag, color, hardness);
+                }
+            }
+            if (geometry.empty()) continue;
+            id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
+                                                              length:sizeof(DTMetalVertex) * geometry.size()
+                                                             options:MTLResourceStorageModeShared];
+            [encoder setVertexBuffer:buffer offset:0 atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+        }
     }
     [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];

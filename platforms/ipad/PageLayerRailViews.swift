@@ -7,6 +7,9 @@ final class PagesRailView: UIView {
     var onAdd: (() -> Void)?
     var onRename: ((Int) -> Void)?
     var onDelete: ((Int) -> Void)?
+    var onDuplicate: ((Int) -> Void)?
+    var onMove: ((Int, Int) -> Void)?
+    var thumbnailForPage: ((UInt) -> UIImage?)?
 
     var pageInfos: [DTPageInfo] = [] { didSet { reload() } }
 
@@ -69,10 +72,18 @@ final class PagesRailView: UIView {
         stack.addArrangedSubview(titleLabel("PAGES"))
         let canDelete = pageInfos.count > 1
         for info in pageInfos {
-            let card = PageCardButton(info: info, canDelete: canDelete)
+            let card = PageCardButton(info: info, canDelete: canDelete,
+                                      canMoveUp: info.index > 0,
+                                      canMoveDown: info.index + 1 < UInt(pageInfos.count),
+                                      thumbnail: thumbnailForPage?(info.index))
             card.onSelect = { [weak self] in self?.onSelect?(Int(info.index)) }
             card.onRename = { [weak self] in self?.onRename?(Int(info.index)) }
             card.onDelete = { [weak self] in self?.onDelete?(Int(info.index)) }
+            card.onDuplicate = { [weak self] in self?.onDuplicate?(Int(info.index)) }
+            card.onMove = { [weak self] offset in
+                let destination = Int(info.index) + offset
+                self?.onMove?(Int(info.index), destination)
+            }
             stack.addArrangedSubview(card)
         }
         let add = UIButton(type: .system)
@@ -92,16 +103,25 @@ private final class PageCardButton: UIButton {
     var onSelect: (() -> Void)?
     var onRename: (() -> Void)?
     var onDelete: (() -> Void)?
+    var onDuplicate: (() -> Void)?
+    var onMove: ((Int) -> Void)?
     private let info: DTPageInfo
     private let canDelete: Bool
+    private let canMoveUp: Bool
+    private let canMoveDown: Bool
 
-    init(info: DTPageInfo, canDelete: Bool) {
+    init(info: DTPageInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool, thumbnail: UIImage?) {
         self.info = info
         self.canDelete = canDelete
+        self.canMoveUp = canMoveUp
+        self.canMoveDown = canMoveDown
         super.init(frame: .zero)
         var config = UIButton.Configuration.plain()
         config.title = "\(Int(info.index) + 1)\n\(info.name)"
         config.titleAlignment = .center
+        config.image = thumbnail
+        config.imagePlacement = .top
+        config.imagePadding = 3
         config.baseForegroundColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
         config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 3, bottom: 8, trailing: 3)
         self.configuration = config
@@ -114,6 +134,7 @@ private final class PageCardButton: UIButton {
         heightAnchor.constraint(greaterThanOrEqualToConstant: 64).isActive = true
         accessibilityLabel = "Page \(Int(info.index) + 1), \(info.name)"
         accessibilityValue = info.selected ? "Selected" : "Not selected"
+        accessibilityTraits = info.selected ? [.button, .selected] : [.button]
         addTarget(self, action: #selector(selected), for: .touchUpInside)
         addInteraction(UIContextMenuInteraction(delegate: self))
     }
@@ -127,8 +148,11 @@ private final class PageCardButton: UIButton {
         UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             guard let self else { return UIMenu(title: "", children: []) }
             let rename = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.onRename?() }
+            let duplicate = UIAction(title: "Duplicate", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.onDuplicate?() }
+            let moveUp = UIAction(title: "Move Up", image: UIImage(systemName: "arrow.up"), attributes: self.canMoveUp ? [] : [.disabled]) { [weak self] _ in self?.onMove?(-1) }
+            let moveDown = UIAction(title: "Move Down", image: UIImage(systemName: "arrow.down"), attributes: self.canMoveDown ? [] : [.disabled]) { [weak self] _ in self?.onMove?(1) }
             let delete = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: self.canDelete ? [] : [.disabled]) { [weak self] _ in self?.onDelete?() }
-            return UIMenu(title: self.info.name, children: [rename, delete])
+            return UIMenu(title: self.info.name, children: [rename, duplicate, UIMenu(title: "Move", options: .displayInline, children: [moveUp, moveDown]), delete])
         }
     }
 }
@@ -139,6 +163,8 @@ final class LayersRailView: UIView {
     var onAdd: (() -> Void)?
     var onRename: ((Int) -> Void)?
     var onDelete: ((Int) -> Void)?
+    var onDuplicate: ((Int) -> Void)?
+    var onMove: ((Int, Int) -> Void)?
     var onVisibility: ((Bool, Int) -> Void)?
     var onOpacity: ((CGFloat, Int) -> Void)?
     var onOpacityCommit: ((CGFloat, Int) -> Void)?
@@ -203,10 +229,14 @@ final class LayersRailView: UIView {
         stack.addArrangedSubview(titleLabel("LAYERS"))
         let canDelete = layerInfos.count > 1
         for info in layerInfos {
-            let row = LayerRowView(info: info, canDelete: canDelete)
+            let row = LayerRowView(info: info, canDelete: canDelete,
+                                   canMoveUp: info.index > 0,
+                                   canMoveDown: info.index + 1 < UInt(layerInfos.count))
             row.onSelect = { [weak self] in self?.onSelect?(Int(info.index)) }
             row.onRename = { [weak self] in self?.onRename?(Int(info.index)) }
             row.onDelete = { [weak self] in self?.onDelete?(Int(info.index)) }
+            row.onDuplicate = { [weak self] in self?.onDuplicate?(Int(info.index)) }
+            row.onMove = { [weak self] offset in self?.onMove?(Int(info.index), Int(info.index) + offset) }
             row.onVisibility = { [weak self] visible in self?.onVisibility?(visible, Int(info.index)) }
             row.onOpacity = { [weak self] opacity in self?.onOpacity?(opacity, Int(info.index)) }
             row.onOpacityCommit = { [weak self] opacity in self?.onOpacityCommit?(opacity, Int(info.index)) }
@@ -229,19 +259,25 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     var onSelect: (() -> Void)?
     var onRename: (() -> Void)?
     var onDelete: (() -> Void)?
+    var onDuplicate: (() -> Void)?
+    var onMove: ((Int) -> Void)?
     var onVisibility: ((Bool) -> Void)?
     var onOpacity: ((CGFloat) -> Void)?
     var onOpacityCommit: ((CGFloat) -> Void)?
     private let info: DTLayerInfo
     private let canDelete: Bool
+    private let canMoveUp: Bool
+    private let canMoveDown: Bool
     private let nameLabel = UILabel()
     private let opacityLabel = UILabel()
     private let visibilityButton = UIButton(type: .system)
     private let opacitySlider = UISlider()
 
-    init(info: DTLayerInfo, canDelete: Bool) {
+    init(info: DTLayerInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool) {
         self.info = info
         self.canDelete = canDelete
+        self.canMoveUp = canMoveUp
+        self.canMoveDown = canMoveDown
         super.init(frame: .zero)
         backgroundColor = info.selected ? UIColor.systemBlue.withAlphaComponent(0.12) : .clear
         layer.cornerRadius = 7
@@ -303,6 +339,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
         addInteraction(UIContextMenuInteraction(delegate: self))
         accessibilityLabel = "Layer \(info.name)"
         accessibilityValue = "\(info.visible ? "Visible" : "Hidden"), \(opacityLabel.text ?? "")"
+        accessibilityTraits = info.selected ? [.button, .selected] : [.button]
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -313,8 +350,11 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
         UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             guard let self else { return UIMenu(title: "", children: []) }
             let rename = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.onRename?() }
+            let duplicate = UIAction(title: "Duplicate", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.onDuplicate?() }
+            let moveUp = UIAction(title: "Move Up", image: UIImage(systemName: "arrow.up"), attributes: self.canMoveUp ? [] : [.disabled]) { [weak self] _ in self?.onMove?(-1) }
+            let moveDown = UIAction(title: "Move Down", image: UIImage(systemName: "arrow.down"), attributes: self.canMoveDown ? [] : [.disabled]) { [weak self] _ in self?.onMove?(1) }
             let delete = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: self.canDelete ? [] : [.disabled]) { [weak self] _ in self?.onDelete?() }
-            return UIMenu(title: self.info.name, children: [rename, delete])
+            return UIMenu(title: self.info.name, children: [rename, duplicate, UIMenu(title: "Move", options: .displayInline, children: [moveUp, moveDown]), delete])
         }
     }
 }

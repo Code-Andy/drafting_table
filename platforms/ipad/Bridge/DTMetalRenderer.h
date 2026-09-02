@@ -20,6 +20,10 @@ NS_ASSUME_NONNULL_BEGIN
              translationX:(CGFloat)x
              translationY:(CGFloat)y;
 
+/// Enables the document-space square grid. Spacing is expressed in document
+/// points and is clamped by the renderer to a practical positive range.
+- (void)updateGridVisible:(BOOL)visible spacing:(CGFloat)spacing;
+
 @property(nonatomic, readonly) NSUInteger frameCount;
 
 @end

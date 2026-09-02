@@ -7,6 +7,8 @@ struct DTMetalVertex {
     float predicted;
     float opacity;
     float eraser;
+    float4 color;
+    float hardness;
 };
 
 struct DTVertexOut {
@@ -14,6 +16,8 @@ struct DTVertexOut {
     float predicted;
     float opacity;
     float eraser;
+    float4 color;
+    float hardness;
 };
 
 // Must remain layout-compatible with DTMetalUniforms in DTMetalRenderer.mm:
@@ -40,7 +44,8 @@ vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
     float2 clip = float2((transformed.x / safeViewport.x) * 2.0 - 1.0,
                          1.0 - (transformed.y / safeViewport.y) * 2.0);
     return {float4(clip, 0.0, 1.0), input.predicted,
-            saturate(input.opacity), input.eraser};
+            saturate(input.opacity), input.eraser, input.color,
+            saturate(input.hardness)};
 }
 
 fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
@@ -49,11 +54,13 @@ fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
     // prediction overlapping real ink never brightens it.
     const float prediction = mix(1.0, 0.30, saturate(in.predicted));
     float alpha = saturate(in.opacity) * prediction;
-    const float3 graphite = float3(0.075, 0.080, 0.082);
     // The immediate eraser replays warm-paper color in retained stroke order.
-    // Its alpha follows brush opacity, giving a soft eraser edge; a future
-    // tile destination-out pass can replace this without changing geometry.
-    const float3 paper = float3(0.965, 0.945, 0.900);
-    const float3 color = mix(graphite, paper, step(0.5, in.eraser));
-    return float4(color * alpha, alpha);
+    // Brush color is supplied as straight RGBA and is premultiplied here.
+    // Hardness controls the edge contribution of the fringe pass; the core
+    // remains opaque while a softer brush retains a visible feather.
+    float edge = mix(0.72, 1.0, saturate(in.hardness));
+    alpha *= edge;
+    float4 color = in.color;
+    color.a *= alpha;
+    return float4(color.rgb * color.a, color.a);
 }

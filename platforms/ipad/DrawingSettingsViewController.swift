@@ -6,17 +6,28 @@ final class DrawingSettingsViewController: UIViewController {
     static let activationKey = "draftingTable.penActivationPressure"
     static let brushSizeKey = "draftingTable.brushSize"
     static let brushOpacityKey = "draftingTable.brushOpacity"
+    static let brushHardnessKey = "draftingTable.brushHardness"
+    static let brushColorKey = "draftingTable.brushColorRGBA"
+    static let gridKey = "draftingTable.gridVisible"
+    static let defaultBrushColorRGBA: UInt32 = 0x1B1712FF
 
     var onActivationChanged: ((CGFloat) -> Void)?
     var onBrushSizeChanged: ((CGFloat) -> Void)?
     var onBrushOpacityChanged: ((CGFloat) -> Void)?
+    var onBrushHardnessChanged: ((CGFloat) -> Void)?
+    var onBrushColorChanged: ((UInt32) -> Void)?
+    var onGridChanged: ((Bool) -> Void)?
 
     private let activationSlider = UISlider()
     private let sizeSlider = UISlider()
     private let opacitySlider = UISlider()
+    private let hardnessSlider = UISlider()
+    private let colorWell = UIColorWell()
+    private let gridSwitch = UISwitch()
     private let activationValue = UILabel()
     private let sizeValue = UILabel()
     private let opacityValue = UILabel()
+    private let hardnessValue = UILabel()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -34,6 +45,8 @@ final class DrawingSettingsViewController: UIViewController {
         let activation = min(max(storedFloat(defaults, key: Self.activationKey, fallback: 3), 0), 20)
         let size = min(max(storedFloat(defaults, key: Self.brushSizeKey, fallback: 8), 1), 40)
         let opacity = min(max(storedFloat(defaults, key: Self.brushOpacityKey, fallback: 100), 5), 100)
+        let hardness = min(max(storedFloat(defaults, key: Self.brushHardnessKey, fallback: 80), 0), 100)
+        let colorRGBA = defaults.object(forKey: Self.brushColorKey) == nil ? Self.defaultBrushColorRGBA : UInt32(defaults.integer(forKey: Self.brushColorKey))
 
         configureSlider(activationSlider, min: 0, max: 20, value: activation,
                         label: "Pen activation", hint: "Higher values ignore lighter contact and screen-protector noise.",
@@ -44,6 +57,16 @@ final class DrawingSettingsViewController: UIViewController {
         configureSlider(opacitySlider, min: 5, max: 100, value: opacity,
                         label: "Brush opacity", hint: "Opacity of new brush strokes.",
                         action: #selector(opacityChanged(_:)))
+        configureSlider(hardnessSlider, min: 0, max: 100, value: hardness,
+                        label: "Brush hardness", hint: "Controls edge softness for new brush strokes.",
+                        action: #selector(hardnessChanged(_:)))
+        colorWell.selectedColor = Self.uiColor(from: colorRGBA)
+        colorWell.supportsAlpha = true
+        colorWell.accessibilityLabel = "Brush color"
+        colorWell.addTarget(self, action: #selector(colorChanged(_:)), for: .valueChanged)
+        gridSwitch.isOn = defaults.bool(forKey: Self.gridKey)
+        gridSwitch.accessibilityLabel = "Show grid"
+        gridSwitch.addTarget(self, action: #selector(gridChanged(_:)), for: .valueChanged)
         updateLabels()
 
         let stack = UIStackView(arrangedSubviews: [
@@ -51,6 +74,9 @@ final class DrawingSettingsViewController: UIViewController {
             settingRow(title: "Pen activation", detail: "Start drawing only after this pressure threshold.", slider: activationSlider, value: activationValue),
             settingRow(title: "Brush size", detail: "Set the diameter of new brush strokes.", slider: sizeSlider, value: sizeValue),
             settingRow(title: "Brush opacity", detail: "Set the opacity of new brush strokes.", slider: opacitySlider, value: opacityValue),
+            settingRow(title: "Brush hardness", detail: "Soft edges blend more naturally; hard edges stay crisp.", slider: hardnessSlider, value: hardnessValue),
+            colorRow(),
+            switchRow(title: "Grid", detail: "Show a drafting grid over the page.", control: gridSwitch),
             infoLabel()
         ])
         stack.axis = .vertical
@@ -154,12 +180,71 @@ final class DrawingSettingsViewController: UIViewController {
         onBrushOpacityChanged?(CGFloat(value / 100))
     }
 
+    @objc private func hardnessChanged(_ sender: UISlider) {
+        let value = min(max(sender.value, 0), 100)
+        sender.value = value
+        UserDefaults.standard.set(value, forKey: Self.brushHardnessKey)
+        updateLabels()
+        onBrushHardnessChanged?(CGFloat(value / 100))
+    }
+
+    @objc private func colorChanged(_ sender: UIColorWell) {
+        let packed = Self.rgba(from: sender.selectedColor ?? Self.uiColor(from: Self.defaultBrushColorRGBA))
+        UserDefaults.standard.set(Int(packed), forKey: Self.brushColorKey)
+        onBrushColorChanged?(packed)
+    }
+
+    @objc private func gridChanged(_ sender: UISwitch) {
+        UserDefaults.standard.set(sender.isOn, forKey: Self.gridKey)
+        onGridChanged?(sender.isOn)
+    }
+
     private func updateLabels() {
         activationValue.text = String(format: "%.0f%%", activationSlider.value)
         sizeValue.text = String(format: "%.0f pt", sizeSlider.value)
         opacityValue.text = String(format: "%.0f%%", opacitySlider.value)
+        hardnessValue.text = String(format: "%.0f%%", hardnessSlider.value)
         activationSlider.accessibilityValue = activationValue.text
         sizeSlider.accessibilityValue = sizeValue.text
         opacitySlider.accessibilityValue = opacityValue.text
+        hardnessSlider.accessibilityValue = hardnessValue.text
+    }
+
+    private func colorRow() -> UIView {
+        let label = UILabel()
+        label.text = "Brush color"
+        label.font = .systemFont(ofSize: 17, weight: .semibold)
+        label.textColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
+        let detail = UILabel()
+        detail.text = "Color used for new brush and shape strokes."
+        detail.font = .systemFont(ofSize: 13)
+        detail.textColor = .secondaryLabel
+        detail.numberOfLines = 0
+        let row = UIStackView(arrangedSubviews: [label, detail, colorWell])
+        row.axis = .vertical; row.spacing = 5
+        return row
+    }
+
+    private func switchRow(title: String, detail: String, control: UISwitch) -> UIView {
+        let titleLabel = UILabel(); titleLabel.text = title; titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.textColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
+        let header = UIStackView(arrangedSubviews: [titleLabel, UIView(), control]); header.axis = .horizontal; header.alignment = .center
+        let detailLabel = UILabel(); detailLabel.text = detail; detailLabel.font = .systemFont(ofSize: 13); detailLabel.textColor = .secondaryLabel; detailLabel.numberOfLines = 0
+        let row = UIStackView(arrangedSubviews: [header, detailLabel]); row.axis = .vertical; row.spacing = 5
+        return row
+    }
+
+    static func uiColor(from packed: UInt32) -> UIColor {
+        UIColor(red: CGFloat((packed >> 24) & 0xff) / 255,
+                green: CGFloat((packed >> 16) & 0xff) / 255,
+                blue: CGFloat((packed >> 8) & 0xff) / 255,
+                alpha: CGFloat(packed & 0xff) / 255)
+    }
+
+    static func rgba(from color: UIColor) -> UInt32 {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return (UInt32(r * 255 + 0.5) << 24) | (UInt32(g * 255 + 0.5) << 16) |
+            (UInt32(b * 255 + 0.5) << 8) | UInt32(a * 255 + 0.5)
     }
 }

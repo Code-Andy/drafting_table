@@ -39,7 +39,7 @@ final class StrokePersistenceStore {
     func quarantineCorruptArchive() {
         guard fileManager.fileExists(atPath: fileURL.path) else { return }
         let quarantine = fileURL.deletingPathExtension()
-            .appendingPathExtension("corrupt-(Int(Date().timeIntervalSince1970)).archive")
+            .appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970)).archive")
         try? fileManager.moveItem(at: fileURL, to: quarantine)
     }
 }

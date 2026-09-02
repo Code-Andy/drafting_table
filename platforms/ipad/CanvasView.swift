@@ -1,5 +1,6 @@
 import MetalKit
 import UIKit
+import QuartzCore
 
 /// MTKView input surface for Apple Pencil. UIKit owns gesture recognition and
 /// event prediction; DTEngineBridge owns the thread-safe document samples.
@@ -19,6 +20,23 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     /// cancelled, or otherwise finalized. This intentionally is not called
     /// for every Pencil sample so autosave remains inexpensive.
     var onDocumentChanged: (() -> Void)?
+
+    /// Called when a Pencil gesture changes the active drawing tool.
+    /// The controller can use this to refresh its tool rail and persist the
+    /// preference without polling the bridge.
+    var onToolChanged: (() -> Void)?
+
+    /// Whether the renderer should draw a drafting grid. This state is kept
+    /// here so callers can choose whether/how to persist it in their own
+    /// settings model. The renderer call is dynamic for compatibility with
+    /// older renderer binaries that simply ignore the optional grid feature.
+    var gridVisible: Bool = false {
+        didSet {
+            guard oldValue != gridVisible else { return }
+            updateGridRenderer()
+            setNeedsDisplay()
+        }
+    }
 
     /// Minimum normalized Apple Pencil force needed to put the pen down. A
     /// small amount of hysteresis is used on lift-off so force estimates that
@@ -43,6 +61,16 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     private var lastDiagnosticFrame: UInt = 0
     private var nextSampleID: UInt64 = 1
     private var lastPencilAction = "none"
+    private var squeezeToggleConsumed = false
+    private var hoverActive = false
+    private var hoverPoint: CGPoint = .zero
+    private let hoverPreviewLayer = CAShapeLayer()
+
+    private lazy var hoverGesture: UIHoverGestureRecognizer = {
+        let gesture = UIHoverGestureRecognizer(target: self, action: #selector(handlePencilHover(_:)))
+        gesture.delegate = self
+        return gesture
+    }()
 
     private lazy var panGesture: UIPanGestureRecognizer = {
         let gesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
@@ -97,10 +125,20 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
+        // UIHoverGestureRecognizer receives Pencil hover on iPadOS 16+ and is
+        // harmless on devices without hover support. It does not feed the
+        // touch/sample path, so preview updates can never create strokes.
+        addGestureRecognizer(hoverGesture)
+        hoverPreviewLayer.fillColor = UIColor.clear.cgColor
+        hoverPreviewLayer.lineWidth = 1.5
+        hoverPreviewLayer.zPosition = 1000
+        hoverPreviewLayer.isHidden = true
+        layer.addSublayer(hoverPreviewLayer)
         addGestureRecognizer(panGesture)
         addGestureRecognizer(pinchGesture)
         addGestureRecognizer(rotationGesture)
         restoreViewTransform()
+        updateGridRenderer()
     }
 
     override func didMoveToWindow() {
@@ -117,6 +155,79 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     }
 
     deinit { displayLink?.invalidate() }
+
+    private func updateGridRenderer() {
+        // Renderer and Swift shell ship as one app binary, so call the typed
+        // bridge directly. Objective-C perform(_:with:with:) cannot safely
+        // marshal scalar BOOL/CGFloat parameters.
+        renderer?.updateGridVisible(gridVisible, spacing: 32)
+    }
+
+    private var activeToolName: String {
+        switch engineBridge.tool {
+        case .eraser: return "eraser"
+        case .line: return "line"
+        case .rectangle: return "rectangle"
+        case .ellipse: return "ellipse"
+        default: return "brush"
+        }
+    }
+
+    private func togglePencilTool(source: String) {
+        // The bridge currently exposes Brush/Eraser. If shape tools are added
+        // later, any non-Brush/Eraser value intentionally falls back to Brush
+        // on the first Pencil toggle.
+        switch engineBridge.tool {
+        case .brush: engineBridge.tool = .eraser
+        case .eraser: engineBridge.tool = .brush
+        default: engineBridge.tool = .brush
+        }
+        lastPencilAction = "\(source) → \(activeToolName)"
+        onToolChanged?()
+        setNeedsDisplay()
+    }
+
+    private func updateHoverPreview(at point: CGPoint) {
+        guard bounds.contains(point), window != nil else {
+            hoverActive = false
+            hoverPreviewLayer.isHidden = true
+            return
+        }
+        hoverActive = true
+        hoverPoint = point
+        // brushSize is a document-space diameter; scale it into view points.
+        // Keep the preview legible at extreme zoom levels without allowing a
+        // huge circle to cover the whole canvas.
+        let diameter = min(max(engineBridge.brushSize * canvasScale, 3), 160)
+        hoverPreviewLayer.path = UIBezierPath(ovalIn: CGRect(x: point.x - diameter * 0.5,
+                                                              y: point.y - diameter * 0.5,
+                                                              width: diameter,
+                                                              height: diameter)).cgPath
+        hoverPreviewLayer.strokeColor = engineBridge.tool == .eraser
+            ? UIColor.systemRed.withAlphaComponent(0.75).cgColor
+            : UIColor.black.withAlphaComponent(0.65).cgColor
+        hoverPreviewLayer.lineDashPattern = engineBridge.tool == .eraser
+            ? [NSNumber(value: 4), NSNumber(value: 3)]
+            : nil
+        hoverPreviewLayer.isHidden = strokeEngaged
+    }
+
+    private func hideHoverPreview() {
+        hoverActive = false
+        hoverPreviewLayer.isHidden = true
+    }
+
+    @objc private func handlePencilHover(_ gesture: UIHoverGestureRecognizer) {
+        switch gesture.state {
+        case .began, .changed:
+            guard !strokeEngaged else { return }
+            updateHoverPreview(at: gesture.location(in: self))
+        case .ended, .cancelled, .failed:
+            hideHoverPreview()
+        default:
+            break
+        }
+    }
 
     private func accepts(_ touch: UITouch) -> Bool {
         touch.type == .pencil ||
@@ -202,6 +313,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
             return
         }
         strokeEngaged = true
+        hideHoverPreview()
         engineBridge.beginStroke()
         onDrawingBegan?()
         appendBatch(for: touch,
@@ -229,6 +341,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                 }
             } else if normalizedForce(of: latest) >= activationPressure {
                 strokeEngaged = true
+                hideHoverPreview()
                 engineBridge.beginStroke()
                 onDrawingBegan?()
                 appendBatch(for: activeTouch,
@@ -255,6 +368,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
         strokeEngaged = false
         self.activeTouch = nil
+        hideHoverPreview()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -265,6 +379,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
         strokeEngaged = false
         activeTouch = nil
+        hideHoverPreview()
     }
 
     // MARK: - Canvas transform and gestures
@@ -413,6 +528,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldReceive touch: UITouch) -> Bool {
         // Pencil input remains exclusively owned by the sample path.
+        if gestureRecognizer === hoverGesture { return true }
         touch.type == .direct
     }
 
@@ -433,6 +549,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         for touch in touches where touch.type == .pencil {
             if !strokeEngaged && normalizedForce(of: touch) >= activationPressure {
                 strokeEngaged = true
+                hideHoverPreview()
                 engineBridge.beginStroke()
                 onDrawingBegan?()
                 appendBatch(for: touch,
@@ -449,12 +566,31 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
     func pencilInteraction(_ interaction: UIPencilInteraction,
                            didReceiveTap tap: UIPencilInteraction.Tap) {
-        lastPencilAction = "double tap"
+        // UIPencilInteraction delivers this callback for the system-configured
+        // Pencil tap action (the default is a double tap). Shape tools are not
+        // exposed by the current bridge, so any future non Brush/Eraser value
+        // naturally falls back to Brush on the first toggle.
+        togglePencilTool(source: "double tap")
     }
 
     func pencilInteraction(_ interaction: UIPencilInteraction,
                            didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         lastPencilAction = "squeeze \(squeeze.phase)"
+        // Squeeze emits phase updates while the user holds the Pencil. Toggle
+        // only once at the terminal phase so the tool cannot flap repeatedly.
+        switch squeeze.phase {
+        case .began:
+            squeezeToggleConsumed = false
+        case .ended:
+            if !squeezeToggleConsumed {
+                squeezeToggleConsumed = true
+                togglePencilTool(source: "squeeze")
+            }
+        case .cancelled:
+            squeezeToggleConsumed = false
+        default:
+            break
+        }
     }
 
     @objc private func displayTick() {
@@ -467,11 +603,14 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         lastDiagnosticTime = now
         lastDiagnosticFrame = frames
         let state = activeTouch == nil ? "idle" : "pencil input"
-        onDiagnostics?(String(format: "Metal  %.0f fps\nStrokes  %lu   Samples  %lu\nState  %@\nPencil  %@",
+        let hover = hoverActive ? String(format: "yes (%.0f, %.0f)", hoverPoint.x, hoverPoint.y) : "no"
+        onDiagnostics?(String(format: "Metal  %.0f fps\nStrokes  %lu   Samples  %lu\nState  %@\nTool  %@\nHover  %@\nPencil  %@",
                              fps,
                              engineBridge.strokeCount,
                              engineBridge.sampleCount,
                              state,
+                             activeToolName,
+                             hover,
                              lastPencilAction))
     }
 }
