@@ -61,6 +61,24 @@ snapping, selections, and vector tools:
 - the view transform persists in UserDefaults and can be reset from the
   navigation bar.
 
+Version 0.6 replaces the placeholder rails with a retained multi-page,
+multi-layer document session:
+
+- dynamic selectable page cards and layer rows;
+- add, rename, and guarded delete actions for pages and layers;
+- active-page/active-layer drawing ownership;
+- per-layer visibility and opacity;
+- per-layer Undo/Redo and Clear Layer behavior;
+- active-page rendering that flattens visible layers bottom-up;
+- `DTAR` archive v2 with page/layer names, active indices, visibility, opacity,
+  styles, and samples;
+- migration of v1 flat-stroke archives into `Page 1 / Ink`;
+- real v1/v2 round-trip and malformed-data tests.
+
+These are retained stroke pages/layers. They are the interaction and archive
+model needed by later milestones, not yet Files document packages backed by
+sparse raster/vector tiles.
+
 ## Implemented architecture
 
 ### Portable C++20
@@ -87,6 +105,7 @@ snapping, selections, and vector tools:
 - Persistent Pencil activation threshold with lift-off hysteresis
 - Brush/Eraser selection, retained stroke styles, Undo/Redo, and autosave
 - Document/view transform with two-finger pan, pinch, rotation, and Reset View
+- Dynamic retained pages/layers with visibility, opacity, and archive v2
 - Thin Objective-C++ ownership bridge
 - Diagnostics overlay
 - XcodeGen project generation

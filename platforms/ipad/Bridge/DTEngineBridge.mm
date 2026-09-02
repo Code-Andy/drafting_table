@@ -34,6 +34,20 @@ using drafting_table::PencilSample;
 - (CGFloat)brushOpacity { return _brushOpacity; }
 @end
 
+@implementation DTPageInfo {
+    NSUInteger _index; NSString *_name; BOOL _selected;
+}
+- (instancetype)initWithIndex:(NSUInteger)index name:(NSString *)name selected:(BOOL)selected { if ((self=[super init])) { _index=index; _name=[name copy]; _selected=selected; } return self; }
+- (NSUInteger)index{return _index;} - (NSString *)name{return _name;} - (BOOL)selected{return _selected;}
+@end
+
+@implementation DTLayerInfo {
+    NSUInteger _index; NSString *_name; BOOL _selected; BOOL _visible; CGFloat _opacity;
+}
+- (instancetype)initWithIndex:(NSUInteger)index name:(NSString *)name selected:(BOOL)selected visible:(BOOL)visible opacity:(CGFloat)opacity { if ((self=[super init])) { _index=index; _name=[name copy]; _selected=selected; _visible=visible; _opacity=opacity; } return self; }
+- (NSUInteger)index{return _index;} - (NSString *)name{return _name;} - (BOOL)selected{return _selected;} - (BOOL)visible{return _visible;} - (CGFloat)opacity{return _opacity;}
+@end
+
 namespace {
 PencilSample toCoreSample(const DTPencilSample& input) {
     PencilSample sample;
@@ -78,6 +92,14 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 - (void)setBrushOpacity:(CGFloat)opacity { if (_engine) _engine->setBrushOpacity((float)opacity); }
 - (BOOL)canUndo { return _engine && _engine->canUndo(); }
 - (BOOL)canRedo { return _engine && _engine->canRedo(); }
+- (NSArray<DTPageInfo *> *)pageInfos {
+    if (!_engine) return @[]; auto names=_engine->pageNames(); NSUInteger selected=_engine->activePageIndex(); NSMutableArray *r=[NSMutableArray arrayWithCapacity:names.size()];
+    for (NSUInteger i=0;i<names.size();++i) [r addObject:[[DTPageInfo alloc] initWithIndex:i name:[NSString stringWithUTF8String:names[i].c_str()] ?: @"" selected:i==selected]]; return r;
+}
+- (NSArray<DTLayerInfo *> *)layerInfos {
+    if (!_engine) return @[]; auto names=_engine->layerNames(); NSUInteger selected=_engine->activeLayerIndex(); NSMutableArray *r=[NSMutableArray arrayWithCapacity:names.size()];
+    for (NSUInteger i=0;i<names.size();++i) [r addObject:[[DTLayerInfo alloc] initWithIndex:i name:[NSString stringWithUTF8String:names[i].c_str()] ?: @"" selected:i==selected visible:_engine->layerVisible(i) opacity:_engine->layerOpacity(i)]]; return r;
+}
 
 - (void)beginStroke { if (_engine) _engine->beginStroke(); }
 
@@ -106,6 +128,24 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 - (void)clearCanvas { if (_engine) _engine->clear(); }
 - (BOOL)undoLastStroke { return _engine && _engine->undoLastStroke(); }
 - (BOOL)redoLastStroke { return _engine && _engine->redoLastStroke(); }
+- (BOOL)addPageWithName:(NSString *)name { return _engine && _engine->addPage(name.UTF8String ? std::string(name.UTF8String) : std::string()); }
+- (BOOL)selectPageAtIndex:(NSUInteger)index { return _engine && _engine->selectPage(index); }
+- (BOOL)renamePageAtIndex:(NSUInteger)index toName:(NSString *)name { return _engine && name && _engine->renamePage(index, std::string(name.UTF8String ?: "")); }
+- (BOOL)addLayerWithName:(NSString *)name { return _engine && _engine->addLayer(name.UTF8String ? std::string(name.UTF8String) : std::string()); }
+- (BOOL)selectLayerAtIndex:(NSUInteger)index { return _engine && _engine->selectLayer(index); }
+- (BOOL)renameLayerAtIndex:(NSUInteger)index toName:(NSString *)name { return _engine && name && _engine->renameLayer(index, std::string(name.UTF8String ?: "")); }
+- (BOOL)setActiveLayerVisible:(BOOL)visible { return _engine && _engine->setActiveLayerVisible(visible); }
+- (BOOL)setActiveLayerOpacity:(CGFloat)opacity { return _engine && _engine->setActiveLayerOpacity((float)opacity); }
+- (NSUInteger)addPage { if (!_engine) return NSNotFound; const auto before=_engine->pageCount(); if (!_engine->addPage()) return NSNotFound; return before; }
+- (BOOL)setActivePageIndex:(NSUInteger)index { return _engine && _engine->selectPage(index); }
+- (BOOL)deletePageAtIndex:(NSUInteger)index { return _engine && _engine->deletePage(index); }
+- (BOOL)renamePageAtIndex:(NSUInteger)index name:(NSString *)name { return _engine && name && _engine->renamePage(index, std::string(name.UTF8String ?: "")); }
+- (NSUInteger)addLayer { if (!_engine) return NSNotFound; const auto before=_engine->layerNames().size(); if (!_engine->addLayer()) return NSNotFound; return before; }
+- (BOOL)setActiveLayerIndex:(NSUInteger)index { return _engine && _engine->selectLayer(index); }
+- (BOOL)deleteLayerAtIndex:(NSUInteger)index { return _engine && _engine->deleteLayer(index); }
+- (BOOL)renameLayerAtIndex:(NSUInteger)index name:(NSString *)name { return _engine && name && _engine->renameLayer(index, std::string(name.UTF8String ?: "")); }
+- (BOOL)setLayerVisible:(BOOL)visible atIndex:(NSUInteger)index { return _engine && _engine->setLayerVisible(index, visible); }
+- (BOOL)setLayerOpacity:(CGFloat)opacity atIndex:(NSUInteger)index { return _engine && _engine->setLayerOpacity(index, (float)opacity); }
 
 - (NSData *)archiveData {
     if (!_engine) return [NSData data];

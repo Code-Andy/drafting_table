@@ -73,7 +73,7 @@ final class DraftingTableViewController: UIViewController {
             target: self,
             action: #selector(resetCanvasView)
         )
-        applyStoredSettings(); restoreDocument(); refreshRails(); updateToolSelection(); updateUndoRedoState()
+        restoreDocument(); applyStoredSettings(); refreshRails(); updateToolSelection(); updateUndoRedoState()
     }
 
     /// Called by the scene delegate before suspension as a final autosave.
@@ -81,9 +81,9 @@ final class DraftingTableViewController: UIViewController {
         do { try persistence.save(canvas.engineBridge.archiveData()) } catch { /* retry on next mutation */ }
     }
 
-    private func documentDidChange(refreshRails: Bool = true) {
+    private func documentDidChange() {
         saveDocument(); emptyState.isHidden = canvas.engineBridge.strokeCount > 0
-        if refreshRails { refreshRails() }
+        refreshRails()
         updateUndoRedoState(); canvas.setNeedsDisplay()
     }
 
@@ -139,7 +139,7 @@ final class DraftingTableViewController: UIViewController {
     private func configurePagesRail() {
         pagesRail.onSelect = { [weak self] index in
             guard let self else { return }
-            self.canvas.engineBridge.setActivePageIndex(index)
+            self.canvas.engineBridge.setActivePageIndex(UInt(index))
             self.documentDidChange()
         }
         pagesRail.onAdd = { [weak self] in self?.addPage() }
@@ -150,7 +150,7 @@ final class DraftingTableViewController: UIViewController {
     private func configureLayersRail() {
         layersRail.onSelect = { [weak self] index in
             guard let self else { return }
-            self.canvas.engineBridge.setActiveLayerIndex(index)
+            self.canvas.engineBridge.setActiveLayerIndex(UInt(index))
             self.documentDidChange()
         }
         layersRail.onAdd = { [weak self] in self?.addLayer() }
@@ -158,16 +158,18 @@ final class DraftingTableViewController: UIViewController {
         layersRail.onDelete = { [weak self] index in self?.deleteLayer(at: index) }
         layersRail.onVisibility = { [weak self] visible, index in
             guard let self else { return }
-            self.canvas.engineBridge.setLayerVisible(visible, at: index)
+            self.canvas.engineBridge.setLayerVisible(visible, at: UInt(index))
             self.documentDidChange()
         }
         layersRail.onOpacity = { [weak self] opacity, index in
             guard let self else { return }
-            self.canvas.engineBridge.setLayerOpacity(opacity, at: index)
-            // Keep the slider alive while it is being dragged; the row updates
-            // its percentage label locally. A later mutation refreshes all
-            // metadata from the bridge.
-            self.documentDidChange(refreshRails: false)
+            self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
+            self.canvas.setNeedsDisplay()
+        }
+        layersRail.onOpacityCommit = { [weak self] opacity, index in
+            guard let self else { return }
+            self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
+            self.documentDidChange()
         }
     }
 
@@ -183,7 +185,7 @@ final class DraftingTableViewController: UIViewController {
 
     private func deletePage(at index: Int) {
         guard canvas.engineBridge.pageInfos.count > 1 else { return }
-        canvas.engineBridge.deletePage(at: index)
+        canvas.engineBridge.deletePage(at: UInt(index))
         documentDidChange()
     }
 
@@ -199,7 +201,7 @@ final class DraftingTableViewController: UIViewController {
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self, weak alert] _ in
             guard let self, let name = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return }
-            self.canvas.engineBridge.renamePage(at: index, name: name)
+            self.canvas.engineBridge.renamePage(at: UInt(index), name: name)
             self.documentDidChange()
         })
         present(alert, animated: true)
@@ -212,7 +214,7 @@ final class DraftingTableViewController: UIViewController {
 
     private func deleteLayer(at index: Int) {
         guard canvas.engineBridge.layerInfos.count > 1 else { return }
-        canvas.engineBridge.deleteLayer(at: index)
+        canvas.engineBridge.deleteLayer(at: UInt(index))
         documentDidChange()
     }
 
@@ -228,7 +230,7 @@ final class DraftingTableViewController: UIViewController {
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self, weak alert] _ in
             guard let self, let name = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return }
-            self.canvas.engineBridge.renameLayer(at: index, name: name)
+            self.canvas.engineBridge.renameLayer(at: UInt(index), name: name)
             self.documentDidChange()
         })
         present(alert, animated: true)
@@ -236,7 +238,7 @@ final class DraftingTableViewController: UIViewController {
 
     private func configureToolRail() {
         styleRail(toolRail); let stack = UIStackView(); stack.axis = .horizontal; stack.alignment = .fill; stack.distribution = .fillEqually; stack.spacing = 7; stack.translatesAutoresizingMaskIntoConstraints = false
-        brushButton = toolButton(title: "✎  Brush", action: #selector(selectBrush)); eraserButton = toolButton(title: "⌫  Eraser", action: #selector(selectEraser)); undoButton = toolButton(title: "↶  Undo", action: #selector(undoCanvas)); redoButton = toolButton(title: "↷  Redo", action: #selector(redoCanvas)); clearButton = toolButton(title: "⌫  Clear", action: #selector(clearCanvas)); settingsButton = toolButton(title: "⚙  Settings", action: #selector(openSettings))
+        brushButton = toolButton(title: "✎  Brush", action: #selector(selectBrush)); eraserButton = toolButton(title: "⌫  Eraser", action: #selector(selectEraser)); undoButton = toolButton(title: "↶  Undo", action: #selector(undoCanvas)); redoButton = toolButton(title: "↷  Redo", action: #selector(redoCanvas)); clearButton = toolButton(title: "⌫  Clear Layer", action: #selector(clearCanvas)); settingsButton = toolButton(title: "⚙  Settings", action: #selector(openSettings))
         [brushButton, eraserButton, undoButton, redoButton, clearButton, settingsButton].forEach { button in button.widthAnchor.constraint(greaterThanOrEqualToConstant: 78).isActive = true; stack.addArrangedSubview(button) }
         toolRail.addSubview(stack); NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: toolRail.leadingAnchor, constant: 9), stack.trailingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: -9), stack.topAnchor.constraint(equalTo: toolRail.topAnchor, constant: 8), stack.bottomAnchor.constraint(equalTo: toolRail.bottomAnchor, constant: -8)])
     }

@@ -47,6 +47,8 @@ shade/bucket match Android fixtures; undo→redo is byte-deterministic.
 
 ## M3 — documents, pages, and layers
 
+Status: **retained pages/layers implemented; document packages still pending**
+
 - Dynamic page/layer rails and active selection
 - Add/delete/rename/reorder pages and layers
 - Visibility, opacity, raster/vector layer types, rasterize/merge

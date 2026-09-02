@@ -43,6 +43,7 @@ Completed delegated tracks:
 - curved-stroke join smoothing and software Pencil activation/lift-off tuning.
 - retained Brush/Eraser styles, Undo/Redo, versioned archives, and autosave.
 - document/view coordinate transforms and two-finger pan/pinch/rotation.
+- dynamic retained pages/layers and archive v1-to-v2 migration.
 
 ## Delegation rules
 
@@ -93,7 +94,7 @@ Before tagging:
 
 ## Current next steps
 
-- validate the version 0.5 gesture and coordinate-space iteration;
+- validate the version 0.6 retained pages/layers iteration;
 - publish the next tagged GitHub Release;
 - collect iPad screenshots and threshold/curve behavior notes;
 - then connect the sparse tile renderer through an ordered command path rather

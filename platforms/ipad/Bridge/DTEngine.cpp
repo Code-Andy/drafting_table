@@ -1,150 +1,58 @@
 #include "DTEngine.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <type_traits>
-
+namespace drafting_table { namespace {
+constexpr std::uint32_t kVersion1=1,kVersion2=2; constexpr std::size_t kMaxBytes=64u*1024u*1024u; constexpr std::uint32_t kMaxPages=1000,kMaxLayers=1000,kMaxStrokes=100000,kMaxPoints=1000000; constexpr std::uint64_t kMaxTotalPoints=2000000; constexpr std::uint32_t kMaxString=4096;
+template<class T> struct Bits{using type=std::make_unsigned_t<T>;}; template<>struct Bits<float>{using type=std::uint32_t;}; template<>struct Bits<double>{using type=std::uint64_t;};
+template<class T> void put(std::vector<std::uint8_t>&o,T v){using U=typename Bits<T>::type;U b{};if constexpr(std::is_same_v<T,float>||std::is_same_v<T,double>)std::memcpy(&b,&v,sizeof v);else b=(U)v;for(size_t i=0;i<sizeof(U);++i)o.push_back((uint8_t)(b>>(8*i)));}
+template<class T> bool get(std::span<const uint8_t>d,size_t&a,T&v){using U=typename Bits<T>::type;if(a>d.size()||sizeof(U)>d.size()-a)return false;U b=0;for(size_t i=0;i<sizeof(U);++i)b|=(U)d[a++]<<(8*i);if constexpr(std::is_same_v<T,float>||std::is_same_v<T,double>)std::memcpy(&v,&b,sizeof v);else v=(T)b;return true;}
+bool style(float s,float o){return std::isfinite(s)&&std::isfinite(o)&&s>=1&&s<=40&&o>=.05f&&o<=1;}
+bool point(const PencilSample&p){return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.pressure)&&p.pressure>=0&&p.pressure<=1&&std::isfinite(p.altitude)&&std::isfinite(p.azimuth)&&std::isfinite(p.roll)&&std::isfinite(p.hoverDistance)&&std::isfinite(p.timestamp);}
+bool nameOK(const std::string&n){return n.size()<=kMaxString;}
+void putString(std::vector<uint8_t>&o,const std::string&s){put<uint32_t>(o,(uint32_t)s.size());o.insert(o.end(),s.begin(),s.end());}
+bool getString(std::span<const uint8_t>d,size_t&a,std::string&s){uint32_t n=0;if(!get(d,a,n)||n>kMaxString||n>d.size()-a)return false;s.assign((const char*)d.data()+a,n);a+=n;return true;}
+void putStroke(std::vector<uint8_t>&o,const Stroke&s){o.push_back((uint8_t)s.tool);o.insert(o.end(),3,0);put<float>(o,s.brushSize);put<float>(o,s.brushOpacity);put<uint32_t>(o,(uint32_t)s.points.size());for(auto&p:s.points){put<float>(o,p.x);put<float>(o,p.y);put<float>(o,p.pressure);put<float>(o,p.altitude);put<float>(o,p.azimuth);put<float>(o,p.roll);put<float>(o,p.hoverDistance);put<double>(o,p.timestamp);put<uint64_t>(o,p.id);put<uint64_t>(o,p.estimationUpdateIndex);put<uint64_t>(o,p.estimationId);put<uint32_t>(o,(uint32_t)p.flags);}}
+bool getStroke(std::span<const uint8_t>d,size_t&a,Stroke&s,uint64_t&total){if(a>=d.size())return false;uint8_t raw=d[a++];if(raw>1||a+3>d.size())return false;a+=3;s.tool=(DTTool)raw;uint32_t n=0,flags=0;if(!get(d,a,s.brushSize)||!get(d,a,s.brushOpacity)||!get(d,a,n)||!style(s.brushSize,s.brushOpacity)||n>kMaxPoints||total+n>kMaxTotalPoints)return false;total+=n;s.points.reserve(n);for(uint32_t j=0;j<n;++j){PencilSample p;if(!get(d,a,p.x)||!get(d,a,p.y)||!get(d,a,p.pressure)||!get(d,a,p.altitude)||!get(d,a,p.azimuth)||!get(d,a,p.roll)||!get(d,a,p.hoverDistance)||!get(d,a,p.timestamp)||!get(d,a,p.id)||!get(d,a,p.estimationUpdateIndex)||!get(d,a,p.estimationId)||!get(d,a,flags)||!point(p)||(flags&~0x7fu))return false;p.flags=(SampleFlags)flags;s.points.push_back(p);}return true;}
+}}
 namespace drafting_table {
-namespace {
-constexpr std::uint32_t kArchiveVersion = 1;
-constexpr std::size_t kArchiveHeaderSize = 12;
-constexpr std::size_t kMaxArchiveBytes = 64u * 1024u * 1024u;
-constexpr std::uint32_t kMaxStrokes = 100000;
-constexpr std::uint32_t kMaxPointsPerStroke = 1000000;
-constexpr std::uint64_t kMaxTotalPoints = 2000000;
-constexpr std::size_t kStrokeArchiveBytes = 16;
-constexpr std::size_t kPointArchiveBytes = 64;
+Engine::Engine(){pages_.push_back(Page{});pages_[0].layers.push_back(Layer{});}
+DTTool Engine::tool()const{std::lock_guard l(mutex_);return tool_;} void Engine::setTool(DTTool v){std::lock_guard l(mutex_);v=v==DTTool::Eraser?DTTool::Eraser:DTTool::Brush;if(tool_!=v){tool_=v;++revision_;}}
+float Engine::brushSize()const{std::lock_guard l(mutex_);return brushSize_;} void Engine::setBrushSize(float v){std::lock_guard l(mutex_);v=std::isfinite(v)?std::clamp(v,1.f,40.f):8.f;if(v!=brushSize_){brushSize_=v;++revision_;}}
+float Engine::brushOpacity()const{std::lock_guard l(mutex_);return brushOpacity_;} void Engine::setBrushOpacity(float v){std::lock_guard l(mutex_);v=std::isfinite(v)?std::clamp(v,.05f,1.f):1.f;if(v!=brushOpacity_){brushOpacity_=v;++revision_;}}
+void Engine::beginStroke(){std::lock_guard l(mutex_);if(strokeInProgress_)cancelStrokeUnlocked();activeStroke_={};activeStroke_.tool=tool_;activeStroke_.brushSize=brushSize_;activeStroke_.brushOpacity=brushOpacity_;StrokeConfig c;c.brushSize=brushSize_;inputEngine_.beginStroke(c);strokeInProgress_=true;++revision_;}
+void Engine::appendSamples(std::span<const PencilSample>r,std::span<const PencilSample>p){std::lock_guard l(mutex_);if(!strokeInProgress_)return;inputEngine_.appendSamples(r,p);rebuildActiveStroke();++revision_;}
+bool Engine::updateEstimatedSample(uint64_t i,const PencilSample&p){std::lock_guard l(mutex_);if(!strokeInProgress_)return false;bool ok=inputEngine_.updateEstimatedSampleByIndex(i,p);if(ok){rebuildActiveStroke();++revision_;}return ok;}
+void Engine::rebuildActiveStroke(){activeStroke_.points=inputEngine_.realSamples();activeStroke_.points.insert(activeStroke_.points.end(),inputEngine_.predictedSamples().begin(),inputEngine_.predictedSamples().end());}
+void Engine::cancelStrokeUnlocked(){inputEngine_.cancelStroke();activeStroke_.points.clear();strokeInProgress_=false;}
+void Engine::endStroke(){std::lock_guard l(mutex_);if(!strokeInProgress_)return;if(!inputEngine_.realSamples().empty()){activeLayerUnlocked().strokes.push_back({inputEngine_.realSamples(),activeStroke_.tool,activeStroke_.brushSize,activeStroke_.brushOpacity});activeLayerUnlocked().redoStrokes.clear();}inputEngine_.endStroke();inputEngine_.clearCommittedSamples();activeStroke_.points.clear();strokeInProgress_=false;++revision_;}
+void Engine::cancelStroke(){std::lock_guard l(mutex_);cancelStrokeUnlocked();++revision_;}
+void Engine::clear(){std::lock_guard l(mutex_);cancelStrokeUnlocked();inputEngine_.clearCommittedSamples();auto&ly=activeLayerUnlocked();ly.strokes.clear();ly.redoStrokes.clear();++revision_;}
+bool Engine::undoLastStroke(){std::lock_guard l(mutex_);bool c=false;if(strokeInProgress_){cancelStrokeUnlocked();c=true;}auto&ly=activeLayerUnlocked();if(!ly.strokes.empty()){ly.redoStrokes.push_back(std::move(ly.strokes.back()));ly.strokes.pop_back();c=true;}if(c)++revision_;return c;}
+bool Engine::redoLastStroke(){std::lock_guard l(mutex_);bool c=false;if(strokeInProgress_){cancelStrokeUnlocked();c=true;}auto&ly=activeLayerUnlocked();if(!ly.redoStrokes.empty()){ly.strokes.push_back(std::move(ly.redoStrokes.back()));ly.redoStrokes.pop_back();c=true;}if(c)++revision_;return c;}
+bool Engine::canUndo()const{std::lock_guard l(mutex_);return strokeInProgress_||!activeLayerUnlocked().strokes.empty();} bool Engine::canRedo()const{std::lock_guard l(mutex_);return !activeLayerUnlocked().redoStrokes.empty();}
+std::size_t Engine::pageCount()const{std::lock_guard l(mutex_);return pages_.size();} std::size_t Engine::activePageIndex()const{std::lock_guard l(mutex_);return activePage_;} std::size_t Engine::activeLayerIndex()const{std::lock_guard l(mutex_);return activePageUnlocked().activeLayer;}
+std::vector<std::string> Engine::pageNames()const{std::lock_guard l(mutex_);std::vector<std::string>r;for(auto&p:pages_)r.push_back(p.name);return r;} std::vector<std::string> Engine::layerNames()const{std::lock_guard l(mutex_);std::vector<std::string>r;for(auto&x:activePageUnlocked().layers)r.push_back(x.name);return r;}
+bool Engine::addPage(const std::string&n){std::lock_guard l(mutex_);if(!nameOK(n)||pages_.size()>=kMaxPages)return false;cancelStrokeUnlocked();Page p;p.name=n.empty()?"Page "+std::to_string(pages_.size()+1):n;p.layers.push_back(Layer{});pages_.push_back(std::move(p));activePage_=pages_.size()-1;++revision_;return true;}
+bool Engine::selectPage(size_t i){std::lock_guard l(mutex_);if(i>=pages_.size())return false;const bool cancelled=strokeInProgress_;cancelStrokeUnlocked();if(activePage_!=i||cancelled){activePage_=i;++revision_;}return true;}
+bool Engine::deletePage(size_t i){std::lock_guard l(mutex_);if(i>=pages_.size()||pages_.size()<=1)return false;cancelStrokeUnlocked();pages_.erase(pages_.begin()+i);if(activePage_>=pages_.size())activePage_=pages_.size()-1;else if(activePage_>i)--activePage_;++revision_;return true;}
+bool Engine::renamePage(size_t i,const std::string&n){std::lock_guard l(mutex_);if(i>=pages_.size()||n.empty()||!nameOK(n))return false;pages_[i].name=n;++revision_;return true;}
+bool Engine::addLayer(const std::string&n){std::lock_guard l(mutex_);auto&p=activePageUnlocked();if(!nameOK(n)||p.layers.size()>=kMaxLayers)return false;cancelStrokeUnlocked();Layer x;x.name=n.empty()?"Layer "+std::to_string(p.layers.size()+1):n;p.layers.push_back(std::move(x));p.activeLayer=p.layers.size()-1;++revision_;return true;}
+bool Engine::selectLayer(size_t i){std::lock_guard l(mutex_);auto&p=activePageUnlocked();if(i>=p.layers.size())return false;const bool cancelled=strokeInProgress_;cancelStrokeUnlocked();if(p.activeLayer!=i||cancelled){p.activeLayer=i;++revision_;}return true;}
+bool Engine::deleteLayer(size_t i){std::lock_guard l(mutex_);auto&p=activePageUnlocked();if(i>=p.layers.size()||p.layers.size()<=1)return false;cancelStrokeUnlocked();p.layers.erase(p.layers.begin()+i);if(p.activeLayer>=p.layers.size())p.activeLayer=p.layers.size()-1;else if(p.activeLayer>i)--p.activeLayer;++revision_;return true;}
+bool Engine::renameLayer(size_t i,const std::string&n){std::lock_guard l(mutex_);auto&p=activePageUnlocked();if(i>=p.layers.size()||n.empty()||!nameOK(n))return false;p.layers[i].name=n;++revision_;return true;}
+bool Engine::activeLayerVisible()const{std::lock_guard l(mutex_);return activeLayerUnlocked().visible;} bool Engine::setActiveLayerVisible(bool v){std::lock_guard l(mutex_);auto&x=activeLayerUnlocked();if(x.visible==v)return true;x.visible=v;++revision_;return true;}
+float Engine::activeLayerOpacity()const{std::lock_guard l(mutex_);return activeLayerUnlocked().opacity;} bool Engine::setActiveLayerOpacity(float v){std::lock_guard l(mutex_);if(!std::isfinite(v))return false;auto&x=activeLayerUnlocked();v=std::clamp(v,0.f,1.f);if(x.opacity!=v){x.opacity=v;++revision_;}return true;}
+bool Engine::layerVisible(size_t i)const{std::lock_guard l(mutex_);const auto&p=activePageUnlocked();return i<p.layers.size()?p.layers[i].visible:false;} float Engine::layerOpacity(size_t i)const{std::lock_guard l(mutex_);const auto&p=activePageUnlocked();return i<p.layers.size()?p.layers[i].opacity:0.f;}
+bool Engine::setLayerVisible(size_t i,bool v){std::lock_guard l(mutex_);auto&p=activePageUnlocked();if(i>=p.layers.size())return false;if(p.layers[i].visible!=v){p.layers[i].visible=v;++revision_;}return true;} bool Engine::setLayerOpacity(size_t i,float v){std::lock_guard l(mutex_);if(!std::isfinite(v))return false;auto&p=activePageUnlocked();if(i>=p.layers.size())return false;v=std::clamp(v,0.f,1.f);if(p.layers[i].opacity!=v){p.layers[i].opacity=v;++revision_;}return true;}
+std::vector<Stroke> Engine::snapshot()const{std::lock_guard l(mutex_);std::vector<Stroke>r;for(auto&ly:activePageUnlocked().layers)if(ly.visible&&ly.opacity>0){for(auto&s:ly.strokes){auto c=s;c.brushOpacity*=ly.opacity;r.push_back(std::move(c));}}if(strokeInProgress_&&!activeStroke_.points.empty()){auto c=activeStroke_;c.brushOpacity*=activeLayerUnlocked().opacity;if(activeLayerUnlocked().visible&&activeLayerUnlocked().opacity>0)r.push_back(std::move(c));}return r;}
+std::size_t Engine::strokeCount()const{std::lock_guard l(mutex_);size_t n=0;for(auto&s:activePageUnlocked().layers)n+=s.strokes.size();if(strokeInProgress_&&!activeStroke_.points.empty())++n;return n;} std::size_t Engine::sampleCount()const{std::lock_guard l(mutex_);size_t n=0;for(auto&ly:activePageUnlocked().layers)for(auto&s:ly.strokes)n+=s.points.size();if(strokeInProgress_)n+=activeStroke_.points.size();return n;} std::uint64_t Engine::revision()const{std::lock_guard l(mutex_);return revision_;}
 
-template <typename T> struct ArchiveBits { using type = std::make_unsigned_t<T>; };
-template <> struct ArchiveBits<float> { using type = std::uint32_t; };
-template <> struct ArchiveBits<double> { using type = std::uint64_t; };
-template <typename T> void appendLE(std::vector<std::uint8_t>& out, T value) {
-    using U = typename ArchiveBits<T>::type;
-    U bits{};
-    if constexpr (std::is_same_v<T,float> || std::is_same_v<T,double>) std::memcpy(&bits,&value,sizeof(value));
-    else bits = static_cast<U>(value);
-    for (std::size_t i=0;i<sizeof(U);++i) out.push_back(static_cast<std::uint8_t>(bits>>(i*8)));
+std::vector<uint8_t> Engine::archive()const{std::lock_guard l(mutex_);if(pages_.empty()||pages_.size()>kMaxPages||activePage_>=pages_.size())return{};size_t sz=28;uint64_t total=0;for(auto&p:pages_){if(p.name.empty()||!nameOK(p.name)||p.layers.empty()||p.layers.size()>kMaxLayers||p.activeLayer>=p.layers.size())return{};sz+=12+p.name.size();for(auto&ly:p.layers){if(ly.name.empty()||!nameOK(ly.name)||!std::isfinite(ly.opacity)||ly.opacity<0||ly.opacity>1||ly.strokes.size()>kMaxStrokes)return{};sz+=13+ly.name.size();for(auto&s:ly.strokes){if(s.points.size()>kMaxPoints||!style(s.brushSize,s.brushOpacity)||total+s.points.size()>kMaxTotalPoints)return{};total+=s.points.size();sz+=16+s.points.size()*64;for(auto&pnt:s.points)if(!point(pnt))return{};}}}if(sz>kMaxBytes)return{};std::vector<uint8_t>o;o.reserve(sz);o.insert(o.end(),{'D','T','A','R'});put<uint32_t>(o,kVersion2);put<uint32_t>(o,(uint32_t)activePage_);put<uint32_t>(o,(uint32_t)pages_.size());o.push_back((uint8_t)tool_);o.insert(o.end(),3,0);put<float>(o,brushSize_);put<float>(o,brushOpacity_);for(auto&p:pages_){putString(o,p.name);put<uint32_t>(o,(uint32_t)p.activeLayer);put<uint32_t>(o,(uint32_t)p.layers.size());for(auto&ly:p.layers){putString(o,ly.name);o.push_back(ly.visible?1:0);put<float>(o,ly.opacity);put<uint32_t>(o,(uint32_t)ly.strokes.size());for(auto&s:ly.strokes)putStroke(o,s);}}return o;}
+bool Engine::loadArchive(std::span<const uint8_t>d){if(d.size()<12||d.size()>kMaxBytes)return false;size_t a=0;if(d[a++]!='D'||d[a++]!='T'||d[a++]!='A'||d[a++]!='R')return false;uint32_t ver=0; if(!get(d,a,ver))return false;std::vector<Page> pages;size_t activePage=0;DTTool tool=DTTool::Brush;float bs=8,bo=1;uint64_t total=0;
+ if(ver==1){uint32_t count=0;if(!get(d,a,count)||count>kMaxStrokes)return false;Page p;p.layers.push_back(Layer{});for(uint32_t i=0;i<count;++i){Stroke s;if(!getStroke(d,a,s,total))return false;p.layers[0].strokes.push_back(std::move(s));}if(a!=d.size())return false;pages.push_back(std::move(p));}
+ else if(ver==2){uint32_t ap=0,np=0;uint8_t raw=0;if(!get(d,a,ap)||!get(d,a,np)||ap>=np||np==0||np>kMaxPages||a>=d.size())return false;raw=d[a++];if(raw>1||a+3>d.size())return false;a+=3;if(!get(d,a,bs)||!get(d,a,bo)||!style(bs,bo))return false;activePage=ap;pages.reserve(np);for(uint32_t i=0;i<np;++i){Page p;uint32_t al=0,nl=0;if(!getString(d,a,p.name)||p.name.empty()||!get(d,a,al)||!get(d,a,nl)||nl==0||nl>kMaxLayers||al>=nl)return false;p.activeLayer=al;p.layers.reserve(nl);for(uint32_t j=0;j<nl;++j){Layer ly;uint8_t vis=0;uint32_t ns=0;if(!getString(d,a,ly.name)||ly.name.empty()||a>=d.size())return false;vis=d[a++];if(vis>1||!get(d,a,ly.opacity)||ly.opacity<0||ly.opacity>1||!get(d,a,ns)||ns>kMaxStrokes)return false;ly.visible=vis!=0;ly.strokes.reserve(ns);for(uint32_t k=0;k<ns;++k){Stroke s;if(!getStroke(d,a,s,total))return false;ly.strokes.push_back(std::move(s));}p.layers.push_back(std::move(ly));}pages.push_back(std::move(p));}if(a!=d.size())return false;tool=(DTTool)raw;}
+ else return false;std::lock_guard l(mutex_);cancelStrokeUnlocked();inputEngine_.clearCommittedSamples();pages_=std::move(pages);activePage_=activePage;tool_=tool;brushSize_=bs;brushOpacity_=bo;++revision_;return true;}
 }
-template <typename T> bool readLE(std::span<const std::uint8_t> data, std::size_t& at, T& value) {
-    using U = typename ArchiveBits<T>::type;
-    if (at > data.size() || sizeof(U) > data.size()-at) return false;
-    U bits=0; for (std::size_t i=0;i<sizeof(U);++i) bits |= static_cast<U>(data[at++]) << (i*8);
-    if constexpr (std::is_same_v<T,float> || std::is_same_v<T,double>) std::memcpy(&value,&bits,sizeof(value));
-    else value = static_cast<T>(bits);
-    return true;
-}
-bool validStyle(float size,float opacity) { return std::isfinite(size)&&std::isfinite(opacity)&&size>=1.0f&&size<=40.0f&&opacity>=0.05f&&opacity<=1.0f; }
-bool validPoint(const PencilSample& p) {
-    return std::isfinite(p.x) && std::isfinite(p.y) &&
-           std::isfinite(p.pressure) && p.pressure >= 0.0f && p.pressure <= 1.0f &&
-           std::isfinite(p.altitude) && std::isfinite(p.azimuth) &&
-           std::isfinite(p.roll) && std::isfinite(p.hoverDistance) &&
-           std::isfinite(p.timestamp);
-}
-}
-
-DTTool Engine::tool() const { std::lock_guard<std::mutex> l(mutex_); return tool_; }
-void Engine::setTool(DTTool v) { std::lock_guard<std::mutex> l(mutex_); v=v==DTTool::Eraser?DTTool::Eraser:DTTool::Brush; if(tool_!=v){tool_=v;++revision_;} }
-float Engine::brushSize() const { std::lock_guard<std::mutex> l(mutex_); return brushSize_; }
-void Engine::setBrushSize(float v) { std::lock_guard<std::mutex> l(mutex_); v=std::isfinite(v)?std::clamp(v,1.0f,40.0f):8.0f; if(brushSize_!=v){brushSize_=v;++revision_;} }
-float Engine::brushOpacity() const { std::lock_guard<std::mutex> l(mutex_); return brushOpacity_; }
-void Engine::setBrushOpacity(float v) { std::lock_guard<std::mutex> l(mutex_); v=std::isfinite(v)?std::clamp(v,0.05f,1.0f):1.0f; if(brushOpacity_!=v){brushOpacity_=v;++revision_;} }
-
-void Engine::beginStroke() {
-    std::lock_guard<std::mutex> l(mutex_);
-    if(strokeInProgress_) inputEngine_.cancelStroke();
-    activeStroke_.points.clear(); activeStroke_.tool=tool_; activeStroke_.brushSize=brushSize_; activeStroke_.brushOpacity=brushOpacity_;
-    StrokeConfig config; config.brushSize=brushSize_; inputEngine_.beginStroke(config); strokeInProgress_=true; ++revision_;
-}
-void Engine::appendSamples(std::span<const PencilSample> real,std::span<const PencilSample> predicted) {
-    std::lock_guard<std::mutex> l(mutex_); if(!strokeInProgress_) return; inputEngine_.appendSamples(real,predicted); rebuildActiveStroke(); ++revision_;
-}
-bool Engine::updateEstimatedSample(std::uint64_t index,const PencilSample& replacement) {
-    std::lock_guard<std::mutex> l(mutex_); if(!strokeInProgress_) return false; bool ok=inputEngine_.updateEstimatedSampleByIndex(index,replacement); if(ok){rebuildActiveStroke();++revision_;} return ok;
-}
-void Engine::rebuildActiveStroke() { activeStroke_.points=inputEngine_.realSamples(); activeStroke_.points.insert(activeStroke_.points.end(),inputEngine_.predictedSamples().begin(),inputEngine_.predictedSamples().end()); }
-void Engine::endStroke() {
-    std::lock_guard<std::mutex> l(mutex_); if(!strokeInProgress_) return;
-    if(!inputEngine_.realSamples().empty()){ Stroke s; s.points=inputEngine_.realSamples(); s.tool=activeStroke_.tool; s.brushSize=activeStroke_.brushSize; s.brushOpacity=activeStroke_.brushOpacity; strokes_.push_back(std::move(s)); redoStrokes_.clear(); }
-    inputEngine_.endStroke(); inputEngine_.clearCommittedSamples(); activeStroke_.points.clear(); strokeInProgress_=false; ++revision_;
-}
-void Engine::cancelStroke() { std::lock_guard<std::mutex> l(mutex_); inputEngine_.cancelStroke(); activeStroke_.points.clear(); strokeInProgress_=false; ++revision_; }
-void Engine::clear() { std::lock_guard<std::mutex> l(mutex_); inputEngine_.cancelStroke(); inputEngine_.clearCommittedSamples(); strokes_.clear(); redoStrokes_.clear(); activeStroke_.points.clear(); strokeInProgress_=false; ++revision_; }
-bool Engine::undoLastStroke() {
-    std::lock_guard<std::mutex> l(mutex_); bool changed=false;
-    if(strokeInProgress_){inputEngine_.cancelStroke();activeStroke_.points.clear();strokeInProgress_=false;changed=true;}
-    if(!strokes_.empty()){redoStrokes_.push_back(std::move(strokes_.back()));strokes_.pop_back();changed=true;}
-    if(changed)++revision_; return changed;
-}
-bool Engine::redoLastStroke() {
-    std::lock_guard<std::mutex> l(mutex_); bool changed=false;
-    if(strokeInProgress_){inputEngine_.cancelStroke();activeStroke_.points.clear();strokeInProgress_=false;changed=true;}
-    if(!redoStrokes_.empty()){strokes_.push_back(std::move(redoStrokes_.back()));redoStrokes_.pop_back();changed=true;}
-    if(changed)++revision_; return changed;
-}
-bool Engine::canUndo() const { std::lock_guard<std::mutex> l(mutex_); return !strokes_.empty()||strokeInProgress_; }
-bool Engine::canRedo() const { std::lock_guard<std::mutex> l(mutex_); return !redoStrokes_.empty(); }
-
-std::vector<std::uint8_t> Engine::archive() const {
-    std::lock_guard<std::mutex> l(mutex_);
-    if (strokes_.size() > kMaxStrokes) return {};
-
-    std::size_t encodedSize = kArchiveHeaderSize;
-    std::uint64_t totalPoints = 0;
-    for (const Stroke& stroke : strokes_) {
-        if (!validStyle(stroke.brushSize, stroke.brushOpacity) ||
-            stroke.points.size() > kMaxPointsPerStroke) return {};
-        totalPoints += stroke.points.size();
-        if (totalPoints > kMaxTotalPoints) return {};
-        if (encodedSize > kMaxArchiveBytes - kStrokeArchiveBytes) return {};
-        encodedSize += kStrokeArchiveBytes;
-        if (stroke.points.size() > (kMaxArchiveBytes - encodedSize) / kPointArchiveBytes) {
-            return {};
-        }
-        encodedSize += stroke.points.size() * kPointArchiveBytes;
-        for (const PencilSample& point : stroke.points) {
-            if (!validPoint(point)) return {};
-        }
-    }
-
-    std::vector<std::uint8_t> out;
-    out.reserve(encodedSize);
-    out.insert(out.end(), {'D', 'T', 'A', 'R'});
-    appendLE<std::uint32_t>(out, kArchiveVersion);
-    appendLE<std::uint32_t>(out, static_cast<std::uint32_t>(strokes_.size()));
-    for (const Stroke& stroke : strokes_) {
-        out.push_back(static_cast<std::uint8_t>(stroke.tool));
-        out.insert(out.end(), 3, 0);
-        appendLE<float>(out, stroke.brushSize);
-        appendLE<float>(out, stroke.brushOpacity);
-        appendLE<std::uint32_t>(out, static_cast<std::uint32_t>(stroke.points.size()));
-        for (const PencilSample& point : stroke.points) {
-            appendLE<float>(out, point.x);
-            appendLE<float>(out, point.y);
-            appendLE<float>(out, point.pressure);
-            appendLE<float>(out, point.altitude);
-            appendLE<float>(out, point.azimuth);
-            appendLE<float>(out, point.roll);
-            appendLE<float>(out, point.hoverDistance);
-            appendLE<double>(out, point.timestamp);
-            appendLE<std::uint64_t>(out, point.id);
-            appendLE<std::uint64_t>(out, point.estimationUpdateIndex);
-            appendLE<std::uint64_t>(out, point.estimationId);
-            appendLE<std::uint32_t>(out, static_cast<std::uint32_t>(point.flags));
-        }
-    }
-    return out;
-}
-bool Engine::loadArchive(std::span<const std::uint8_t> data) {
-    if(data.size()<kArchiveHeaderSize||data.size()>kMaxArchiveBytes)return false;std::size_t at=0;if(data[at++]!='D'||data[at++]!='T'||data[at++]!='A'||data[at++]!='R')return false;std::uint32_t version=0,count=0;if(!readLE(data,at,version)||!readLE(data,at,count)||version!=kArchiveVersion||count>kMaxStrokes)return false;std::vector<Stroke> decoded;decoded.reserve(count);std::uint64_t total=0;
-    for(std::uint32_t i=0;i<count;++i){if(at>=data.size())return false;auto raw=data[at++];if(raw>static_cast<std::uint8_t>(DTTool::Eraser)||at+3>data.size())return false;at+=3;Stroke s;s.tool=static_cast<DTTool>(raw);std::uint32_t points=0;if(!readLE(data,at,s.brushSize)||!readLE(data,at,s.brushOpacity)||!readLE(data,at,points)||!validStyle(s.brushSize,s.brushOpacity)||points>kMaxPointsPerStroke||total+points>kMaxTotalPoints)return false;total+=points;s.points.reserve(points);for(std::uint32_t j=0;j<points;++j){PencilSample p;std::uint32_t flags=0;if(!readLE(data,at,p.x)||!readLE(data,at,p.y)||!readLE(data,at,p.pressure)||!readLE(data,at,p.altitude)||!readLE(data,at,p.azimuth)||!readLE(data,at,p.roll)||!readLE(data,at,p.hoverDistance)||!readLE(data,at,p.timestamp)||!readLE(data,at,p.id)||!readLE(data,at,p.estimationUpdateIndex)||!readLE(data,at,p.estimationId)||!readLE(data,at,flags))return false;if(!validPoint(p)||(flags&~0x7Fu)!=0)return false;p.flags=static_cast<SampleFlags>(flags);s.points.push_back(p);}decoded.push_back(std::move(s));}
-    if(at!=data.size())return false;std::lock_guard<std::mutex> l(mutex_);inputEngine_.cancelStroke();inputEngine_.clearCommittedSamples();activeStroke_.points.clear();strokeInProgress_=false;strokes_=std::move(decoded);redoStrokes_.clear();++revision_;return true;
-}
-
-std::vector<Stroke> Engine::snapshot() const { std::lock_guard<std::mutex> l(mutex_); auto result=strokes_;if(strokeInProgress_&&!activeStroke_.points.empty())result.push_back(activeStroke_);return result; }
-std::size_t Engine::strokeCount() const { std::lock_guard<std::mutex> l(mutex_);return strokes_.size()+(strokeInProgress_&&!activeStroke_.points.empty()?1u:0u); }
-std::size_t Engine::sampleCount() const { std::lock_guard<std::mutex> l(mutex_);std::size_t n=0;for(const Stroke& s:strokes_)n+=s.points.size();if(strokeInProgress_)n+=activeStroke_.points.size();return n; }
-std::uint64_t Engine::revision() const { std::lock_guard<std::mutex> l(mutex_);return revision_; }
-} // namespace drafting_table

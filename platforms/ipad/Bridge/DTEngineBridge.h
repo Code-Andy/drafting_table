@@ -54,6 +54,24 @@ typedef NS_ENUM(uint8_t, DTTool) {
 - (instancetype)init NS_UNAVAILABLE;
 @end
 
+@interface DTPageInfo : NSObject
+@property(nonatomic, readonly) NSUInteger index;
+@property(nonatomic, readonly, copy) NSString *name;
+@property(nonatomic, readonly) BOOL selected;
+- (instancetype)initWithIndex:(NSUInteger)index name:(NSString *)name selected:(BOOL)selected NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
+@interface DTLayerInfo : NSObject
+@property(nonatomic, readonly) NSUInteger index;
+@property(nonatomic, readonly, copy) NSString *name;
+@property(nonatomic, readonly) BOOL selected;
+@property(nonatomic, readonly) BOOL visible;
+@property(nonatomic, readonly) CGFloat opacity;
+- (instancetype)initWithIndex:(NSUInteger)index name:(NSString *)name selected:(BOOL)selected visible:(BOOL)visible opacity:(CGFloat)opacity NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 /// Objective-C ownership boundary around the platform-neutral C++ engine.
 /// Swift only sees this small API; no C++ types leak into the application.
 @interface DTEngineBridge : NSObject
@@ -66,6 +84,8 @@ typedef NS_ENUM(uint8_t, DTTool) {
 @property(nonatomic) CGFloat brushOpacity;
 @property(nonatomic, readonly) BOOL canUndo;
 @property(nonatomic, readonly) BOOL canRedo;
+@property(nonatomic, readonly) NSArray<DTPageInfo *> *pageInfos;
+@property(nonatomic, readonly) NSArray<DTLayerInfo *> *layerInfos;
 
 - (void)beginStroke;
 - (void)appendSamples:(const DTPencilSample *_Nullable)samples
@@ -78,6 +98,26 @@ typedef NS_ENUM(uint8_t, DTTool) {
 - (void)clearCanvas;
 - (BOOL)undoLastStroke;
 - (BOOL)redoLastStroke;
+
+- (BOOL)addPageWithName:(NSString *)name;
+- (BOOL)selectPageAtIndex:(NSUInteger)index;
+- (BOOL)renamePageAtIndex:(NSUInteger)index toName:(NSString *)name;
+- (BOOL)addLayerWithName:(NSString *)name;
+- (BOOL)selectLayerAtIndex:(NSUInteger)index;
+- (BOOL)renameLayerAtIndex:(NSUInteger)index toName:(NSString *)name;
+- (BOOL)setActiveLayerVisible:(BOOL)visible;
+- (BOOL)setActiveLayerOpacity:(CGFloat)opacity;
+// Swift-facing document controls return NO/NSNotFound for invalid mutations.
+- (NSUInteger)addPage;
+- (BOOL)setActivePageIndex:(NSUInteger)index;
+- (BOOL)deletePageAtIndex:(NSUInteger)index NS_SWIFT_NAME(deletePage(at:));
+- (BOOL)renamePageAtIndex:(NSUInteger)index name:(NSString *)name NS_SWIFT_NAME(renamePage(at:name:));
+- (NSUInteger)addLayer;
+- (BOOL)setActiveLayerIndex:(NSUInteger)index;
+- (BOOL)deleteLayerAtIndex:(NSUInteger)index NS_SWIFT_NAME(deleteLayer(at:));
+- (BOOL)renameLayerAtIndex:(NSUInteger)index name:(NSString *)name NS_SWIFT_NAME(renameLayer(at:name:));
+- (BOOL)setLayerVisible:(BOOL)visible atIndex:(NSUInteger)index NS_SWIFT_NAME(setLayerVisible(_:at:));
+- (BOOL)setLayerOpacity:(CGFloat)opacity atIndex:(NSUInteger)index NS_SWIFT_NAME(setLayerOpacity(_:at:));
 
 - (NSData *)archiveData;
 - (BOOL)loadArchiveData:(NSData *)data;

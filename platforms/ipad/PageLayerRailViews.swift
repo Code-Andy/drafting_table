@@ -141,6 +141,7 @@ final class LayersRailView: UIView {
     var onDelete: ((Int) -> Void)?
     var onVisibility: ((Bool, Int) -> Void)?
     var onOpacity: ((CGFloat, Int) -> Void)?
+    var onOpacityCommit: ((CGFloat, Int) -> Void)?
 
     var layerInfos: [DTLayerInfo] = [] { didSet { reload() } }
 
@@ -208,6 +209,7 @@ final class LayersRailView: UIView {
             row.onDelete = { [weak self] in self?.onDelete?(Int(info.index)) }
             row.onVisibility = { [weak self] visible in self?.onVisibility?(visible, Int(info.index)) }
             row.onOpacity = { [weak self] opacity in self?.onOpacity?(opacity, Int(info.index)) }
+            row.onOpacityCommit = { [weak self] opacity in self?.onOpacityCommit?(opacity, Int(info.index)) }
             stack.addArrangedSubview(row)
         }
         let add = UIButton(type: .system)
@@ -229,6 +231,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     var onDelete: (() -> Void)?
     var onVisibility: ((Bool) -> Void)?
     var onOpacity: ((CGFloat) -> Void)?
+    var onOpacityCommit: ((CGFloat) -> Void)?
     private let info: DTLayerInfo
     private let canDelete: Bool
     private let nameLabel = UILabel()
@@ -275,6 +278,10 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
             self.opacitySlider.accessibilityValue = self.opacityLabel.text
             self.onOpacity?(CGFloat(slider.value))
         }, for: .valueChanged)
+        opacitySlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.onOpacityCommit?(CGFloat(self.opacitySlider.value))
+        }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
         addSubview(nameLabel); addSubview(opacityLabel); addSubview(visibilityButton); addSubview(opacitySlider)
         NSLayoutConstraint.activate([
             visibilityButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
