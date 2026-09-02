@@ -225,7 +225,7 @@ final class LayersRailView: UIView {
     }
 }
 
-private final class LayerRowView: UIView {
+private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     var onSelect: (() -> Void)?
     var onRename: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -308,8 +308,8 @@ private final class LayerRowView: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     @objc private func selected() { onSelect?() }
 
-    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
-                                         configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
         UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             guard let self else { return UIMenu(title: "", children: []) }
             let rename = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.onRename?() }
