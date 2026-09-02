@@ -88,7 +88,7 @@ final class PagesRailView: UIView {
     }
 }
 
-private final class PageCardButton: UIButton, UIContextMenuInteractionDelegate {
+private final class PageCardButton: UIButton {
     var onSelect: (() -> Void)?
     var onRename: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -122,8 +122,8 @@ private final class PageCardButton: UIButton, UIContextMenuInteractionDelegate {
 
     @objc private func selected() { onSelect?() }
 
-    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
-                                 configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                          configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
         UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             guard let self else { return UIMenu(title: "", children: []) }
             let rename = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.onRename?() }
@@ -225,7 +225,7 @@ final class LayersRailView: UIView {
     }
 }
 
-private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
+private final class LayerRowView: UIView {
     var onSelect: (() -> Void)?
     var onRename: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -308,8 +308,8 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     @objc private func selected() { onSelect?() }
 
-    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
-                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
         UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             guard let self else { return UIMenu(title: "", children: []) }
             let rename = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.onRename?() }
