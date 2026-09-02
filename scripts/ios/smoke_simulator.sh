@@ -53,7 +53,9 @@ log_stream_pid=$!
 xcrun simctl launch --terminate-running-process "$device_udid" \
   com.local.draftingtable.ipad >/dev/null
 sleep 8
-pid="$(xcrun simctl spawn "$device_udid" /usr/bin/pgrep -x DraftingTable 2>/dev/null | head -n 1 || true)"
+process_table="$(xcrun simctl spawn "$device_udid" /bin/ps -A -o pid=,comm= 2>&1 || true)"
+echo "$process_table"
+pid="$(printf '%s\n' "$process_table" | awk '$2 ~ /DraftingTable$/ { print $1; exit }')"
 if [[ -z "$pid" ]]; then
   echo "Drafting Table exited during launch smoke test; recent simulator log follows" >&2
   kill "$log_stream_pid" >/dev/null 2>&1 || true
