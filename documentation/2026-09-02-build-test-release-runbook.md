@@ -116,8 +116,10 @@ gh release view v0.6.0 --repo Code-Andy/drafting_table
 Get-FileHash -Algorithm SHA256 .\DraftingTable.ipa
 ```
 
-Do not tag `v0.6.0` until the failure recorded in
-`2026-09-02-current-development-handoff.md` is fixed.
+The Swift failure originally recorded in
+`2026-09-02-current-development-handoff.md` was resolved at `5341b3c`. Tag
+`v0.6.0` only after the final documentation/source commit also passes both
+workflows.
 
 ## Public artifact locations
 

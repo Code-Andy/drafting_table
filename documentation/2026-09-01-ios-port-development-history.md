@@ -122,9 +122,11 @@ Key commits: `310928c`, `6d11522`.
 - Added migration of v1 flat-stroke archives into `Page 1 / Ink` and added real
   v1 fixture, v2 round-trip, and malformed archive tests.
 
-This candidate is not released as of 2026-09-02. Portable CI passes, while the
-macOS build is blocked by two Swift context-menu declarations documented in
-`2026-09-02-current-development-handoff.md`.
+This candidate is not yet tagged as of this record. The initial macOS build was
+blocked by inherited UIKit context-menu declarations. Commits `4828724` and
+`5341b3c` applied the class-specific fix: `UIButton` uses its inherited override
+while the plain `UIView` layer row explicitly conforms to the delegate. Both
+portable and macOS build workflows then passed and the branch IPA was inspected.
 
 ## Release history
 
@@ -135,7 +137,7 @@ macOS build is blocked by two Swift context-menu declarations documented in
 | v0.3.0 | released | Curved-line smoothing and Pencil activation tuning |
 | v0.4.0 | released | Retained tools, settings, Undo/Redo, autosave |
 | v0.5.0 | latest released | Two-finger canvas transform and coordinate boundary |
-| v0.6.0 | candidate only | Retained pages/layers and archive v2 |
+| v0.6.0 | release-ready candidate | Retained pages/layers and archive v2 |
 
 The release list is maintained at
 <https://github.com/Code-Andy/drafting_table/releases>.

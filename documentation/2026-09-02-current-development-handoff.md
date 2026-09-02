@@ -6,14 +6,14 @@ This is the exact resume point as of 2026-09-02 in Toronto.
 
 - Local checkout: `D:\Vibe Code\Drafting Table Fork`
 - Branch: `ipad-native-port`
-- HEAD: `6d11522` — `Add retained pages layers and archive migration`
-- Tracking: `origin/ipad-native-port` at the same commit
+- Source candidate: `5341b3c` — `Keep layer context menu delegate conformance`
+- Tracking: `origin/ipad-native-port` includes the source candidate
 - Fork: <https://github.com/Code-Andy/drafting_table>
 - Upstream: <https://github.com/bgkatz/drafting_table>
 - Upstream push URL: disabled as `no_push`
 - Project version in `project.yml`: `0.6.0` build `7`
 - Latest released version: `v0.5.0`
-- Working tree at documentation start: clean
+- Documentation baseline: `ad0c5f8`
 
 ## What HEAD contains
 
@@ -33,51 +33,49 @@ The UI supports:
 - layer visibility and continuous opacity preview;
 - autosave after committed mutations.
 
-## Validation result
+## Validation result and resolved compiler issue
 
-Portable core workflow passed on the exact HEAD:
+The first source candidate at `6d11522` passed portable tests but failed Swift
+compilation. UIKit's class hierarchy required different declarations:
 
-- Run: <https://github.com/Code-Andy/drafting_table/actions/runs/33578439507>
+- `PageCardButton: UIButton` inherits `UIContextMenuInteractionDelegate` and
+  overrides the context-menu configuration callback;
+- `LayerRowView: UIView` explicitly conforms and implements the callback.
+
+Commits `4828724` and `5341b3c` applied and refined that fix using successive
+Xcode compiler feedback.
+
+Portable core workflow passed on source candidate `5341b3c`:
+
+- Run: <https://github.com/Code-Andy/drafting_table/actions/runs/33599071991>
 - Conclusion: success
 - Covered: portable core, document, brush, Metal layout, and iPad retained
   engine tests.
 
-The iPad workflow failed on the exact HEAD:
+The iPad workflow also passed on `5341b3c`:
 
-- Run: <https://github.com/Code-Andy/drafting_table/actions/runs/33578439462>
-- Conclusion: failure
-- Stage: Swift compilation under Xcode 16.4 / iPhoneOS 18.5
+- Run: <https://github.com/Code-Andy/drafting_table/actions/runs/33599071908>
+- Conclusion: success
+- Environment: Xcode 16.4 / iPhoneOS 18.5
 
-The first reported errors are in
-`platforms/ipad/PageLayerRailViews.swift`:
+The downloaded branch artifact was inspected with these results:
 
-```text
-line 91: redundant conformance of PageCardButton to
-         UIContextMenuInteractionDelegate
-line 125: overriding declaration requires an override keyword
-```
-
-UIKit's `UIButton`/`UIControl` already conforms to the context-menu delegate
-and exposes the configuration callback as an overridable method. The expected
-repair is to remove the explicit conformance from `PageCardButton` and mark its
-callback `override`. `LayerRowView` should be checked for the same inherited
-`UIView` conformance and callback behavior before the next push.
+- version `0.6.0`, build `7`;
+- bundle `com.local.draftingtable.ipad`;
+- arm64 Mach-O executable (`CPU_TYPE_ARM64`);
+- compiled `Assets.car` and `default.metallib` present;
+- SHA-256
+  `F49B1BED7F10778F236D940F734C1247B1CD26A6625EE2F8182A8D02CB2EC321`.
 
 ## Exact continuation sequence
 
-1. Patch both context-menu view classes for inherited UIKit conformance.
-2. Review the resulting Swift declarations rather than suppressing the error.
-3. Commit and push to `ipad-native-port`.
-4. Require both portable core and iPad unsigned IPA workflows to pass.
-5. Download the branch IPA artifact and inspect:
-   `Payload/DraftingTable.app`, arm64 executable, processed `Info.plist`, app
-   icon assets, and `default.metallib`.
-6. Confirm marketing version `0.6.0` and build `7` inside the packaged app.
-7. Write release notes that say "retained pages/layers" and do not claim sparse
+1. Push this documentation update and require both workflows to pass on the
+   final documentation/source commit.
+2. Write release notes that say "retained pages/layers" and do not claim sparse
    raster tiles, thumbnails, reorder, or Files document packages.
-8. Tag and push `v0.6.0` only after the branch build passes.
-9. Verify the tagged workflow, release asset, SHA-256, and direct IPA URL.
-10. Collect real-iPad feedback before beginning the sparse raster milestone.
+3. Tag and push `v0.6.0`.
+4. Verify the tagged workflow, release asset, SHA-256, and direct IPA URL.
+5. Collect real-iPad feedback before beginning the sparse raster milestone.
 
 ## Known boundaries of the candidate
 
