@@ -38,6 +38,9 @@ typedef struct {
 typedef NS_ENUM(uint8_t, DTTool) {
     DTToolBrush = 0,
     DTToolEraser = 1,
+    DTToolLine = 2,
+    DTToolRectangle = 3,
+    DTToolEllipse = 4,
 };
 
 /// Immutable render snapshot carrying the stroke's style as well as its
@@ -47,10 +50,14 @@ typedef NS_ENUM(uint8_t, DTTool) {
 @property(nonatomic, readonly) DTTool tool;
 @property(nonatomic, readonly) CGFloat brushSize;
 @property(nonatomic, readonly) CGFloat brushOpacity;
+@property(nonatomic, readonly) uint32_t brushColorRGBA;
+@property(nonatomic, readonly) CGFloat brushHardness;
 - (instancetype)initWithPoints:(NSArray<NSValue *> *)points
                            tool:(DTTool)tool
                       brushSize:(CGFloat)brushSize
-                    brushOpacity:(CGFloat)brushOpacity NS_DESIGNATED_INITIALIZER;
+                    brushOpacity:(CGFloat)brushOpacity
+                 brushColorRGBA:(uint32_t)brushColorRGBA
+                 brushHardness:(CGFloat)brushHardness NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 @end
 
@@ -82,6 +89,8 @@ typedef NS_ENUM(uint8_t, DTTool) {
 @property(nonatomic) DTTool tool;
 @property(nonatomic) CGFloat brushSize;
 @property(nonatomic) CGFloat brushOpacity;
+@property(nonatomic) uint32_t brushColorRGBA;
+@property(nonatomic) CGFloat brushHardness;
 @property(nonatomic, readonly) BOOL canUndo;
 @property(nonatomic, readonly) BOOL canRedo;
 @property(nonatomic, readonly) NSArray<DTPageInfo *> *pageInfos;
@@ -118,6 +127,10 @@ typedef NS_ENUM(uint8_t, DTTool) {
 - (BOOL)renameLayerAtIndex:(NSUInteger)index name:(NSString *)name NS_SWIFT_NAME(renameLayer(at:name:));
 - (BOOL)setLayerVisible:(BOOL)visible atIndex:(NSUInteger)index NS_SWIFT_NAME(setLayerVisible(_:at:));
 - (BOOL)setLayerOpacity:(CGFloat)opacity atIndex:(NSUInteger)index NS_SWIFT_NAME(setLayerOpacity(_:at:));
+- (NSUInteger)duplicatePageAtIndex:(NSUInteger)index NS_SWIFT_NAME(duplicatePage(at:));
+- (BOOL)movePageAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex NS_SWIFT_NAME(movePage(from:to:));
+- (NSUInteger)duplicateLayerAtIndex:(NSUInteger)index NS_SWIFT_NAME(duplicateLayer(at:));
+- (BOOL)moveLayerAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex NS_SWIFT_NAME(moveLayer(from:to:));
 
 - (NSData *)archiveData;
 - (BOOL)loadArchiveData:(NSData *)data;
@@ -125,6 +138,7 @@ typedef NS_ENUM(uint8_t, DTTool) {
 /// Snapshot entries are immutable DTRenderStroke instances and are safe to
 /// retain while the engine receives input.
 - (NSArray<DTRenderStroke *> *)renderableStrokes;
+- (NSArray<DTRenderStroke *> *)renderableStrokesForPageAtIndex:(NSUInteger)index NS_SWIFT_NAME(renderableStrokes(forPageAt:));
 
 @end
 

@@ -2,6 +2,7 @@
 
 #include "DTEngine.hpp"
 #include <memory>
+#include <limits>
 #include <span>
 
 using drafting_table::Engine;
@@ -13,18 +14,24 @@ using drafting_table::PencilSample;
     DTTool _tool;
     CGFloat _brushSize;
     CGFloat _brushOpacity;
+    uint32_t _brushColorRGBA;
+    CGFloat _brushHardness;
 }
 
 - (instancetype)initWithPoints:(NSArray<NSValue *> *)points
                            tool:(DTTool)tool
                       brushSize:(CGFloat)brushSize
-                    brushOpacity:(CGFloat)brushOpacity {
+                    brushOpacity:(CGFloat)brushOpacity
+                 brushColorRGBA:(uint32_t)brushColorRGBA
+                  brushHardness:(CGFloat)brushHardness {
     self = [super init];
     if (self) {
         _points = [points copy];
         _tool = tool;
         _brushSize = brushSize;
         _brushOpacity = brushOpacity;
+        _brushColorRGBA = brushColorRGBA;
+        _brushHardness = brushHardness;
     }
     return self;
 }
@@ -32,6 +39,8 @@ using drafting_table::PencilSample;
 - (DTTool)tool { return _tool; }
 - (CGFloat)brushSize { return _brushSize; }
 - (CGFloat)brushOpacity { return _brushOpacity; }
+- (uint32_t)brushColorRGBA { return _brushColorRGBA; }
+- (CGFloat)brushHardness { return _brushHardness; }
 @end
 
 @implementation DTPageInfo {
@@ -80,16 +89,20 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 - (NSUInteger)sampleCount { return _engine ? _engine->sampleCount() : 0; }
 - (uint64_t)revision { return _engine ? _engine->revision() : 0; }
 - (DTTool)tool {
-    if (!_engine || _engine->tool() == drafting_table::DTTool::Brush) return DTToolBrush;
-    return DTToolEraser;
+    if (!_engine) return DTToolBrush;
+    return static_cast<DTTool>(_engine->tool());
 }
 - (void)setTool:(DTTool)tool {
-    if (_engine) _engine->setTool(tool == DTToolEraser ? drafting_table::DTTool::Eraser : drafting_table::DTTool::Brush);
+    if (_engine) _engine->setTool(static_cast<drafting_table::DTTool>(tool));
 }
 - (CGFloat)brushSize { return _engine ? _engine->brushSize() : 8.0; }
 - (void)setBrushSize:(CGFloat)size { if (_engine) _engine->setBrushSize((float)size); }
 - (CGFloat)brushOpacity { return _engine ? _engine->brushOpacity() : 1.0; }
 - (void)setBrushOpacity:(CGFloat)opacity { if (_engine) _engine->setBrushOpacity((float)opacity); }
+- (uint32_t)brushColorRGBA { return _engine ? _engine->brushColorRGBA() : drafting_table::kDefaultBrushColorRGBA; }
+- (void)setBrushColorRGBA:(uint32_t)color { if (_engine) _engine->setBrushColorRGBA(color); }
+- (CGFloat)brushHardness { return _engine ? _engine->brushHardness() : drafting_table::kDefaultBrushHardness; }
+- (void)setBrushHardness:(CGFloat)hardness { if (_engine) _engine->setBrushHardness((float)hardness); }
 - (BOOL)canUndo { return _engine && _engine->canUndo(); }
 - (BOOL)canRedo { return _engine && _engine->canRedo(); }
 - (NSArray<DTPageInfo *> *)pageInfos {
@@ -146,6 +159,10 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 - (BOOL)renameLayerAtIndex:(NSUInteger)index name:(NSString *)name { return _engine && name && _engine->renameLayer(index, std::string(name.UTF8String ?: "")); }
 - (BOOL)setLayerVisible:(BOOL)visible atIndex:(NSUInteger)index { return _engine && _engine->setLayerVisible(index, visible); }
 - (BOOL)setLayerOpacity:(CGFloat)opacity atIndex:(NSUInteger)index { return _engine && _engine->setLayerOpacity(index, (float)opacity); }
+- (NSUInteger)duplicatePageAtIndex:(NSUInteger)index { if (!_engine) return NSNotFound; const auto value = _engine->duplicatePage(index); return value == std::numeric_limits<std::size_t>::max() ? NSNotFound : value; }
+- (BOOL)movePageAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex { return _engine && _engine->movePage(fromIndex, toIndex); }
+- (NSUInteger)duplicateLayerAtIndex:(NSUInteger)index { if (!_engine) return NSNotFound; const auto value = _engine->duplicateLayer(index); return value == std::numeric_limits<std::size_t>::max() ? NSNotFound : value; }
+- (BOOL)moveLayerAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex { return _engine && _engine->moveLayer(fromIndex, toIndex); }
 
 - (NSData *)archiveData {
     if (!_engine) return [NSData data];
@@ -172,11 +189,28 @@ PencilSample toCoreSample(const DTPencilSample& input) {
             [polyline addObject:[NSValue valueWithBytes:&renderPoint
                                               objCType:@encode(DTRenderPoint)]];
         }
-        const DTTool tool = stroke.tool == drafting_table::DTTool::Eraser ? DTToolEraser : DTToolBrush;
+        const DTTool tool = static_cast<DTTool>(stroke.tool);
         [result addObject:[[DTRenderStroke alloc] initWithPoints:polyline
                                                             tool:tool
                                                        brushSize:stroke.brushSize
-                                                     brushOpacity:stroke.brushOpacity]];
+                                                     brushOpacity:stroke.brushOpacity
+                                                  brushColorRGBA:stroke.brushColorRGBA
+                                                   brushHardness:stroke.brushHardness]];
+    }
+    return result;
+}
+
+- (NSArray<DTRenderStroke *> *)renderableStrokesForPageAtIndex:(NSUInteger)index {
+    if (!_engine) return @[];
+    const auto strokes = _engine->snapshotForPage(index);
+    NSMutableArray *result = [NSMutableArray arrayWithCapacity:strokes.size()];
+    for (const Stroke& stroke : strokes) {
+        NSMutableArray *polyline = [NSMutableArray arrayWithCapacity:stroke.points.size()];
+        for (const PencilSample& point : stroke.points) {
+            DTRenderPoint renderPoint = {point.x, point.y, point.pressure, static_cast<uint8_t>(point.isPredicted() ? 1 : 0)};
+            [polyline addObject:[NSValue valueWithBytes:&renderPoint objCType:@encode(DTRenderPoint)]];
+        }
+        [result addObject:[[DTRenderStroke alloc] initWithPoints:polyline tool:static_cast<DTTool>(stroke.tool) brushSize:stroke.brushSize brushOpacity:stroke.brushOpacity brushColorRGBA:stroke.brushColorRGBA brushHardness:stroke.brushHardness]];
     }
     return result;
 }

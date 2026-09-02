@@ -31,15 +31,18 @@ void appendDouble(std::vector<std::uint8_t>& out, double value) {
     appendU64(out, bits);
 }
 
-std::vector<std::uint8_t> makeVersion1Archive(const dt::PencilSample& sample) {
-    std::vector<std::uint8_t> out{'D', 'T', 'A', 'R'};
-    appendU32(out, 1); // version
-    appendU32(out, 1); // stroke count
+void appendString(std::vector<std::uint8_t>& out, const char* value) {
+    const auto length = static_cast<std::uint32_t>(std::strlen(value));
+    appendU32(out, length);
+    out.insert(out.end(), value, value + length);
+}
+
+void appendLegacyStroke(std::vector<std::uint8_t>& out, const dt::PencilSample& sample) {
     out.push_back(static_cast<std::uint8_t>(dt::DTTool::Eraser));
     out.insert(out.end(), 3, 0);
     appendFloat(out, 12.5f);
     appendFloat(out, 0.4f);
-    appendU32(out, 1); // point count
+    appendU32(out, 1);
     appendFloat(out, sample.x); appendFloat(out, sample.y);
     appendFloat(out, sample.pressure); appendFloat(out, sample.altitude);
     appendFloat(out, sample.azimuth); appendFloat(out, sample.roll);
@@ -47,6 +50,33 @@ std::vector<std::uint8_t> makeVersion1Archive(const dt::PencilSample& sample) {
     appendU64(out, sample.id); appendU64(out, sample.estimationUpdateIndex);
     appendU64(out, sample.estimationId);
     appendU32(out, static_cast<std::uint32_t>(sample.flags));
+}
+
+std::vector<std::uint8_t> makeVersion1Archive(const dt::PencilSample& sample) {
+    std::vector<std::uint8_t> out{'D', 'T', 'A', 'R'};
+    appendU32(out, 1); // version
+    appendU32(out, 1); // stroke count
+    appendLegacyStroke(out, sample);
+    return out;
+}
+
+std::vector<std::uint8_t> makeVersion2Archive(const dt::PencilSample& sample) {
+    std::vector<std::uint8_t> out{'D', 'T', 'A', 'R'};
+    appendU32(out, 2); // version
+    appendU32(out, 0); // active page
+    appendU32(out, 1); // page count
+    out.push_back(static_cast<std::uint8_t>(dt::DTTool::Eraser));
+    out.insert(out.end(), 3, 0);
+    appendFloat(out, 12.5f);
+    appendFloat(out, 0.4f);
+    appendString(out, "Legacy Page");
+    appendU32(out, 0); // active layer
+    appendU32(out, 1); // layer count
+    appendString(out, "Legacy Ink");
+    out.push_back(1); // visible
+    appendFloat(out, 1.0f);
+    appendU32(out, 1); // stroke count
+    appendLegacyStroke(out, sample);
     return out;
 }
 }
@@ -68,25 +98,33 @@ int main() {
     CHECK(engine.strokeCount()==1); CHECK(engine.sampleCount()==1); CHECK(engine.revision()>initialRevision);
     auto snapshot=engine.snapshot();
     CHECK(snapshot.size()==1); CHECK(snapshot[0].tool==dt::DTTool::Eraser); CHECK(snapshot[0].brushSize==12.5f); CHECK(snapshot[0].brushOpacity==0.4f);
+    engine.setBrushColorRGBA(0x12345600u); engine.setBrushHardness(-2.0f);
+    CHECK(engine.brushColorRGBA()==0x12345600u); CHECK(engine.brushHardness()==0.0f);
+    engine.setBrushHardness(0.35f); engine.setBrushColorRGBA(0xAABBCCDDu);
+    engine.beginStroke(); engine.appendSamples(std::span<const dt::PencilSample>(&sample,1),{}); engine.endStroke();
+    auto styled = engine.snapshot(); CHECK(styled.back().brushColorRGBA==0xAABBCCDDu); CHECK(styled.back().brushHardness==0.35f);
+    engine.setBrushColorRGBA(0x01020304u); engine.setBrushHardness(0.9f);
+    CHECK(engine.snapshot().back().brushColorRGBA==0xAABBCCDDu); CHECK(engine.snapshot().back().brushHardness==0.35f);
 
     CHECK(engine.canUndo()); CHECK(!engine.canRedo()); CHECK(engine.undoLastStroke());
-    CHECK(engine.strokeCount()==0); CHECK(!engine.canUndo()); CHECK(engine.canRedo()); CHECK(engine.redoLastStroke());
-    CHECK(engine.strokeCount()==1); CHECK(engine.canUndo()); CHECK(!engine.canRedo());
+    CHECK(engine.strokeCount()==1); CHECK(engine.canUndo()); CHECK(engine.canRedo()); CHECK(engine.redoLastStroke());
+    CHECK(engine.strokeCount()==2); CHECK(engine.canUndo()); CHECK(!engine.canRedo());
 
     const auto archive=engine.archive();
     CHECK(archive.size()>12);
     dt::Engine restored;
     CHECK(restored.loadArchive(archive));
     auto restoredSnapshot=restored.snapshot();
-    CHECK(restoredSnapshot.size()==1); CHECK(restoredSnapshot[0].points.size()==1);
+    CHECK(restoredSnapshot.size()==2); CHECK(restoredSnapshot[0].points.size()==1);
     CHECK(restoredSnapshot[0].tool==dt::DTTool::Eraser); CHECK(restoredSnapshot[0].brushSize==12.5f); CHECK(restoredSnapshot[0].brushOpacity==0.4f);
     CHECK(restoredSnapshot[0].points[0].x==sample.x);
+    CHECK(restoredSnapshot[0].brushColorRGBA==dt::kDefaultBrushColorRGBA); CHECK(restoredSnapshot[0].brushHardness==dt::kDefaultBrushHardness);
     CHECK(!restored.loadArchive(std::span<const std::uint8_t>(archive.data(),archive.size()-1)));
-    CHECK(restored.strokeCount()==1);
-    auto badVersion=archive; badVersion[4]=3; CHECK(!restored.loadArchive(badVersion));
-    CHECK(restored.strokeCount()==1);
+    CHECK(restored.strokeCount()==2);
+    auto badVersion=archive; badVersion[4]=4; CHECK(!restored.loadArchive(badVersion));
+    CHECK(restored.strokeCount()==2);
     auto trailing=archive; trailing.push_back(0); CHECK(!restored.loadArchive(trailing));
-    CHECK(restored.strokeCount()==1);
+    CHECK(restored.strokeCount()==2);
     restored.clear(); CHECK(!restored.canUndo()); CHECK(!restored.canRedo());
 
     // Retained pages and layers keep independent undo stacks and flatten
@@ -116,6 +154,17 @@ int main() {
     CHECK(roundTrip.pageCount() == document.pageCount());
     CHECK(roundTrip.layerNames() == document.layerNames());
 
+    for (auto shape : {dt::DTTool::Line, dt::DTTool::Rectangle, dt::DTTool::Ellipse}) {
+        document.setTool(shape); document.beginStroke(); document.appendSamples(std::span<const dt::PencilSample>(&sample, 1), {}); document.endStroke();
+    }
+    auto shapedArchive = document.archive(); dt::Engine shapedRoundTrip; CHECK(shapedRoundTrip.loadArchive(shapedArchive));
+    auto shaped = shapedRoundTrip.snapshot(); CHECK(shaped.size() >= 3);
+    CHECK(shaped[shaped.size()-3].tool == dt::DTTool::Line); CHECK(shaped[shaped.size()-2].tool == dt::DTTool::Rectangle); CHECK(shaped.back().tool == dt::DTTool::Ellipse);
+
+    const auto originalPages = document.pageCount(); CHECK(document.duplicatePage(0) == 1); CHECK(document.pageCount() == originalPages + 1);
+    CHECK(document.snapshotForPage(0).size() > 0); CHECK(document.movePage(1, 0)); CHECK(document.activePageIndex() == 0);
+    CHECK(document.duplicateLayer(0) == 1); CHECK(document.layerNames().size() >= 2); CHECK(document.moveLayer(1, 0)); CHECK(document.activeLayerIndex() == 0);
+
     const auto v1 = makeVersion1Archive(sample);
     dt::Engine migrated;
     CHECK(migrated.loadArchive(v1));
@@ -124,8 +173,18 @@ int main() {
     CHECK(migrated.snapshot().size() == 1);
     CHECK(migrated.snapshot()[0].tool == dt::DTTool::Eraser);
     CHECK(migrated.snapshot()[0].brushSize == 12.5f);
+    CHECK(migrated.snapshot()[0].brushColorRGBA == dt::kDefaultBrushColorRGBA);
+    CHECK(migrated.snapshot()[0].brushHardness == dt::kDefaultBrushHardness);
+
+    const auto legacyV2 = makeVersion2Archive(sample);
+    dt::Engine migratedV2;
+    CHECK(migratedV2.loadArchive(legacyV2));
+    CHECK(migratedV2.pageNames()[0] == "Legacy Page");
+    CHECK(migratedV2.layerNames()[0] == "Legacy Ink");
+    CHECK(migratedV2.snapshot()[0].brushColorRGBA == dt::kDefaultBrushColorRGBA);
+    CHECK(migratedV2.snapshot()[0].brushHardness == dt::kDefaultBrushHardness);
 
     engine.beginStroke(); engine.appendSamples(std::span<const dt::PencilSample>(&sample,1),{});
-    CHECK(engine.canUndo()); CHECK(engine.undoLastStroke()); CHECK(engine.strokeCount()==0); CHECK(engine.canRedo());
+    CHECK(engine.canUndo()); CHECK(engine.undoLastStroke()); CHECK(engine.strokeCount()==1); CHECK(engine.canRedo());
     if(failures!=0)return EXIT_FAILURE; std::cout<<"all iPad engine tests passed\n"; return EXIT_SUCCESS;
 }
