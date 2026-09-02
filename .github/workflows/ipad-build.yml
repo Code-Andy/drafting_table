@@ -65,6 +65,12 @@ jobs:
           set -euo pipefail
           bash scripts/ios/build_ipa.sh
 
+      - name: Launch smoke test in iPad Simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ios/smoke_simulator.sh
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v7
         with:

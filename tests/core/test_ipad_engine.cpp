@@ -184,6 +184,15 @@ int main() {
     CHECK(migratedV2.snapshot()[0].brushColorRGBA == dt::kDefaultBrushColorRGBA);
     CHECK(migratedV2.snapshot()[0].brushHardness == dt::kDefaultBrushHardness);
 
+    dt::Engine bounded;
+    std::vector<dt::PencilSample> longStroke(2'000, sample);
+    for (std::size_t index = 0; index < longStroke.size(); ++index) longStroke[index].x = static_cast<float>(index);
+    bounded.beginStroke(); bounded.appendSamples(longStroke, {}); bounded.endStroke();
+    const auto display = bounded.snapshotForDisplay(0, 128, 128);
+    CHECK(display.size() == 1); CHECK(display[0].points.size() == 128);
+    CHECK(display[0].points.front().x == 0.0f);
+    CHECK(display[0].points.back().x == 1'999.0f);
+
     engine.beginStroke(); engine.appendSamples(std::span<const dt::PencilSample>(&sample,1),{});
     CHECK(engine.canUndo()); CHECK(engine.undoLastStroke()); CHECK(engine.strokeCount()==1); CHECK(engine.canRedo());
     if(failures!=0)return EXIT_FAILURE; std::cout<<"all iPad engine tests passed\n"; return EXIT_SUCCESS;

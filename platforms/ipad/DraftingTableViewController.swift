@@ -130,21 +130,31 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let size = min(max(storedFloat(defaults, key: DrawingSettingsViewController.brushSizeKey, fallback: 8), 1), 40)
         let opacity = min(max(storedFloat(defaults, key: DrawingSettingsViewController.brushOpacityKey, fallback: 100), 5), 100)
         let hardness = min(max(storedFloat(defaults, key: DrawingSettingsViewController.brushHardnessKey, fallback: 80), 0), 100)
-        let color = defaults.object(forKey: DrawingSettingsViewController.brushColorKey) == nil
-            ? DrawingSettingsViewController.defaultBrushColorRGBA
-            : UInt32(defaults.integer(forKey: DrawingSettingsViewController.brushColorKey))
+        let color = storedUInt32(defaults,
+                                 key: DrawingSettingsViewController.brushColorKey,
+                                 fallback: DrawingSettingsViewController.defaultBrushColorRGBA)
         canvas.activationPressure = CGFloat(activation / 100)
         canvas.engineBridge.brushSize = CGFloat(size)
         canvas.engineBridge.brushOpacity = CGFloat(opacity / 100)
         canvas.engineBridge.brushHardness = CGFloat(hardness / 100)
         canvas.engineBridge.brushColorRGBA = color
         canvas.gridVisible = defaults.bool(forKey: Self.gridDefaultsKey)
-        selectedTool = DTTool(rawValue: UInt8(defaults.integer(forKey: Self.selectedToolDefaultsKey))) ?? .brush
+        let storedTool = defaults.integer(forKey: Self.selectedToolDefaultsKey)
+        selectedTool = (0...Int(DTTool.ellipse.rawValue)).contains(storedTool)
+            ? (DTTool(rawValue: UInt8(storedTool)) ?? .brush)
+            : .brush
         canvas.engineBridge.tool = selectedTool
     }
 
     private func storedFloat(_ defaults: UserDefaults, key: String, fallback: Float) -> Float {
         defaults.object(forKey: key) == nil ? fallback : defaults.float(forKey: key)
+    }
+
+    private func storedUInt32(_ defaults: UserDefaults, key: String, fallback: UInt32) -> UInt32 {
+        guard let number = defaults.object(forKey: key) as? NSNumber else { return fallback }
+        let value = number.int64Value
+        guard value >= 0, UInt64(value) <= UInt64(UInt32.max) else { return fallback }
+        return UInt32(value)
     }
 
     private func showSettings() {
@@ -489,17 +499,12 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func thumbnail(forPageAt index: UInt) -> UIImage? {
         if let cached = pageThumbnailCache[index] { return cached }
-        guard let data = DocumentExportService.pngData(strokes: canvas.engineBridge.renderableStrokes(forPageAt: index),
-                                                        canvasSize: canvas.bounds.size),
-              let image = UIImage(data: data) else { return nil }
         let target = CGSize(width: 68, height: 42)
-        let thumbnail = UIGraphicsImageRenderer(size: target).image { _ in
-            let scale = min(target.width / max(image.size.width, 1), target.height / max(image.size.height, 1))
-            let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            let rect = CGRect(x: (target.width - size.width) / 2, y: (target.height - size.height) / 2,
-                              width: size.width, height: size.height)
-            image.draw(in: rect)
-        }
+        guard let thumbnail = DocumentExportService.thumbnail(
+            strokes: canvas.engineBridge.renderableStrokes(forPageAt: index),
+            canvasSize: canvas.bounds.size,
+            targetSize: target
+        ) else { return nil }
         pageThumbnailCache[index] = thumbnail
         return thumbnail
     }

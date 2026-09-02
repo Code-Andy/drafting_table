@@ -46,7 +46,8 @@ final class DrawingSettingsViewController: UIViewController {
         let size = min(max(storedFloat(defaults, key: Self.brushSizeKey, fallback: 8), 1), 40)
         let opacity = min(max(storedFloat(defaults, key: Self.brushOpacityKey, fallback: 100), 5), 100)
         let hardness = min(max(storedFloat(defaults, key: Self.brushHardnessKey, fallback: 80), 0), 100)
-        let colorRGBA = defaults.object(forKey: Self.brushColorKey) == nil ? Self.defaultBrushColorRGBA : UInt32(defaults.integer(forKey: Self.brushColorKey))
+        let colorRGBA = storedUInt32(defaults, key: Self.brushColorKey,
+                                     fallback: Self.defaultBrushColorRGBA)
 
         configureSlider(activationSlider, min: 0, max: 20, value: activation,
                         label: "Pen activation", hint: "Higher values ignore lighter contact and screen-protector noise.",
@@ -103,6 +104,13 @@ final class DrawingSettingsViewController: UIViewController {
 
     private func storedFloat(_ defaults: UserDefaults, key: String, fallback: Float) -> Float {
         defaults.object(forKey: key) == nil ? fallback : defaults.float(forKey: key)
+    }
+
+    private func storedUInt32(_ defaults: UserDefaults, key: String, fallback: UInt32) -> UInt32 {
+        guard let number = defaults.object(forKey: key) as? NSNumber else { return fallback }
+        let value = number.int64Value
+        guard value >= 0, UInt64(value) <= UInt64(UInt32.max) else { return fallback }
+        return UInt32(value)
     }
 
     private func configureSlider(_ slider: UISlider, min: Float, max: Float, value: Float,
@@ -243,7 +251,9 @@ final class DrawingSettingsViewController: UIViewController {
 
     static func rgba(from color: UIColor) -> UInt32 {
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
-        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else {
+            return defaultBrushColorRGBA
+        }
         return (UInt32(r * 255 + 0.5) << 24) | (UInt32(g * 255 + 0.5) << 16) |
             (UInt32(b * 255 + 0.5) << 8) | UInt32(a * 255 + 0.5)
     }

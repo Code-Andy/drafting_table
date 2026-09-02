@@ -179,7 +179,10 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 
 - (NSArray<DTRenderStroke *> *)renderableStrokes {
     if (!_engine) return @[];
-    const auto strokes = _engine->snapshot();
+    // The retained archive can contain millions of samples, but a display
+    // frame must remain bounded. Decimation preserves first/last points for
+    // shape tools and prevents launch-time deep-copy/NSValue allocation spikes.
+    const auto strokes = _engine->snapshotForDisplay(_engine->activePageIndex(), 1024, 65536);
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:strokes.size()];
     for (const Stroke& stroke : strokes) {
         NSMutableArray *polyline = [NSMutableArray arrayWithCapacity:stroke.points.size()];
@@ -202,7 +205,7 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 
 - (NSArray<DTRenderStroke *> *)renderableStrokesForPageAtIndex:(NSUInteger)index {
     if (!_engine) return @[];
-    const auto strokes = _engine->snapshotForPage(index);
+    const auto strokes = _engine->snapshotForDisplay(index, 1024, 65536);
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:strokes.size()];
     for (const Stroke& stroke : strokes) {
         NSMutableArray *polyline = [NSMutableArray arrayWithCapacity:stroke.points.size()];

@@ -30,6 +30,27 @@ enum DocumentExportService {
         }
     }
 
+    /// Renders directly at rail resolution. Avoids allocating and PNG-encoding
+    /// a full-screen page merely to shrink it to a small page card.
+    static func thumbnail(strokes: [DTRenderStroke],
+                          canvasSize: CGSize,
+                          targetSize: CGSize) -> UIImage? {
+        guard let source = validated(canvasSize),
+              targetSize.width >= 1, targetSize.height >= 1,
+              targetSize.width <= 512, targetSize.height <= 512 else { return nil }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: targetSize, format: format).image { rendererContext in
+            let scale = min(targetSize.width / source.width, targetSize.height / source.height)
+            let fitted = CGSize(width: source.width * scale, height: source.height * scale)
+            rendererContext.cgContext.translateBy(x: (targetSize.width - fitted.width) * 0.5,
+                                                   y: (targetSize.height - fitted.height) * 0.5)
+            rendererContext.cgContext.scaleBy(x: scale, y: scale)
+            drawPage(strokes: strokes, size: source, context: rendererContext.cgContext)
+        }
+    }
+
     private static func validated(_ size: CGSize) -> CGSize? {
         guard size.width.isFinite, size.height.isFinite,
               size.width >= 1, size.height >= 1,

@@ -101,7 +101,7 @@ static void addRoundCapStyled(std::vector<DTMetalVertex>& out,
                               vector_float2 center, float radius,
                               float pressure, float predicted, float opacity,
                               float eraser, vector_float4 color, float hardness) {
-    constexpr int kSlices = 16;
+    constexpr int kSlices = 8;
     for (int i = 0; i < kSlices; ++i) {
         const float a0 = (2.0f * kPi * static_cast<float>(i)) / kSlices;
         const float a1 = (2.0f * kPi * static_cast<float>(i + 1)) / kSlices;
@@ -197,8 +197,9 @@ static DTSampledPoint catmullRom(const DTSampledPoint& p0,
 static std::vector<DTSampledPoint> smoothedPoints(
     const std::vector<DTSampledPoint>& input) {
     if (input.size() < 3) return input;
+    constexpr size_t kMaximumSmoothedPoints = 1024;
     std::vector<DTSampledPoint> output;
-    output.reserve(input.size() * 3);
+    output.reserve(std::min(kMaximumSmoothedPoints, input.size() * 3));
     for (size_t i = 0; i + 1 < input.size(); ++i) {
         const DTSampledPoint& p0 = input[i == 0 ? i : i - 1];
         const DTSampledPoint& p1 = input[i];
@@ -207,9 +208,29 @@ static std::vector<DTSampledPoint> smoothedPoints(
         const float length = simd_length(p2.position - p1.position);
         const int subdivisions = std::max(1, std::min(12, static_cast<int>(ceilf(length / 3.0f))));
         for (int step = 0; step < subdivisions; ++step) {
+            if (output.size() + 1 >= kMaximumSmoothedPoints) break;
             const float t = static_cast<float>(step) / static_cast<float>(subdivisions);
             output.push_back(catmullRom(p0, p1, p2, p3, t));
         }
+        if (output.size() + 1 >= kMaximumSmoothedPoints) break;
+    }
+    output.push_back(input.back());
+    return output;
+}
+
+static std::vector<DTSampledPoint> boundedInputPoints(
+    const std::vector<DTSampledPoint>& input) {
+    constexpr size_t kMaximumInputPoints = 512;
+    if (input.size() <= kMaximumInputPoints) return input;
+    std::vector<DTSampledPoint> output;
+    output.reserve(kMaximumInputPoints);
+    output.push_back(input.front());
+    const double stride = static_cast<double>(input.size() - 1) /
+        static_cast<double>(kMaximumInputPoints - 1);
+    for (size_t index = 1; index + 1 < kMaximumInputPoints; ++index) {
+        const size_t source = std::min(input.size() - 2,
+            static_cast<size_t>(llround(static_cast<double>(index) * stride)));
+        output.push_back(input[source]);
     }
     output.push_back(input.back());
     return output;
@@ -376,8 +397,10 @@ typedef struct {
             id<MTLBuffer> gridBuffer = [view.device newBufferWithBytes:grid.data()
                                                                   length:sizeof(DTMetalVertex) * grid.size()
                                                                  options:MTLResourceStorageModeShared];
-            [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
-            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
+            if (gridBuffer) {
+                [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
+            }
         }
     }
 
@@ -416,13 +439,15 @@ typedef struct {
                 id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
                                                                       length:sizeof(DTMetalVertex) * geometry.size()
                                                                      options:MTLResourceStorageModeShared];
-                [encoder setVertexBuffer:buffer offset:0 atIndex:0];
-                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+                if (buffer) {
+                    [encoder setVertexBuffer:buffer offset:0 atIndex:0];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+                }
             }
             continue;
         }
 
-        points = smoothedPoints(points);
+        points = smoothedPoints(boundedInputPoints(points));
         const vector_float4 color = eraser
             ? (vector_float4){0.965f, 0.945f, 0.900f, 1.0f} : strokeColor;
         // A low-hardness fringe plus a full-opacity core gives the control a
@@ -434,7 +459,7 @@ typedef struct {
             const float passScale = fringe ? fringeRadiusScale : 1.0f;
             const float passOpacity = fringe ? fringeOpacity : opacity;
             std::vector<DTMetalVertex> geometry;
-            geometry.reserve(points.size() * 96);
+            geometry.reserve(points.size() * 24);
             if (points.size() == 1) {
                 addRoundCapStyled(geometry, points[0].position,
                                   strokeRadius(points[0].pressure, brushSize) * passScale,
@@ -459,7 +484,12 @@ typedef struct {
                     addTriangleStyled(geometry, a1, b0, b1, p1.pressure, p1.predicted,
                                       passOpacity, eraseFlag, color, hardness);
                 }
-                for (const DTSampledPoint& point : points) {
+                for (size_t index = 0; index < points.size(); ++index) {
+                    // Dense smoothed quads overlap naturally. Periodic caps
+                    // preserve curved joins without allocating a fan at every
+                    // interpolated point on long retained strokes.
+                    if (index != 0 && index + 1 != points.size() && index % 4 != 0) continue;
+                    const DTSampledPoint& point = points[index];
                     addRoundCapStyled(geometry, point.position,
                                       strokeRadius(point.pressure, brushSize) * passScale,
                                       point.pressure, point.predicted, passOpacity,
@@ -470,8 +500,10 @@ typedef struct {
             id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
                                                               length:sizeof(DTMetalVertex) * geometry.size()
                                                              options:MTLResourceStorageModeShared];
-            [encoder setVertexBuffer:buffer offset:0 atIndex:0];
-            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+            if (buffer) {
+                [encoder setVertexBuffer:buffer offset:0 atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+            }
         }
     }
     [encoder endEncoding];
