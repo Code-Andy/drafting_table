@@ -11,6 +11,7 @@ xcodebuild \
   -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$derived_data" \
+  -enableAddressSanitizer YES \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
   build
@@ -30,28 +31,41 @@ raise SystemExit("No available iPad simulator")
 ')"
 
 cleanup() {
+  if [[ -n "${log_stream_pid:-}" ]]; then
+    kill "$log_stream_pid" >/dev/null 2>&1 || true
+    wait "$log_stream_pid" >/dev/null 2>&1 || true
+  fi
   xcrun simctl terminate "$device_udid" com.local.draftingtable.ipad >/dev/null 2>&1 || true
   xcrun simctl shutdown "$device_udid" >/dev/null 2>&1 || true
+  [[ -z "${runtime_log:-}" ]] || rm -f "$runtime_log"
 }
 trap cleanup EXIT
 
 xcrun simctl boot "$device_udid" >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$device_udid" -b
 xcrun simctl install "$device_udid" "$app_path"
+runtime_log="$(mktemp)"
+xcrun simctl spawn "$device_udid" log stream \
+  --style compact \
+  --level debug \
+  --predicate 'process == "DraftingTable" OR eventMessage CONTAINS[c] "com.local.draftingtable.ipad"' \
+  >"$runtime_log" 2>&1 &
+log_stream_pid=$!
 launch_output="$(xcrun simctl launch "$device_udid" com.local.draftingtable.ipad)"
 pid="${launch_output##*: }"
 test -n "$pid"
 sleep 8
 if ! xcrun simctl spawn "$device_udid" /bin/kill -0 "$pid"; then
   echo "Drafting Table exited during launch smoke test; recent simulator log follows" >&2
-  xcrun simctl spawn "$device_udid" log show \
-    --last 3m \
-    --style compact \
-    --predicate 'process == "DraftingTable" OR eventMessage CONTAINS[c] "com.local.draftingtable.ipad"' \
-    || true
-  echo "Crash reports:" >&2
-  xcrun simctl spawn "$device_udid" find /Users/mobile/Library/Logs/CrashReporter \
-    -type f -maxdepth 2 -print 2>/dev/null || true
+  kill "$log_stream_pid" >/dev/null 2>&1 || true
+  wait "$log_stream_pid" >/dev/null 2>&1 || true
+  log_stream_pid=""
+  tail -n 800 "$runtime_log" || true
+  latest_report="$(ls -1t "$HOME"/Library/Logs/DiagnosticReports/DraftingTable* 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$latest_report" ]]; then
+    echo "Latest host crash report: $latest_report" >&2
+    tail -n 1200 "$latest_report" || true
+  fi
   exit 1
 fi
 
