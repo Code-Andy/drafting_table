@@ -79,6 +79,22 @@ These are retained stroke pages/layers. They are the interaction and archive
 model needed by later milestones, not yet Files document packages backed by
 sparse raster/vector tiles.
 
+Version 0.7 is a broad workspace feature batch:
+
+- stored brush color and hardness with Settings controls;
+- retained Line, Rectangle, and Ellipse outline tools;
+- document-space grid following the persisted canvas transform;
+- page/layer duplicate and move-up/down operations;
+- generated page thumbnails with active-page invalidation caching;
+- Apple Pencil hover preview, double-tap tool toggle, and de-duplicated squeeze;
+- current-page PNG and all-page PDF export;
+- `.drafttable` Files type registration plus validated Open and Save Copy;
+- `DTAR` archive v3 with real v1/v2 migration fixtures.
+
+The new outline tools are persistent and exportable, but are not yet editable
+vector-layer shapes with snapping/selection. The Files document is a flat DTAR
+archive, not yet the final lazy sparse-tile package.
+
 ## Implemented architecture
 
 ### Portable C++20
@@ -106,6 +122,9 @@ sparse raster/vector tiles.
 - Brush/Eraser selection, retained stroke styles, Undo/Redo, and autosave
 - Document/view transform with two-finger pan, pinch, rotation, and Reset View
 - Dynamic retained pages/layers with visibility, opacity, and archive v2
+- Brush color/hardness, technical outline tools, grid, thumbnails, and archive v3
+- `.drafttable` Open/Save Copy plus PNG/PDF export
+- Pencil hover preview, double-tap, and squeeze tool switching
 - Thin Objective-C++ ownership bridge
 - Diagnostics overlay
 - XcodeGen project generation
@@ -169,11 +188,11 @@ correction, hover, gestures, memory pressure, and visual fidelity.
    Android document migration fixtures.
 3. Port brush, eraser, shade, fill, and uniform-alpha composition completely.
 4. Port vector SDF rendering, snapping, selections, transforms, and rasterize.
-5. Implement pages/layers UI behavior, thumbnails, reorder, visibility, and
-   opacity.
-6. Add two-finger pan/pinch/rotation, hover previews, squeeze palette, haptics,
-   and Pencil preference mappings.
-7. Add PNG/PDF export and system image import.
+5. Replace retained outline tools with editable vector layers, snapping,
+   selections, transforms, rasterize, and merge.
+6. Complete hover/squeeze palette behavior, haptics, and Pencil preference
+   mappings after device feedback.
+7. Add system image import and page-size-aware export.
 8. Add deterministic Metal undo/redo fidelity and on-device performance tests.
 
 ## Licensing constraint

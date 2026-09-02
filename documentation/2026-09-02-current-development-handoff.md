@@ -6,16 +6,21 @@ This is the exact resume point as of 2026-09-02 in Toronto.
 
 - Local checkout: `D:\Vibe Code\Drafting Table Fork`
 - Branch: `ipad-native-port`
-- Source candidate: `5341b3c` — `Keep layer context menu delegate conformance`
+- Source candidate: `4bcbaaf` — `Fix Swift input and document picker control flow`
 - Tracking: `origin/ipad-native-port` includes the source candidate
 - Fork: <https://github.com/Code-Andy/drafting_table>
 - Upstream: <https://github.com/bgkatz/drafting_table>
 - Upstream push URL: disabled as `no_push`
-- Project version in `project.yml`: `0.6.0` build `7`
-- Latest released version: `v0.6.0`
+- Project version in `project.yml`: `0.7.0` build `8`
+- Latest released version: `v0.6.0`; `v0.7.0` candidate builds successfully
 - Documentation baseline: `ad0c5f8`
 
 ## What HEAD contains
+
+The v0.7 candidate adds a broad feature batch on top of the v0.6 retained
+document model: color/hardness, Line/Rectangle/Ellipse tools, grid, page/layer
+duplicate and reorder, thumbnails, Pencil hover/actions, `.drafttable` Open and
+Save Copy, PNG/PDF export, and archive v3 with v1/v2 migration.
 
 `310928c` adds dynamic UIKit page and layer rails. `6d11522` adds retained
 page/layer ownership, bridge APIs, archive v2, v1 migration, and tests.
@@ -79,24 +84,37 @@ compiled assets and Metal library. Its SHA-256 is
 - Release: <https://github.com/Code-Andy/drafting_table/releases/tag/v0.6.0>
 - IPA: <https://github.com/Code-Andy/drafting_table/releases/download/v0.6.0/DraftingTable.ipa>
 
+## v0.7 candidate validation
+
+Source candidate `4bcbaaf` passed both workflows:
+
+- Portable core: <https://github.com/Code-Andy/drafting_table/actions/runs/33601182562>
+- Xcode/IPA: <https://github.com/Code-Andy/drafting_table/actions/runs/33601182536>
+
+The branch artifact reports `0.7.0` build `8`, contains an arm64 executable,
+compiled assets and Metal library, and registers the `.drafttable` UTI. Its
+pre-tag SHA-256 is
+`A1B78B4AC6B550048D0EDC97F16A5D9833F6D8AB59D5EBA8FB79DA46C3D2DAC0`.
+
 ## Exact continuation sequence
 
-1. Install `v0.6.0` and test page/layer selection, add, rename, guarded delete,
-   visibility, opacity, autosave/relaunch, active-layer Undo/Redo/Clear, Pencil
-   curves, and two-finger gestures.
-2. Record device feedback as a new dated key-change file.
-3. Begin the sparse raster command-path milestone only after obvious v0.6
+1. Publish and install `v0.7.0` build `8`.
+2. Test color/hardness, all five tools, grid transform, duplicate/reorder,
+   thumbnails, hover/double-tap/squeeze, `.drafttable` Open/Save Copy, PNG/PDF,
+   autosave, migration, Pencil curves, and two-finger gestures.
+3. Record device feedback as a new dated key-change file.
+4. Begin the sparse raster command path and true eraser after obvious v0.7
    regressions are addressed.
 
 ## Known boundaries of the candidate
 
-- Page cards do not yet contain rendered thumbnails.
-- Page/layer reordering is not implemented.
 - Layers are retained stroke lists, not final raster/vector layer types.
 - The visible renderer is not the sparse tile renderer.
 - Eraser is not destination-out.
-- No Files document packages, multi-document browser, PNG/PDF export, or image
-  import exists in the iPad port yet.
+- `.drafttable` is a flat archive rather than a lazy tile package, and there is
+  no multi-document browser or Android tile-folder migration.
+- PNG/PDF export exists; image import and page-size presets do not.
+- Shape tools persist and export but are not editable/snappable vectors.
 - Pencil and gesture behavior still require device validation in this version.
 
 ## Do not lose these invariants

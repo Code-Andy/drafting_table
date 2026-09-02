@@ -72,6 +72,8 @@ gestures never create accidental marks.
 
 ## M5 — vector tools and snapping
 
+Status: **initial retained outline tools and grid implemented**
+
 - Metal SDF line, rectangle, ellipse, and circle
 - Shape previews, vector color/width, rasterize
 - Grid and pixel-grid overlays
@@ -91,6 +93,8 @@ marquee tests do not over-select.
 
 ## M7 — document packages and Android migration
 
+Status: **flat `.drafttable` Open/Save Copy implemented; packages pending**
+
 - Files-compatible `.drafttable` packages
 - Lazy sparse-tile load, deferred atomic writes, crash recovery
 - Android `page_*`, `layer_*`, tile, `VEC0`, and `VEC1` import
@@ -100,6 +104,8 @@ golden fixtures open without geometry or color changes.
 
 ## M8 — import and export
 
+Status: **PNG and multi-page PDF export implemented; image import pending**
+
 - System photo/file image import into floating selection
 - Page PNG and multi-page PDF export
 - Share sheet and export without UI/page-border overlays
@@ -108,6 +114,8 @@ Acceptance: dimensions, page count, premultiplied color, and cancel paths are
 verified by automated fixtures.
 
 ## M9 — Pencil Pro, hover, and haptics
+
+Status: **hover preview and tool actions implemented; device validation and haptics pending**
 
 - Hover location/altitude/azimuth/roll previews
 - Double-tap and squeeze action mappings

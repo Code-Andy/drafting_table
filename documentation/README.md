@@ -35,6 +35,8 @@ handoffs belong here.
    — honest feature matrix and dependency-ordered next work.
 7. [2026-09-02-v0.6-pages-layers-release.md](2026-09-02-v0.6-pages-layers-release.md)
    — tagged feature notes, CI evidence, IPA checksum, and download links.
+8. [2026-09-02-v0.7-major-feature-batch.md](2026-09-02-v0.7-major-feature-batch.md)
+   — broad drawing, document, Pencil, Files, and export implementation jump.
 
 ## Other source-of-truth documents
 
