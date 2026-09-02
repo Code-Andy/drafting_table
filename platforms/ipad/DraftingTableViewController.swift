@@ -17,8 +17,8 @@ final class DraftingTableViewController: UIViewController {
     private let canvas = CanvasView(frame: .zero)
     private let diagnostics = DiagnosticsOverlay(frame: .zero)
     private let emptyState = InsetLabel()
-    private let pagesRail = UIView()
-    private let layersRail = UIView()
+    private let pagesRail = PagesRailView(frame: .zero)
+    private let layersRail = LayersRailView(frame: .zero)
     private let toolRail = UIView()
     private let persistence = StrokePersistenceStore()
     private var brushButton: UIButton!
@@ -46,7 +46,7 @@ final class DraftingTableViewController: UIViewController {
             pagesRail.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 12), pagesRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
             pagesRail.bottomAnchor.constraint(equalTo: toolRail.topAnchor, constant: -12), pagesRail.widthAnchor.constraint(equalToConstant: 84),
             layersRail.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -12), layersRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
-            layersRail.bottomAnchor.constraint(equalTo: toolRail.topAnchor, constant: -12), layersRail.widthAnchor.constraint(equalToConstant: 104),
+            layersRail.bottomAnchor.constraint(equalTo: toolRail.topAnchor, constant: -12), layersRail.widthAnchor.constraint(equalToConstant: 156),
             toolRail.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 16), toolRail.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -16),
             toolRail.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -10), toolRail.heightAnchor.constraint(equalToConstant: 74),
             emptyState.centerXAnchor.constraint(equalTo: root.centerXAnchor), emptyState.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: -12),
@@ -73,7 +73,7 @@ final class DraftingTableViewController: UIViewController {
             target: self,
             action: #selector(resetCanvasView)
         )
-        applyStoredSettings(); restoreDocument(); updateToolSelection(); updateUndoRedoState()
+        applyStoredSettings(); restoreDocument(); refreshRails(); updateToolSelection(); updateUndoRedoState()
     }
 
     /// Called by the scene delegate before suspension as a final autosave.
@@ -81,8 +81,9 @@ final class DraftingTableViewController: UIViewController {
         do { try persistence.save(canvas.engineBridge.archiveData()) } catch { /* retry on next mutation */ }
     }
 
-    private func documentDidChange() {
+    private func documentDidChange(refreshRails: Bool = true) {
         saveDocument(); emptyState.isHidden = canvas.engineBridge.strokeCount > 0
+        if refreshRails { refreshRails() }
         updateUndoRedoState(); canvas.setNeedsDisplay()
     }
 
@@ -92,7 +93,7 @@ final class DraftingTableViewController: UIViewController {
             persistence.quarantineCorruptArchive()
             return
         }
-        emptyState.isHidden = canvas.engineBridge.strokeCount > 0; canvas.setNeedsDisplay()
+        emptyState.isHidden = canvas.engineBridge.strokeCount > 0; canvas.setNeedsDisplay(); refreshRails()
     }
 
     private func applyStoredSettings() {
@@ -136,13 +137,101 @@ final class DraftingTableViewController: UIViewController {
     }
 
     private func configurePagesRail() {
-        styleRail(pagesRail); let stack = UIStackView(arrangedSubviews: [railTitle("PAGES"), pageCard(), disabledPlaceholder(title: "New page · soon")]); stack.axis = .vertical; stack.spacing = 10; stack.alignment = .fill; stack.translatesAutoresizingMaskIntoConstraints = false; pagesRail.addSubview(stack)
-        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: pagesRail.leadingAnchor, constant: 8), stack.trailingAnchor.constraint(equalTo: pagesRail.trailingAnchor, constant: -8), stack.topAnchor.constraint(equalTo: pagesRail.topAnchor, constant: 10), stack.bottomAnchor.constraint(lessThanOrEqualTo: pagesRail.bottomAnchor, constant: -10)])
+        pagesRail.onSelect = { [weak self] index in
+            guard let self else { return }
+            self.canvas.engineBridge.setActivePageIndex(index)
+            self.documentDidChange()
+        }
+        pagesRail.onAdd = { [weak self] in self?.addPage() }
+        pagesRail.onRename = { [weak self] index in self?.renamePage(at: index) }
+        pagesRail.onDelete = { [weak self] index in self?.deletePage(at: index) }
     }
 
     private func configureLayersRail() {
-        styleRail(layersRail); let stack = UIStackView(arrangedSubviews: [railTitle("LAYERS"), layerRow("✎", "Ink", selected: true), layerRow("□", "Paper", selected: false), disabledPlaceholder(title: "New layer · soon")]); stack.axis = .vertical; stack.spacing = 8; stack.translatesAutoresizingMaskIntoConstraints = false; layersRail.addSubview(stack)
-        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: layersRail.leadingAnchor, constant: 8), stack.trailingAnchor.constraint(equalTo: layersRail.trailingAnchor, constant: -8), stack.topAnchor.constraint(equalTo: layersRail.topAnchor, constant: 10), stack.bottomAnchor.constraint(lessThanOrEqualTo: layersRail.bottomAnchor, constant: -10)])
+        layersRail.onSelect = { [weak self] index in
+            guard let self else { return }
+            self.canvas.engineBridge.setActiveLayerIndex(index)
+            self.documentDidChange()
+        }
+        layersRail.onAdd = { [weak self] in self?.addLayer() }
+        layersRail.onRename = { [weak self] index in self?.renameLayer(at: index) }
+        layersRail.onDelete = { [weak self] index in self?.deleteLayer(at: index) }
+        layersRail.onVisibility = { [weak self] visible, index in
+            guard let self else { return }
+            self.canvas.engineBridge.setLayerVisible(visible, at: index)
+            self.documentDidChange()
+        }
+        layersRail.onOpacity = { [weak self] opacity, index in
+            guard let self else { return }
+            self.canvas.engineBridge.setLayerOpacity(opacity, at: index)
+            // Keep the slider alive while it is being dragged; the row updates
+            // its percentage label locally. A later mutation refreshes all
+            // metadata from the bridge.
+            self.documentDidChange(refreshRails: false)
+        }
+    }
+
+    private func refreshRails() {
+        pagesRail.pageInfos = canvas.engineBridge.pageInfos
+        layersRail.layerInfos = canvas.engineBridge.layerInfos
+    }
+
+    private func addPage() {
+        canvas.engineBridge.addPage()
+        documentDidChange()
+    }
+
+    private func deletePage(at index: Int) {
+        guard canvas.engineBridge.pageInfos.count > 1 else { return }
+        canvas.engineBridge.deletePage(at: index)
+        documentDidChange()
+    }
+
+    private func renamePage(at index: Int) {
+        guard index >= 0, index < canvas.engineBridge.pageInfos.count else { return }
+        let current = canvas.engineBridge.pageInfos[index].name
+        let alert = UIAlertController(title: "Rename page", message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = current
+            field.placeholder = "Page name"
+            field.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self, weak alert] _ in
+            guard let self, let name = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return }
+            self.canvas.engineBridge.renamePage(at: index, name: name)
+            self.documentDidChange()
+        })
+        present(alert, animated: true)
+    }
+
+    private func addLayer() {
+        canvas.engineBridge.addLayer()
+        documentDidChange()
+    }
+
+    private func deleteLayer(at index: Int) {
+        guard canvas.engineBridge.layerInfos.count > 1 else { return }
+        canvas.engineBridge.deleteLayer(at: index)
+        documentDidChange()
+    }
+
+    private func renameLayer(at index: Int) {
+        guard index >= 0, index < canvas.engineBridge.layerInfos.count else { return }
+        let current = canvas.engineBridge.layerInfos[index].name
+        let alert = UIAlertController(title: "Rename layer", message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = current
+            field.placeholder = "Layer name"
+            field.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self, weak alert] _ in
+            guard let self, let name = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return }
+            self.canvas.engineBridge.renameLayer(at: index, name: name)
+            self.documentDidChange()
+        })
+        present(alert, animated: true)
     }
 
     private func configureToolRail() {
