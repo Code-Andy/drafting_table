@@ -15,8 +15,6 @@ typedef struct {
     float predicted;
     float opacity;
     float eraser;
-    vector_float4 color;
-    float hardness;
 } DTMetalVertex;
 
 namespace {
@@ -42,10 +40,6 @@ static float finiteOr(float value, float fallback) {
 
 static float clamp01(float value) { return fmaxf(0.0f, fminf(1.0f, value)); }
 
-static vector_float4 graphiteColor() {
-    return (vector_float4){0.075f, 0.080f, 0.082f, 1.0f};
-}
-
 static vector_float4 colorFromRGBA(uint32_t rgba) {
     return (vector_float4){
         ((rgba >> 24) & 0xffu) / 255.0f,
@@ -67,20 +61,17 @@ static void addTriangle(std::vector<DTMetalVertex>& out,
                         vector_float2 a, vector_float2 b, vector_float2 c,
                         float pressure, float predicted,
                         float opacity, float eraser) {
-    const vector_float4 color = eraser > 0.5f
-        ? (vector_float4){0.965f, 0.945f, 0.900f, 1.0f} : graphiteColor();
-    out.push_back({a, pressure, predicted, opacity, eraser, color, 1.0f});
-    out.push_back({b, pressure, predicted, opacity, eraser, color, 1.0f});
-    out.push_back({c, pressure, predicted, opacity, eraser, color, 1.0f});
+    out.push_back({a, pressure, predicted, opacity, eraser});
+    out.push_back({b, pressure, predicted, opacity, eraser});
+    out.push_back({c, pressure, predicted, opacity, eraser});
 }
 
 static void addTriangleStyled(std::vector<DTMetalVertex>& out,
                               vector_float2 a, vector_float2 b, vector_float2 c,
                               float pressure, float predicted, float opacity,
                               float eraser, vector_float4 color, float hardness) {
-    out.push_back({a, pressure, predicted, opacity, eraser, color, hardness});
-    out.push_back({b, pressure, predicted, opacity, eraser, color, hardness});
-    out.push_back({c, pressure, predicted, opacity, eraser, color, hardness});
+    (void)color; (void)hardness;
+    addTriangle(out, a, b, c, pressure, predicted, opacity, eraser);
 }
 
 static void addRoundCap(std::vector<DTMetalVertex>& out,
@@ -243,6 +234,14 @@ typedef struct {
     vector_float4 viewportScaleRotation;
     vector_float4 translation;
 } DTMetalUniforms;
+
+// Use only aligned float4 members across the Objective-C++/Metal boundary.
+// The earlier per-vertex float4+scalar layout corrupted the simulator heap
+// during pipeline setup. Color/hardness are constant for one draw call.
+typedef struct {
+    vector_float4 color;
+    vector_float4 style;
+} DTMetalFragmentUniforms;
 }
 
 @interface DTMetalRenderer ()
@@ -398,6 +397,10 @@ typedef struct {
                                                                   length:sizeof(DTMetalVertex) * grid.size()
                                                                  options:MTLResourceStorageModeShared];
             if (gridBuffer) {
+                DTMetalFragmentUniforms fragmentUniforms{};
+                fragmentUniforms.color = gridColor;
+                fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
+                [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
                 [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
                 [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
             }
@@ -440,6 +443,10 @@ typedef struct {
                                                                       length:sizeof(DTMetalVertex) * geometry.size()
                                                                      options:MTLResourceStorageModeShared];
                 if (buffer) {
+                    DTMetalFragmentUniforms fragmentUniforms{};
+                    fragmentUniforms.color = strokeColor;
+                    fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
+                    [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
                     [encoder setVertexBuffer:buffer offset:0 atIndex:0];
                     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
                 }
@@ -501,6 +508,10 @@ typedef struct {
                                                               length:sizeof(DTMetalVertex) * geometry.size()
                                                              options:MTLResourceStorageModeShared];
             if (buffer) {
+                DTMetalFragmentUniforms fragmentUniforms{};
+                fragmentUniforms.color = color;
+                fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
+                [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
                 [encoder setVertexBuffer:buffer offset:0 atIndex:0];
                 [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
             }

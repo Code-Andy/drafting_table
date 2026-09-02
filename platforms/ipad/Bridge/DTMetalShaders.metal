@@ -7,8 +7,6 @@ struct DTMetalVertex {
     float predicted;
     float opacity;
     float eraser;
-    float4 color;
-    float hardness;
 };
 
 struct DTVertexOut {
@@ -16,8 +14,6 @@ struct DTVertexOut {
     float predicted;
     float opacity;
     float eraser;
-    float4 color;
-    float hardness;
 };
 
 // Must remain layout-compatible with DTMetalUniforms in DTMetalRenderer.mm:
@@ -25,6 +21,11 @@ struct DTVertexOut {
 struct DTMetalUniforms {
     float4 viewportScaleRotation;
     float4 translation;
+};
+
+struct DTMetalFragmentUniforms {
+    float4 color;
+    float4 style;
 };
 
 vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
@@ -44,11 +45,11 @@ vertex DTVertexOut dt_vertex(const device DTMetalVertex *vertices [[buffer(0)]],
     float2 clip = float2((transformed.x / safeViewport.x) * 2.0 - 1.0,
                          1.0 - (transformed.y / safeViewport.y) * 2.0);
     return {float4(clip, 0.0, 1.0), input.predicted,
-            saturate(input.opacity), input.eraser, input.color,
-            saturate(input.hardness)};
+            saturate(input.opacity), input.eraser};
 }
 
-fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
+fragment float4 dt_fragment(DTVertexOut in [[stage_in]],
+                            constant DTMetalFragmentUniforms &uniforms [[buffer(0)]]) {
     // Real graphite is premultiplied and opaque at the configured brush
     // opacity. Predicted geometry fades to 30%; the same dark hue means a
     // prediction overlapping real ink never brightens it.
@@ -58,9 +59,9 @@ fragment float4 dt_fragment(DTVertexOut in [[stage_in]]) {
     // Brush color is supplied as straight RGBA and is premultiplied here.
     // Hardness controls the edge contribution of the fringe pass; the core
     // remains opaque while a softer brush retains a visible feather.
-    float edge = mix(0.72, 1.0, saturate(in.hardness));
+    float edge = mix(0.72, 1.0, saturate(uniforms.style.x));
     alpha *= edge;
-    float4 color = in.color;
+    float4 color = uniforms.color;
     color.a *= alpha;
     return float4(color.rgb * color.a, color.a);
 }
