@@ -6,6 +6,8 @@
 > [PORTING.md](PORTING.md) for the extraction plan, and
 > [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for the full milestone DAG, and
 > [AGENTIC_SETUP.md](AGENTIC_SETUP.md) for the current orchestration workflow.
+> The dated development history, decisions, build runbook, and exact handoff
+> state are indexed in [documentation/README.md](documentation/README.md).
 
 Ben's notes:
 
