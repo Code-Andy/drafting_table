@@ -12,7 +12,7 @@ This is the exact resume point as of 2026-09-02 in Toronto.
 - Upstream: <https://github.com/bgkatz/drafting_table>
 - Upstream push URL: disabled as `no_push`
 - Project version in `project.yml`: `0.7.0` build `8`
-- Latest released version: `v0.6.0`; `v0.7.0` candidate builds successfully
+- Latest released version: `v0.7.0`
 - Documentation baseline: `ad0c5f8`
 
 ## What HEAD contains
@@ -98,13 +98,23 @@ pre-tag SHA-256 is
 
 ## Exact continuation sequence
 
-1. Publish and install `v0.7.0` build `8`.
+1. Install `v0.7.0` build `8`.
 2. Test color/hardness, all five tools, grid transform, duplicate/reorder,
    thumbnails, hover/double-tap/squeeze, `.drafttable` Open/Save Copy, PNG/PDF,
    autosave, migration, Pencil curves, and two-finger gestures.
 3. Record device feedback as a new dated key-change file.
 4. Begin the sparse raster command path and true eraser after obvious v0.7
    regressions are addressed.
+
+## v0.7 release result
+
+`8eed6ba` was tagged as `v0.7.0`. The tagged build and release workflow passed:
+<https://github.com/Code-Andy/drafting_table/actions/runs/33601680372>.
+
+- Release: <https://github.com/Code-Andy/drafting_table/releases/tag/v0.7.0>
+- IPA: <https://github.com/Code-Andy/drafting_table/releases/download/v0.7.0/DraftingTable.ipa>
+- SHA-256:
+  `5A957E175198B6C34D5612CBC095720C075F768D4326CC3CF59C33646CBC31B0`
 
 ## Known boundaries of the candidate
 
