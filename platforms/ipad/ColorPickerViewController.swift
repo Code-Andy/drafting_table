@@ -330,9 +330,10 @@ final class ColorPickerViewController: UIViewController {
     static func rgbInt(from color: UIColor) -> UInt32 {
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
         guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return 0 }
-        return (UInt32(min(max(r, 0), 1) * 255 + 0.5) << 16) |
-            (UInt32(min(max(g, 0), 1) * 255 + 0.5) << 8) |
-            UInt32(min(max(b, 0), 1) * 255 + 0.5)
+        let ri = UInt32(min(max(r, CGFloat(0)), CGFloat(1)) * CGFloat(255) + CGFloat(0.5))
+        let gi = UInt32(min(max(g, CGFloat(0)), CGFloat(1)) * CGFloat(255) + CGFloat(0.5))
+        let bi = UInt32(min(max(b, CGFloat(0)), CGFloat(1)) * CGFloat(255) + CGFloat(0.5))
+        return (ri << 16) | (gi << 8) | bi
     }
 
     static func hexString(from color: UIColor) -> String {
