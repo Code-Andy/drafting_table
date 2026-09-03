@@ -57,6 +57,8 @@
 	<true/>
 	<key>UIUserInterfaceStyle</key>
 	<string>Light</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Drafting Table uses your photo library to import images onto the canvas.</string>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>

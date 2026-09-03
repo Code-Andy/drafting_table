@@ -8,14 +8,14 @@ enum DocumentExportService {
     private static let maximumDimension: CGFloat = 8_192
     private static let maximumPixels: CGFloat = 64 * 1_024 * 1_024
 
-    static func pngData(strokes: [DTRenderStroke], canvasSize: CGSize) -> Data? {
+    static func pngData(strokes: [DTRenderStroke], canvasSize: CGSize, transparentBackground: Bool = false) -> Data? {
         guard let size = validated(canvasSize) else { return nil }
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
-        format.opaque = true
+        format.opaque = !transparentBackground
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
         return renderer.image { context in
-            drawPage(strokes: strokes, size: size, context: context.cgContext)
+            drawPage(strokes: strokes, size: size, context: context.cgContext, fillBackground: !transparentBackground)
         }.pngData()
     }
 
@@ -61,10 +61,13 @@ enum DocumentExportService {
 
     private static func drawPage(strokes: [DTRenderStroke],
                                  size: CGSize,
-                                 context: CGContext) {
+                                 context: CGContext,
+                                 fillBackground: Bool = true) {
         context.saveGState()
-        context.setFillColor(paperColor.cgColor)
-        context.fill(CGRect(origin: .zero, size: size))
+        if fillBackground {
+            context.setFillColor(paperColor.cgColor)
+            context.fill(CGRect(origin: .zero, size: size))
+        }
         context.setLineCap(.round)
         context.setLineJoin(.round)
 
@@ -97,7 +100,7 @@ enum DocumentExportService {
                 let circleRect = CGRect(x: center.x - side * 0.5, y: center.y - side * 0.5, width: side, height: side)
                 context.setLineWidth(max(1, stroke.brushSize))
                 context.strokeEllipse(in: circleRect)
-            case .shade:
+            case .shade, .bucket:
                 if points.count >= 3 {
                     context.beginPath()
                     context.move(to: CGPoint(x: CGFloat(points[0].x), y: CGFloat(points[0].y)))

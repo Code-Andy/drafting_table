@@ -87,9 +87,8 @@ final class PagesRailView: UIView {
             stack.addArrangedSubview(card)
         }
         let add = UIButton(type: .system)
-        add.setTitle("＋", for: .normal)
-        add.titleLabel?.font = .systemFont(ofSize: 24, weight: .medium)
-        add.setTitleColor(.systemBlue, for: .normal)
+        add.setImage(UIImage(systemName: "plus"), for: .normal)
+        add.tintColor = .systemBlue
         add.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
         add.layer.cornerRadius = 7
         add.heightAnchor.constraint(equalToConstant: 38).isActive = true
@@ -243,9 +242,12 @@ final class LayersRailView: UIView {
             stack.addArrangedSubview(row)
         }
         let add = UIButton(type: .system)
-        add.setTitle("＋ Layer", for: .normal)
-        add.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
-        add.setTitleColor(.systemBlue, for: .normal)
+        var addCfg = UIButton.Configuration.plain()
+        addCfg.image = UIImage(systemName: "plus")
+        addCfg.title = "Layer"
+        addCfg.imagePadding = 4
+        addCfg.baseForegroundColor = .systemBlue
+        add.configuration = addCfg
         add.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
         add.layer.cornerRadius = 7
         add.heightAnchor.constraint(equalToConstant: 34).isActive = true

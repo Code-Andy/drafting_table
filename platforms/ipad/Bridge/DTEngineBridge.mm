@@ -122,6 +122,46 @@ PencilSample toCoreSample(const DTPencilSample& input) {
     for (NSNumber *n in indices) vec.push_back(n.unsignedIntegerValue);
     return _engine->duplicateStrokes(vec, (float)dx, (float)dy);
 }
+- (BOOL)scaleStrokesWithIndices:(NSArray<NSNumber *> *)indices sx:(CGFloat)sx sy:(CGFloat)sy originX:(CGFloat)originX originY:(CGFloat)originY {
+    if (!_engine || indices.count == 0) return NO;
+    std::vector<std::size_t> vec;
+    vec.reserve(indices.count);
+    for (NSNumber *n in indices) vec.push_back(n.unsignedIntegerValue);
+    return _engine->scaleStrokes(vec, (float)sx, (float)sy, (float)originX, (float)originY);
+}
+- (BOOL)rotateStrokesWithIndices:(NSArray<NSNumber *> *)indices angle:(CGFloat)angle originX:(CGFloat)originX originY:(CGFloat)originY {
+    if (!_engine || indices.count == 0) return NO;
+    std::vector<std::size_t> vec;
+    vec.reserve(indices.count);
+    for (NSNumber *n in indices) vec.push_back(n.unsignedIntegerValue);
+    return _engine->rotateStrokes(vec, (float)angle, (float)originX, (float)originY);
+}
+- (NSInteger)hitTestStrokeAtX:(CGFloat)x y:(CGFloat)y tolerance:(CGFloat)tolerance {
+    if (!_engine) return -1;
+    auto idx = _engine->hitTestStroke((float)x, (float)y, (float)tolerance);
+    return idx == std::numeric_limits<std::size_t>::max() ? -1 : (NSInteger)idx;
+}
+- (BOOL)insertPoints:(NSArray<NSValue *> *)points tool:(DTTool)tool brushSize:(CGFloat)brushSize brushOpacity:(CGFloat)brushOpacity brushColorRGBA:(uint32_t)brushColorRGBA brushHardness:(CGFloat)brushHardness {
+    if (!_engine || points.count == 0) return NO;
+    drafting_table::ipad::Stroke s;
+    s.tool = static_cast<drafting_table::ipad::DTTool>(tool);
+    s.brushSize = (float)brushSize;
+    s.brushOpacity = (float)brushOpacity;
+    s.brushColorRGBA = brushColorRGBA;
+    s.brushHardness = (float)brushHardness;
+    s.points.reserve(points.count);
+    for (NSValue *val in points) {
+        DTRenderPoint rp = {0, 0, 1.0f, 0};
+        [val getValue:&rp size:sizeof(rp)];
+        drafting_table::PencilSample ps;
+        ps.x = rp.x;
+        ps.y = rp.y;
+        ps.pressure = rp.pressure;
+        ps.flags = rp.predicted ? drafting_table::SampleFlags::Predicted : drafting_table::SampleFlags::None;
+        s.points.push_back(ps);
+    }
+    return _engine->addStroke(s);
+}
 - (CGFloat)brushSize { return _engine ? _engine->brushSize() : 8.0; }
 - (void)setBrushSize:(CGFloat)size { if (_engine) _engine->setBrushSize((float)size); }
 - (CGFloat)brushOpacity { return _engine ? _engine->brushOpacity() : 1.0; }

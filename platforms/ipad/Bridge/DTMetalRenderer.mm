@@ -31,6 +31,7 @@ struct DTCanvasTransformState {
     bool gridVisible = false;
     float gridSpacing = 32.0f;
     bool pixelGridVisible = false;
+    bool centerMode = false;
 };
 
 static DTCanvasTransformState gCanvasTransform;
@@ -171,18 +172,18 @@ static void addShapeOutline(std::vector<DTMetalVertex>& out,
         return;
     }
     if (tool == 4u) { // ellipse
-        const vector_float2 center = (first + last) * 0.5f;
-        const vector_float2 radii = (vector_float2){
-            fmaxf(0.5f, fabsf(last.x - first.x) * 0.5f),
-            fmaxf(0.5f, fabsf(last.y - first.y) * 0.5f)};
+        const vector_float2 center = gCanvasTransform.centerMode ? first : ((first + last) * 0.5f);
+        const vector_float2 radii = gCanvasTransform.centerMode
+            ? (vector_float2){fmaxf(0.5f, fabsf(last.x - first.x)), fmaxf(0.5f, fabsf(last.y - first.y))}
+            : (vector_float2){fmaxf(0.5f, fabsf(last.x - first.x) * 0.5f), fmaxf(0.5f, fabsf(last.y - first.y) * 0.5f)};
         addEllipseOutline(out, center, radii, radius, opacity, color, hardness);
         return;
     }
-    if (tool == 5u) { // circle: corner-drag defines the bounding square
-        const vector_float2 center = (first + last) * 0.5f;
-        const float circleRadius = fmaxf(
-            0.5f,
-            fmaxf(fabsf(last.x - first.x), fabsf(last.y - first.y)) * 0.5f);
+    if (tool == 5u) { // circle: corner-drag defines the bounding square, center-drag defines radius from center
+        const vector_float2 center = gCanvasTransform.centerMode ? first : ((first + last) * 0.5f);
+        const float circleRadius = gCanvasTransform.centerMode
+            ? fmaxf(0.5f, hypotf(last.x - first.x, last.y - first.y))
+            : fmaxf(0.5f, fmaxf(fabsf(last.x - first.x), fabsf(last.y - first.y)) * 0.5f);
         addEllipseOutline(out, center, (vector_float2){circleRadius, circleRadius},
                           radius, opacity, color, hardness);
         return;
@@ -385,6 +386,11 @@ typedef struct {
 - (void)updatePixelGridVisible:(BOOL)visible {
     std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
     gCanvasTransform.pixelGridVisible = visible;
+}
+
+- (void)updateCenterMode:(BOOL)centerMode {
+    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
+    gCanvasTransform.centerMode = centerMode;
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
@@ -603,7 +609,7 @@ typedef struct {
             const float passOpacity = fringe ? fringeOpacity : opacity;
             std::vector<DTMetalVertex> geometry;
             geometry.reserve(points.size() * 28);
-            if (tool == 6u && !fringe && points.size() >= 3) {
+            if ((tool == 6u || tool == 7u) && !fringe && points.size() >= 3) {
                 addPolygonFill(geometry, points, passOpacity, color, hardness);
             }
             if (points.size() == 1) {

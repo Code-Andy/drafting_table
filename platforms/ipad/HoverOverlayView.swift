@@ -297,6 +297,19 @@ final class HoverOverlayView: UIView {
                 context.fill(handleRect)
                 context.stroke(handleRect)
             }
+
+            // Draw Rotation Handle Lever at top center
+            let rotCenter = CGPoint(x: insetBounds.midX, y: insetBounds.minY - 22)
+            context.setStrokeColor(UIColor.systemBlue.cgColor)
+            context.setLineWidth(1.5)
+            context.strokeLineSegments(between: [
+                CGPoint(x: insetBounds.midX, y: insetBounds.minY),
+                rotCenter
+            ])
+            let rotRect = CGRect(x: rotCenter.x - 5, y: rotCenter.y - 5, width: 10, height: 10)
+            context.setFillColor(UIColor.systemOrange.cgColor)
+            context.fillEllipse(in: rotRect)
+            context.strokeEllipse(in: rotRect)
         }
 
         context.restoreGState()

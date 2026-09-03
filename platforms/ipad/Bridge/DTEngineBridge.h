@@ -43,8 +43,9 @@ typedef NS_ENUM(uint8_t, DTTool) {
     DTToolEllipse = 4,
     DTToolCircle = 5,
     DTToolShade = 6,
-    DTToolSelect = 7,
-    DTToolLasso = 8,
+    DTToolBucket = 7,
+    DTToolSelect = 8,
+    DTToolLasso = 9,
 };
 
 /// Immutable render snapshot carrying the stroke's style as well as its
@@ -138,8 +139,12 @@ typedef NS_ENUM(uint8_t, DTTool) {
 
 @property(nonatomic, readonly) NSUInteger activeLayerStrokeCount;
 - (BOOL)moveStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy NS_SWIFT_NAME(moveStrokes(at:dx:dy:));
+- (BOOL)scaleStrokesWithIndices:(NSArray<NSNumber *> *)indices sx:(CGFloat)sx sy:(CGFloat)sy originX:(CGFloat)originX originY:(CGFloat)originY NS_SWIFT_NAME(scaleStrokes(at:sx:sy:originX:originY:));
+- (BOOL)rotateStrokesWithIndices:(NSArray<NSNumber *> *)indices angle:(CGFloat)angle originX:(CGFloat)originX originY:(CGFloat)originY NS_SWIFT_NAME(rotateStrokes(at:angle:originX:originY:));
 - (BOOL)deleteStrokesWithIndices:(NSArray<NSNumber *> *)indices NS_SWIFT_NAME(deleteStrokes(at:));
 - (BOOL)duplicateStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy NS_SWIFT_NAME(duplicateStrokes(at:dx:dy:));
+- (NSInteger)hitTestStrokeAtX:(CGFloat)x y:(CGFloat)y tolerance:(CGFloat)tolerance NS_SWIFT_NAME(hitTestStroke(atX:y:tolerance:));
+- (BOOL)insertPoints:(NSArray<NSValue *> *)points tool:(DTTool)tool brushSize:(CGFloat)brushSize brushOpacity:(CGFloat)brushOpacity brushColorRGBA:(uint32_t)brushColorRGBA brushHardness:(CGFloat)brushHardness NS_SWIFT_NAME(insertStroke(points:tool:brushSize:brushOpacity:brushColorRGBA:brushHardness:));
 
 - (NSData *)archiveData;
 - (BOOL)loadArchiveData:(NSData *)data;

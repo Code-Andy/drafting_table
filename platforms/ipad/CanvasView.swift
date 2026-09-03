@@ -87,12 +87,20 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     var snapToGrid: Bool = false
     var gridSpacing: CGFloat = 32
 
+    var shapeCenterMode: Bool = false {
+        didSet {
+            renderer?.updateCenterMode(shapeCenterMode)
+            onCenterModeChanged?(shapeCenterMode)
+        }
+    }
+    var onCenterModeChanged: ((Bool) -> Void)?
+
     private var uiTool: DTTool = .brush
     var currentTool: DTTool {
         get { uiTool }
         set {
             uiTool = newValue
-            if newValue.rawValue <= DTTool.shade.rawValue {
+            if newValue.rawValue <= DTTool.bucket.rawValue {
                 engineBridge.tool = newValue
             }
             if newValue != .select && newValue != .lasso {
@@ -109,6 +117,13 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     var selectedBoundingBox: CGRect?
     private var isSelecting = false
     private var isMovingSelection = false
+    private var isRotatingSelection = false
+    private var isScalingSelection = false
+    private var selectionScaleCornerIdx: Int = 0
+    private var selectionScaleOppositeDocPoint: CGPoint = .zero
+    private var selectionScaleStartDocPoint: CGPoint = .zero
+    private var selectionRotateStartAngle: CGFloat = 0
+    private var selectionCenterDocPoint: CGPoint = .zero
     private var selectionDragStartDocPoint: CGPoint = .zero
     private var selectionStartViewPoint: CGPoint = .zero
     private var shapeStartDocPoint: CGPoint?
@@ -227,6 +242,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     private func updateGridRenderer() {
         renderer?.updateGridVisible(gridVisible, spacing: 32)
         renderer?.updatePixelGridVisible(pixelGridVisible)
+        renderer?.updateCenterMode(shapeCenterMode)
     }
 
     private var activeToolName: String {
@@ -237,6 +253,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         case .ellipse: return "ellipse"
         case .circle: return "circle"
         case .shade: return "shade"
+        case .bucket: return "bucket"
         case .select: return "select"
         case .lasso: return "lasso"
         default: return "brush"
@@ -431,21 +448,77 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         if currentTool == .select || currentTool == .lasso {
             let loc = touch.preciseLocation(in: self)
             let docLoc = documentPoint(for: loc)
-            if let box = selectedBoundingBox, box.contains(docLoc) {
-                isMovingSelection = true
-                selectionDragStartDocPoint = docLoc
-            } else {
-                isMovingSelection = false
-                clearSelection()
-                isSelecting = true
-                selectionStartViewPoint = loc
-                if currentTool == .select {
-                    hoverOverlay?.isSelecting = true
-                    hoverOverlay?.selectionRect = CGRect(origin: loc, size: .zero)
-                } else {
-                    hoverOverlay?.isSelecting = true
-                    hoverOverlay?.lassoPoints = [loc]
+
+            if let box = selectedBoundingBox, !selectedStrokeIndices.isEmpty {
+                // Check if hit rotation handle lever
+                let pTopMid = viewPoint(for: CGPoint(x: box.midX, y: box.minY))
+                let rotPinView = CGPoint(x: pTopMid.x, y: pTopMid.y - 22)
+                if hypot(loc.x - rotPinView.x, loc.y - rotPinView.y) <= 22.0 {
+                    isRotatingSelection = true
+                    selectionCenterDocPoint = CGPoint(x: box.midX, y: box.midY)
+                    selectionRotateStartAngle = atan2(docLoc.y - box.midY, docLoc.x - box.midX)
+                    return
                 }
+
+                // Check corner handles for scaling
+                let corners = [
+                    CGPoint(x: box.minX, y: box.minY),
+                    CGPoint(x: box.maxX, y: box.minY),
+                    CGPoint(x: box.maxX, y: box.maxY),
+                    CGPoint(x: box.minX, y: box.maxY)
+                ]
+                var hitCornerIndex = -1
+                for (idx, corner) in corners.enumerated() {
+                    let vCorner = viewPoint(for: corner)
+                    if hypot(loc.x - vCorner.x, loc.y - vCorner.y) <= 20.0 {
+                        hitCornerIndex = idx
+                        break
+                    }
+                }
+                if hitCornerIndex >= 0 {
+                    isScalingSelection = true
+                    selectionScaleCornerIdx = hitCornerIndex
+                    selectionScaleOppositeDocPoint = corners[(hitCornerIndex + 2) % 4]
+                    selectionScaleStartDocPoint = docLoc
+                    return
+                }
+
+                // Check inside selection box for moving
+                if box.insetBy(dx: -8, dy: -8).contains(docLoc) {
+                    isMovingSelection = true
+                    selectionDragStartDocPoint = docLoc
+                    return
+                }
+            }
+
+            // Check tap-to-select single stroke
+            let hitIdx = engineBridge.hitTestStroke(atX: docLoc.x, y: docLoc.y, tolerance: 16.0 / canvasScale)
+            if hitIdx >= 0 {
+                isMovingSelection = false
+                isRotatingSelection = false
+                isScalingSelection = false
+                selectedStrokeIndices = [Int(hitIdx)]
+                recalculateSelectionBounds(for: selectedStrokeIndices)
+                updateSelectionBoundsOverlay()
+                setNeedsDisplay()
+                onSelectionChanged?(selectedStrokeIndices, selectedBoundingBox)
+                HapticFeedbackService.shared.toolSwitched()
+                return
+            }
+
+            // Start new selection
+            isMovingSelection = false
+            isRotatingSelection = false
+            isScalingSelection = false
+            clearSelection()
+            isSelecting = true
+            selectionStartViewPoint = loc
+            if currentTool == .select {
+                hoverOverlay?.isSelecting = true
+                hoverOverlay?.selectionRect = CGRect(origin: loc, size: .zero)
+            } else {
+                hoverOverlay?.isSelecting = true
+                hoverOverlay?.lassoPoints = [loc]
             }
             return
         }
@@ -475,7 +548,34 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         if currentTool == .select || currentTool == .lasso {
             let loc = activeTouch.preciseLocation(in: self)
             let docLoc = documentPoint(for: loc)
-            if isMovingSelection {
+            if isRotatingSelection {
+                let currentAngle = atan2(docLoc.y - selectionCenterDocPoint.y, docLoc.x - selectionCenterDocPoint.x)
+                let deltaAngle = currentAngle - selectionRotateStartAngle
+                if abs(deltaAngle) >= 0.01 {
+                    let nsIndices = selectedStrokeIndices.map { NSNumber(value: $0) }
+                    _ = engineBridge.rotateStrokes(at: nsIndices, angle: deltaAngle, originX: selectionCenterDocPoint.x, originY: selectionCenterDocPoint.y)
+                    selectionRotateStartAngle = currentAngle
+                    recalculateSelectionBounds(for: selectedStrokeIndices)
+                    updateSelectionBoundsOverlay()
+                    setNeedsDisplay()
+                }
+            } else if isScalingSelection {
+                let opp = selectionScaleOppositeDocPoint
+                let origDistX = abs(selectionScaleStartDocPoint.x - opp.x)
+                let origDistY = abs(selectionScaleStartDocPoint.y - opp.y)
+                let curDistX = abs(docLoc.x - opp.x)
+                let curDistY = abs(docLoc.y - opp.y)
+                if origDistX > 2.0 && origDistY > 2.0 && curDistX > 2.0 && curDistY > 2.0 {
+                    let sx = curDistX / origDistX
+                    let sy = curDistY / origDistY
+                    let nsIndices = selectedStrokeIndices.map { NSNumber(value: $0) }
+                    _ = engineBridge.scaleStrokes(at: nsIndices, sx: sx, sy: sy, originX: opp.x, originY: opp.y)
+                    selectionScaleStartDocPoint = docLoc
+                    recalculateSelectionBounds(for: selectedStrokeIndices)
+                    updateSelectionBoundsOverlay()
+                    setNeedsDisplay()
+                }
+            } else if isMovingSelection {
                 let dx = docLoc.x - selectionDragStartDocPoint.x
                 let dy = docLoc.y - selectionDragStartDocPoint.y
                 if abs(dx) >= 0.5 || abs(dy) >= 0.5 {
@@ -538,8 +638,12 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
         // Selection & Transform mode
         if currentTool == .select || currentTool == .lasso {
-            if isMovingSelection {
+            if isMovingSelection || isScalingSelection || isRotatingSelection {
                 isMovingSelection = false
+                isScalingSelection = false
+                isRotatingSelection = false
+                recalculateSelectionBounds(for: selectedStrokeIndices)
+                updateSelectionBoundsOverlay()
                 onDocumentChanged?()
             } else if isSelecting {
                 isSelecting = false
@@ -550,14 +654,43 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
 
         if strokeEngaged {
-            if activeTouch.type != .pencil || normalizedForce(of: activeTouch) >= releasePressure {
-                var finalSample = makeSample(activeTouch, predicted: false)
-                withUnsafePointer(to: &finalSample) { pointer in
-                    engineBridge.appendSamples(pointer, count: 1, realCount: 1)
+            if (currentTool == .circle || currentTool == .ellipse), shapeCenterMode, let start = shapeStartDocPoint {
+                let end = documentPoint(for: activeTouch.preciseLocation(in: self))
+                engineBridge.cancelStroke()
+                engineBridge.beginStroke()
+                var p0 = DTPencilSample()
+                var p1 = DTPencilSample()
+                if currentTool == .circle {
+                    let r = max(1.0, hypot(end.x - start.x, end.y - start.y))
+                    p0.x = Float(start.x - r)
+                    p0.y = Float(start.y - r)
+                    p1.x = Float(start.x + r)
+                    p1.y = Float(start.y + r)
+                } else {
+                    let rx = max(1.0, abs(end.x - start.x))
+                    let ry = max(1.0, abs(end.y - start.y))
+                    p0.x = Float(start.x - rx)
+                    p0.y = Float(start.y - ry)
+                    p1.x = Float(start.x + rx)
+                    p1.y = Float(start.y + ry)
                 }
+                p0.pressure = 1.0; p1.pressure = 1.0
+                var samples = [p0, p1]
+                samples.withUnsafeBufferPointer { buffer in
+                    engineBridge.appendSamples(buffer.baseAddress, count: 2, realCount: 2)
+                }
+                engineBridge.endStroke()
+                onDocumentChanged?()
+            } else {
+                if activeTouch.type != .pencil || normalizedForce(of: activeTouch) >= releasePressure {
+                    var finalSample = makeSample(activeTouch, predicted: false)
+                    withUnsafePointer(to: &finalSample) { pointer in
+                        engineBridge.appendSamples(pointer, count: 1, realCount: 1)
+                    }
+                }
+                engineBridge.endStroke()
+                onDocumentChanged?()
             }
-            engineBridge.endStroke()
-            onDocumentChanged?()
         }
         strokeEngaged = false
         shapeStartDocPoint = nil
@@ -573,6 +706,8 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         lastSnappedAngleIndex = -1
         if currentTool == .select || currentTool == .lasso {
             isMovingSelection = false
+            isRotatingSelection = false
+            isScalingSelection = false
             isSelecting = false
             hoverOverlay?.clearSelectionOverlay()
             self.activeTouch = nil
@@ -589,6 +724,30 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     }
 
     // MARK: - Selection Operations
+
+    private func recalculateSelectionBounds(for indices: [Int]) {
+        guard !indices.isEmpty else {
+            selectedBoundingBox = nil
+            return
+        }
+        let strokes = engineBridge.renderableStrokes()
+        var unionBounds: CGRect?
+        for idx in indices {
+            guard idx < strokes.count else { continue }
+            let stroke = strokes[idx]
+            for val in stroke.points {
+                var rp = DTRenderPoint()
+                val.getValue(&rp)
+                let pt = CGPoint(x: CGFloat(rp.x), y: CGFloat(rp.y))
+                if let u = unionBounds {
+                    unionBounds = u.union(CGRect(origin: pt, size: .zero))
+                } else {
+                    unionBounds = CGRect(origin: pt, size: .zero)
+                }
+            }
+        }
+        selectedBoundingBox = unionBounds?.insetBy(dx: -4, dy: -4)
+    }
 
     func clearSelection() {
         selectedStrokeIndices.removeAll()

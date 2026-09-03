@@ -178,6 +178,25 @@ int main() {
     CHECK(document.deleteStrokes(lastIdx));
     CHECK(document.activeLayerStrokeCount() == activeBefore);
 
+    // Scale and rotate strokes around origin
+    const float preScaleX = document.snapshot()[0].points[0].x;
+    const float preScaleY = document.snapshot()[0].points[0].y;
+    CHECK(document.scaleStrokes(targetIdx, 2.0f, 2.0f, preScaleX, preScaleY));
+    CHECK(document.snapshot()[0].points[0].x == preScaleX);
+    CHECK(document.rotateStrokes(targetIdx, 0.0f, preScaleX, preScaleY));
+
+    // Hit-testing strokes
+    CHECK(document.hitTestStroke(preScaleX, preScaleY, 5.0f) == 0);
+    CHECK(document.hitTestStroke(preScaleX + 1000.0f, preScaleY + 1000.0f, 5.0f) == std::numeric_limits<std::size_t>::max());
+
+    // Add explicit stroke
+    dt_ipad::Stroke customStroke;
+    customStroke.points.push_back(sample);
+    customStroke.tool = dt_ipad::DTTool::Bucket;
+    document.selectLayer(document.layerNames().size() - 1);
+    CHECK(document.addStroke(customStroke));
+    CHECK(document.snapshot().back().tool == dt_ipad::DTTool::Bucket);
+
     const auto v1 = makeVersion1Archive(sample);
     dt_ipad::Engine migrated;
     CHECK(migrated.loadArchive(v1));

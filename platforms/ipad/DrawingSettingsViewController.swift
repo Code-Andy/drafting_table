@@ -9,6 +9,9 @@ final class DrawingSettingsViewController: UIViewController {
     static let brushHardnessKey = "draftingTable.brushHardness"
     static let brushColorKey = "draftingTable.brushColorRGBA"
     static let gridKey = "draftingTable.gridVisible"
+    static let showDiagnosticsKey = "draftingTable.showDiagnostics"
+    static let shapeCenterModeKey = "draftingTable.shapeCenterMode"
+    static let transparentExportKey = "draftingTable.transparentExport"
     static let defaultBrushColorRGBA: UInt32 = 0x1B1712FF
 
     var onActivationChanged: ((CGFloat) -> Void)?
@@ -17,6 +20,9 @@ final class DrawingSettingsViewController: UIViewController {
     var onBrushHardnessChanged: ((CGFloat) -> Void)?
     var onBrushColorChanged: ((UInt32) -> Void)?
     var onGridChanged: ((Bool) -> Void)?
+    var onDiagnosticsChanged: ((Bool) -> Void)?
+    var onShapeCenterModeChanged: ((Bool) -> Void)?
+    var onTransparentExportChanged: ((Bool) -> Void)?
 
     private let activationSlider = UISlider()
     private let sizeSlider = UISlider()
@@ -24,6 +30,9 @@ final class DrawingSettingsViewController: UIViewController {
     private let hardnessSlider = UISlider()
     private let colorWell = UIColorWell()
     private let gridSwitch = UISwitch()
+    private let diagnosticsSwitch = UISwitch()
+    private let centerModeSwitch = UISwitch()
+    private let transparentExportSwitch = UISwitch()
     private let activationValue = UILabel()
     private let sizeValue = UILabel()
     private let opacityValue = UILabel()
@@ -68,6 +77,19 @@ final class DrawingSettingsViewController: UIViewController {
         gridSwitch.isOn = defaults.bool(forKey: Self.gridKey)
         gridSwitch.accessibilityLabel = "Show grid"
         gridSwitch.addTarget(self, action: #selector(gridChanged(_:)), for: .valueChanged)
+
+        diagnosticsSwitch.isOn = defaults.bool(forKey: Self.showDiagnosticsKey)
+        diagnosticsSwitch.accessibilityLabel = "Show diagnostics overlay"
+        diagnosticsSwitch.addTarget(self, action: #selector(diagnosticsChanged(_:)), for: .valueChanged)
+
+        centerModeSwitch.isOn = defaults.bool(forKey: Self.shapeCenterModeKey)
+        centerModeSwitch.accessibilityLabel = "Center-out circle and ellipse"
+        centerModeSwitch.addTarget(self, action: #selector(centerModeChanged(_:)), for: .valueChanged)
+
+        transparentExportSwitch.isOn = defaults.bool(forKey: Self.transparentExportKey)
+        transparentExportSwitch.accessibilityLabel = "Transparent PNG export"
+        transparentExportSwitch.addTarget(self, action: #selector(transparentExportChanged(_:)), for: .valueChanged)
+
         updateLabels()
 
         let stack = UIStackView(arrangedSubviews: [
@@ -77,7 +99,12 @@ final class DrawingSettingsViewController: UIViewController {
             settingRow(title: "Brush opacity", detail: "Set the opacity of new brush strokes.", slider: opacitySlider, value: opacityValue),
             settingRow(title: "Brush hardness", detail: "Soft edges blend more naturally; hard edges stay crisp.", slider: hardnessSlider, value: hardnessValue),
             colorRow(),
+            sectionTitle("CANVAS & INTERACTION"),
             switchRow(title: "Grid", detail: "Show a drafting grid over the page.", control: gridSwitch),
+            switchRow(title: "Center-Out Shapes", detail: "Draw circle and ellipse radiating from center point.", control: centerModeSwitch),
+            switchRow(title: "Transparent PNG Export", detail: "Omit paper background when exporting PNG images.", control: transparentExportSwitch),
+            sectionTitle("DIAGNOSTICS & DEBUG"),
+            switchRow(title: "Metal Diagnostics Overlay", detail: "Show FPS, render latency, Pencil hover coords, and touch count.", control: diagnosticsSwitch),
             infoLabel()
         ])
         stack.axis = .vertical
@@ -207,6 +234,21 @@ final class DrawingSettingsViewController: UIViewController {
         onGridChanged?(sender.isOn)
     }
 
+    @objc private func diagnosticsChanged(_ sender: UISwitch) {
+        UserDefaults.standard.set(sender.isOn, forKey: Self.showDiagnosticsKey)
+        onDiagnosticsChanged?(sender.isOn)
+    }
+
+    @objc private func centerModeChanged(_ sender: UISwitch) {
+        UserDefaults.standard.set(sender.isOn, forKey: Self.shapeCenterModeKey)
+        onShapeCenterModeChanged?(sender.isOn)
+    }
+
+    @objc private func transparentExportChanged(_ sender: UISwitch) {
+        UserDefaults.standard.set(sender.isOn, forKey: Self.transparentExportKey)
+        onTransparentExportChanged?(sender.isOn)
+    }
+
     private func updateLabels() {
         activationValue.text = String(format: "%.0f%%", activationSlider.value)
         sizeValue.text = String(format: "%.0f pt", sizeSlider.value)
@@ -229,7 +271,9 @@ final class DrawingSettingsViewController: UIViewController {
         detail.textColor = .secondaryLabel
         detail.numberOfLines = 0
         let paletteButton = UIButton(type: .system)
-        paletteButton.setTitle("🎨  Palette, recents & my slots", for: .normal)
+        paletteButton.setTitle(" Palette, recents & my slots", for: .normal)
+        paletteButton.setImage(UIImage(systemName: "paintpalette"), for: .normal)
+        paletteButton.tintColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
         paletteButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
         paletteButton.contentHorizontalAlignment = .leading
         paletteButton.accessibilityLabel = "Open color palette"

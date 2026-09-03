@@ -24,6 +24,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// points and is clamped by the renderer to a practical positive range.
 - (void)updateGridVisible:(BOOL)visible spacing:(CGFloat)spacing;
 - (void)updatePixelGridVisible:(BOOL)visible;
+- (void)updateCenterMode:(BOOL)centerMode;
 
 @property(nonatomic, readonly) NSUInteger frameCount;
 
