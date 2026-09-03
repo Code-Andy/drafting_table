@@ -4,7 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
-namespace drafting_table { namespace {
+namespace drafting_table::ipad { namespace {
 constexpr std::uint32_t kVersion1=1,kVersion2=2,kVersion3=3; constexpr std::size_t kMaxBytes=64u*1024u*1024u; constexpr std::uint32_t kMaxPages=1000,kMaxLayers=1000,kMaxStrokes=100000,kMaxPoints=1000000; constexpr std::uint64_t kMaxTotalPoints=2000000; constexpr std::uint32_t kMaxString=4096;
 template<class T> struct Bits{using type=std::make_unsigned_t<T>;}; template<>struct Bits<float>{using type=std::uint32_t;}; template<>struct Bits<double>{using type=std::uint64_t;};
 template<class T> void put(std::vector<std::uint8_t>&o,T v){using U=typename Bits<T>::type;U b{};if constexpr(std::is_same_v<T,float>||std::is_same_v<T,double>)std::memcpy(&b,&v,sizeof v);else b=(U)v;for(size_t i=0;i<sizeof(U);++i)o.push_back((uint8_t)(b>>(8*i)));}
@@ -18,7 +18,7 @@ bool getString(std::span<const uint8_t>d,size_t&a,std::string&s){uint32_t n=0;if
 void putStroke(std::vector<uint8_t>&o,const Stroke&s){o.push_back((uint8_t)s.tool);o.insert(o.end(),3,0);put<float>(o,s.brushSize);put<float>(o,s.brushOpacity);put<uint32_t>(o,s.brushColorRGBA);put<float>(o,s.brushHardness);put<uint32_t>(o,(uint32_t)s.points.size());for(auto&p:s.points){put<float>(o,p.x);put<float>(o,p.y);put<float>(o,p.pressure);put<float>(o,p.altitude);put<float>(o,p.azimuth);put<float>(o,p.roll);put<float>(o,p.hoverDistance);put<double>(o,p.timestamp);put<uint64_t>(o,p.id);put<uint64_t>(o,p.estimationUpdateIndex);put<uint64_t>(o,p.estimationId);put<uint32_t>(o,(uint32_t)p.flags);}}
 bool getStroke(std::span<const uint8_t>d,size_t&a,Stroke&s,uint64_t&total,uint32_t version){if(a>=d.size())return false;uint8_t raw=d[a++];if(!validTool(raw)||(version<3&&raw>1)||a+3>d.size())return false;a+=3;s.tool=(DTTool)raw;uint32_t n=0,flags=0;if(!get(d,a,s.brushSize)||!get(d,a,s.brushOpacity))return false;if(version>=3){if(!get(d,a,s.brushColorRGBA)||!get(d,a,s.brushHardness))return false;}else{s.brushColorRGBA=kDefaultBrushColorRGBA;s.brushHardness=kDefaultBrushHardness;}if(!get(d,a,n)||!style(s.brushSize,s.brushOpacity,s.brushColorRGBA,s.brushHardness)||n>kMaxPoints||total+n>kMaxTotalPoints)return false;total+=n;s.points.reserve(n);for(uint32_t j=0;j<n;++j){PencilSample p;if(!get(d,a,p.x)||!get(d,a,p.y)||!get(d,a,p.pressure)||!get(d,a,p.altitude)||!get(d,a,p.azimuth)||!get(d,a,p.roll)||!get(d,a,p.hoverDistance)||!get(d,a,p.timestamp)||!get(d,a,p.id)||!get(d,a,p.estimationUpdateIndex)||!get(d,a,p.estimationId)||!get(d,a,flags)||!point(p)||(flags&~0x7fu))return false;p.flags=(SampleFlags)flags;s.points.push_back(p);}return true;}
 }}
-namespace drafting_table {
+namespace drafting_table::ipad {
 Engine::Engine(){pages_.push_back(Page{});pages_[0].layers.push_back(Layer{});}
 DTTool Engine::tool()const{std::lock_guard l(mutex_);return tool_;} void Engine::setTool(DTTool v){std::lock_guard l(mutex_);if(static_cast<std::uint8_t>(v)>static_cast<std::uint8_t>(DTTool::Ellipse))v=DTTool::Brush;if(tool_!=v){tool_=v;++revision_;}}
 float Engine::brushSize()const{std::lock_guard l(mutex_);return brushSize_;} void Engine::setBrushSize(float v){std::lock_guard l(mutex_);v=std::isfinite(v)?std::clamp(v,1.f,40.f):8.f;if(v!=brushSize_){brushSize_=v;++revision_;}}

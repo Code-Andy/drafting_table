@@ -6,7 +6,13 @@
 #include <span>
 #include <string>
 #include <vector>
-namespace drafting_table {
+// NOTE: these types deliberately live in drafting_table::ipad, not
+// drafting_table. core/include/DTDocument.hpp already defines
+// drafting_table::Page and drafting_table::Layer with different layouts;
+// sharing those names caused an ODR violation where the linker folded
+// vector<Page> across translation units and Engine::Engine() overflowed
+// the heap on first launch (v0.7/v0.7.1 beige-screen SIGABRT).
+namespace drafting_table::ipad {
 enum class DTTool : std::uint8_t { Brush = 0, Eraser = 1, Line = 2, Rectangle = 3, Ellipse = 4 };
 constexpr std::uint32_t kDefaultBrushColorRGBA = 0x2B2926FFu;
 constexpr float kDefaultBrushHardness = 0.8f;
@@ -39,4 +45,4 @@ private:
  void rebuildActiveStroke(); void cancelStrokeUnlocked(); std::vector<Stroke> snapshotForPageUnlocked(std::size_t pageIndex) const; Page& activePageUnlocked(){return pages_[activePage_];} const Page& activePageUnlocked()const{return pages_[activePage_];} Layer& activeLayerUnlocked(){auto&p=activePageUnlocked();return p.layers[p.activeLayer];} const Layer& activeLayerUnlocked()const{auto&p=activePageUnlocked();return p.layers[p.activeLayer];}
  mutable std::mutex mutex_; std::vector<Page> pages_; std::size_t activePage_=0; Stroke activeStroke_; DrawingEngine inputEngine_; bool strokeInProgress_=false; DTTool tool_=DTTool::Brush; float brushSize_=8.0f; float brushOpacity_=1.0f; std::uint32_t brushColorRGBA_=kDefaultBrushColorRGBA; float brushHardness_=kDefaultBrushHardness; std::uint64_t revision_=0;
 };
-}
+} // namespace drafting_table::ipad

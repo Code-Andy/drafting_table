@@ -5,8 +5,8 @@
 #include <limits>
 #include <span>
 
-using drafting_table::Engine;
-using drafting_table::Stroke;
+using drafting_table::ipad::Engine;
+using drafting_table::ipad::Stroke;
 using drafting_table::PencilSample;
 
 @implementation DTRenderStroke {
@@ -93,15 +93,15 @@ PencilSample toCoreSample(const DTPencilSample& input) {
     return static_cast<DTTool>(_engine->tool());
 }
 - (void)setTool:(DTTool)tool {
-    if (_engine) _engine->setTool(static_cast<drafting_table::DTTool>(tool));
+    if (_engine) _engine->setTool(static_cast<drafting_table::ipad::DTTool>(tool));
 }
 - (CGFloat)brushSize { return _engine ? _engine->brushSize() : 8.0; }
 - (void)setBrushSize:(CGFloat)size { if (_engine) _engine->setBrushSize((float)size); }
 - (CGFloat)brushOpacity { return _engine ? _engine->brushOpacity() : 1.0; }
 - (void)setBrushOpacity:(CGFloat)opacity { if (_engine) _engine->setBrushOpacity((float)opacity); }
-- (uint32_t)brushColorRGBA { return _engine ? _engine->brushColorRGBA() : drafting_table::kDefaultBrushColorRGBA; }
+- (uint32_t)brushColorRGBA { return _engine ? _engine->brushColorRGBA() : drafting_table::ipad::kDefaultBrushColorRGBA; }
 - (void)setBrushColorRGBA:(uint32_t)color { if (_engine) _engine->setBrushColorRGBA(color); }
-- (CGFloat)brushHardness { return _engine ? _engine->brushHardness() : drafting_table::kDefaultBrushHardness; }
+- (CGFloat)brushHardness { return _engine ? _engine->brushHardness() : drafting_table::ipad::kDefaultBrushHardness; }
 - (void)setBrushHardness:(CGFloat)hardness { if (_engine) _engine->setBrushHardness((float)hardness); }
 - (BOOL)canUndo { return _engine && _engine->canUndo(); }
 - (BOOL)canRedo { return _engine && _engine->canRedo(); }

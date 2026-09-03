@@ -1,5 +1,8 @@
 #include "DTEngine.hpp"
 
+// Bridge engine types live in drafting_table::ipad (see DTEngine.hpp):
+namespace dt_ipad = drafting_table::ipad;
+
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -38,7 +41,7 @@ void appendString(std::vector<std::uint8_t>& out, const char* value) {
 }
 
 void appendLegacyStroke(std::vector<std::uint8_t>& out, const dt::PencilSample& sample) {
-    out.push_back(static_cast<std::uint8_t>(dt::DTTool::Eraser));
+    out.push_back(static_cast<std::uint8_t>(dt_ipad::DTTool::Eraser));
     out.insert(out.end(), 3, 0);
     appendFloat(out, 12.5f);
     appendFloat(out, 0.4f);
@@ -65,7 +68,7 @@ std::vector<std::uint8_t> makeVersion2Archive(const dt::PencilSample& sample) {
     appendU32(out, 2); // version
     appendU32(out, 0); // active page
     appendU32(out, 1); // page count
-    out.push_back(static_cast<std::uint8_t>(dt::DTTool::Eraser));
+    out.push_back(static_cast<std::uint8_t>(dt_ipad::DTTool::Eraser));
     out.insert(out.end(), 3, 0);
     appendFloat(out, 12.5f);
     appendFloat(out, 0.4f);
@@ -82,14 +85,14 @@ std::vector<std::uint8_t> makeVersion2Archive(const dt::PencilSample& sample) {
 }
 
 int main() {
-    dt::Engine engine;
+    dt_ipad::Engine engine;
     const auto initialRevision = engine.revision();
     dt::PencilSample sample{10.0f,20.0f,0.5f};
     engine.setBrushSize(-100.0f);
     engine.setBrushOpacity(0.0f);
     CHECK(engine.brushSize()==1.0f);
     CHECK(engine.brushOpacity()==0.05f);
-    engine.setTool(dt::DTTool::Eraser);
+    engine.setTool(dt_ipad::DTTool::Eraser);
     engine.setBrushSize(12.5f);
     engine.setBrushOpacity(0.4f);
     engine.beginStroke();
@@ -97,7 +100,7 @@ int main() {
     engine.endStroke();
     CHECK(engine.strokeCount()==1); CHECK(engine.sampleCount()==1); CHECK(engine.revision()>initialRevision);
     auto snapshot=engine.snapshot();
-    CHECK(snapshot.size()==1); CHECK(snapshot[0].tool==dt::DTTool::Eraser); CHECK(snapshot[0].brushSize==12.5f); CHECK(snapshot[0].brushOpacity==0.4f);
+    CHECK(snapshot.size()==1); CHECK(snapshot[0].tool==dt_ipad::DTTool::Eraser); CHECK(snapshot[0].brushSize==12.5f); CHECK(snapshot[0].brushOpacity==0.4f);
     engine.setBrushColorRGBA(0x12345600u); engine.setBrushHardness(-2.0f);
     CHECK(engine.brushColorRGBA()==0x12345600u); CHECK(engine.brushHardness()==0.0f);
     engine.setBrushHardness(0.35f); engine.setBrushColorRGBA(0xAABBCCDDu);
@@ -112,13 +115,13 @@ int main() {
 
     const auto archive=engine.archive();
     CHECK(archive.size()>12);
-    dt::Engine restored;
+    dt_ipad::Engine restored;
     CHECK(restored.loadArchive(archive));
     auto restoredSnapshot=restored.snapshot();
     CHECK(restoredSnapshot.size()==2); CHECK(restoredSnapshot[0].points.size()==1);
-    CHECK(restoredSnapshot[0].tool==dt::DTTool::Eraser); CHECK(restoredSnapshot[0].brushSize==12.5f); CHECK(restoredSnapshot[0].brushOpacity==0.4f);
+    CHECK(restoredSnapshot[0].tool==dt_ipad::DTTool::Eraser); CHECK(restoredSnapshot[0].brushSize==12.5f); CHECK(restoredSnapshot[0].brushOpacity==0.4f);
     CHECK(restoredSnapshot[0].points[0].x==sample.x);
-    CHECK(restoredSnapshot[0].brushColorRGBA==dt::kDefaultBrushColorRGBA); CHECK(restoredSnapshot[0].brushHardness==dt::kDefaultBrushHardness);
+    CHECK(restoredSnapshot[0].brushColorRGBA==dt_ipad::kDefaultBrushColorRGBA); CHECK(restoredSnapshot[0].brushHardness==dt_ipad::kDefaultBrushHardness);
     CHECK(!restored.loadArchive(std::span<const std::uint8_t>(archive.data(),archive.size()-1)));
     CHECK(restored.strokeCount()==2);
     auto badVersion=archive; badVersion[4]=4; CHECK(!restored.loadArchive(badVersion));
@@ -129,7 +132,7 @@ int main() {
 
     // Retained pages and layers keep independent undo stacks and flatten
     // visible layers with their opacity applied to each style.
-    dt::Engine document;
+    dt_ipad::Engine document;
     CHECK(document.pageCount() == 1);
     CHECK(document.layerNames().size() == 1);
     document.beginStroke(); document.appendSamples(std::span<const dt::PencilSample>(&sample, 1), {}); document.endStroke();
@@ -150,41 +153,41 @@ int main() {
     CHECK(document.pageCount() == 1);
     CHECK(!document.deletePage(0));
     const auto v2 = document.archive();
-    dt::Engine roundTrip; CHECK(roundTrip.loadArchive(v2));
+    dt_ipad::Engine roundTrip; CHECK(roundTrip.loadArchive(v2));
     CHECK(roundTrip.pageCount() == document.pageCount());
     CHECK(roundTrip.layerNames() == document.layerNames());
 
-    for (auto shape : {dt::DTTool::Line, dt::DTTool::Rectangle, dt::DTTool::Ellipse}) {
+    for (auto shape : {dt_ipad::DTTool::Line, dt_ipad::DTTool::Rectangle, dt_ipad::DTTool::Ellipse}) {
         document.setTool(shape); document.beginStroke(); document.appendSamples(std::span<const dt::PencilSample>(&sample, 1), {}); document.endStroke();
     }
-    auto shapedArchive = document.archive(); dt::Engine shapedRoundTrip; CHECK(shapedRoundTrip.loadArchive(shapedArchive));
+    auto shapedArchive = document.archive(); dt_ipad::Engine shapedRoundTrip; CHECK(shapedRoundTrip.loadArchive(shapedArchive));
     auto shaped = shapedRoundTrip.snapshot(); CHECK(shaped.size() >= 3);
-    CHECK(shaped[shaped.size()-3].tool == dt::DTTool::Line); CHECK(shaped[shaped.size()-2].tool == dt::DTTool::Rectangle); CHECK(shaped.back().tool == dt::DTTool::Ellipse);
+    CHECK(shaped[shaped.size()-3].tool == dt_ipad::DTTool::Line); CHECK(shaped[shaped.size()-2].tool == dt_ipad::DTTool::Rectangle); CHECK(shaped.back().tool == dt_ipad::DTTool::Ellipse);
 
     const auto originalPages = document.pageCount(); CHECK(document.duplicatePage(0) == 1); CHECK(document.pageCount() == originalPages + 1);
     CHECK(document.snapshotForPage(0).size() > 0); CHECK(document.movePage(1, 0)); CHECK(document.activePageIndex() == 0);
     CHECK(document.duplicateLayer(0) == 1); CHECK(document.layerNames().size() >= 2); CHECK(document.moveLayer(1, 0)); CHECK(document.activeLayerIndex() == 0);
 
     const auto v1 = makeVersion1Archive(sample);
-    dt::Engine migrated;
+    dt_ipad::Engine migrated;
     CHECK(migrated.loadArchive(v1));
     CHECK(migrated.pageCount() == 1);
     CHECK(migrated.layerNames().size() == 1);
     CHECK(migrated.snapshot().size() == 1);
-    CHECK(migrated.snapshot()[0].tool == dt::DTTool::Eraser);
+    CHECK(migrated.snapshot()[0].tool == dt_ipad::DTTool::Eraser);
     CHECK(migrated.snapshot()[0].brushSize == 12.5f);
-    CHECK(migrated.snapshot()[0].brushColorRGBA == dt::kDefaultBrushColorRGBA);
-    CHECK(migrated.snapshot()[0].brushHardness == dt::kDefaultBrushHardness);
+    CHECK(migrated.snapshot()[0].brushColorRGBA == dt_ipad::kDefaultBrushColorRGBA);
+    CHECK(migrated.snapshot()[0].brushHardness == dt_ipad::kDefaultBrushHardness);
 
     const auto legacyV2 = makeVersion2Archive(sample);
-    dt::Engine migratedV2;
+    dt_ipad::Engine migratedV2;
     CHECK(migratedV2.loadArchive(legacyV2));
     CHECK(migratedV2.pageNames()[0] == "Legacy Page");
     CHECK(migratedV2.layerNames()[0] == "Legacy Ink");
-    CHECK(migratedV2.snapshot()[0].brushColorRGBA == dt::kDefaultBrushColorRGBA);
-    CHECK(migratedV2.snapshot()[0].brushHardness == dt::kDefaultBrushHardness);
+    CHECK(migratedV2.snapshot()[0].brushColorRGBA == dt_ipad::kDefaultBrushColorRGBA);
+    CHECK(migratedV2.snapshot()[0].brushHardness == dt_ipad::kDefaultBrushHardness);
 
-    dt::Engine bounded;
+    dt_ipad::Engine bounded;
     std::vector<dt::PencilSample> longStroke(2'000, sample);
     for (std::size_t index = 0; index < longStroke.size(); ++index) longStroke[index].x = static_cast<float>(index);
     bounded.beginStroke(); bounded.appendSamples(longStroke, {}); bounded.endStroke();
