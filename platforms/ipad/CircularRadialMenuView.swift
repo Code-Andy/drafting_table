@@ -182,7 +182,7 @@ final class CircularRadialMenuView: UIView {
 
         parentView.addSubview(self)
 
-        HapticFeedbackService.shared.pencilSqueezed()
+        HapticFeedbackService.shared.squeeze()
 
         UIView.animate(withDuration: 0.28, delay: 0, usingSpringWithDamping: 0.72, initialSpringVelocity: 0.8, options: .curveEaseOut) {
             self.transform = .identity
