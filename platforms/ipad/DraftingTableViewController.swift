@@ -729,7 +729,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func applyQuickColor(_ rgba: UInt32) {
         canvas.engineBridge.brushColorRGBA = rgba
-        UserDefaults.standard.set(Int64(rgba), forKey: DrawingSettingsViewController.brushColorDefaultsKey)
+        UserDefaults.standard.set(Int(rgba), forKey: DrawingSettingsViewController.brushColorKey)
         refreshColorSwatch()
         HapticFeedbackService.shared.toolSwitched()
     }
