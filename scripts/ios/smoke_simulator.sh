@@ -62,16 +62,39 @@ if [[ -z "$pid" ]]; then
   wait "$log_stream_pid" >/dev/null 2>&1 || true
   log_stream_pid=""
   tail -n 800 "$runtime_log" || true
+  # Launch breadcrumbs are written to the app's Caches directory at every
+  # startup stage, so a fast abort still leaves the last completed stage.
+  echo "--- app container breadcrumbs ---" >&2
+  container="$(xcrun simctl get_app_container "$device_udid" com.local.draftingtable.ipad data 2>/dev/null || true)"
+  if [[ -n "$container" ]]; then
+    echo "data container: $container" >&2
+    for crumb in "$container/Library/Caches/DraftingTable-launch-stages.log" \
+                 "$container/Library/Caches/DraftingTable-last-launch.txt"; do
+      if [[ -f "$crumb" ]]; then
+        echo "--- $crumb ---" >&2
+        cat "$crumb" >&2 || true
+      else
+        echo "--- missing: $crumb ---" >&2
+      fi
+    done
+  else
+    echo "no data container found" >&2
+  fi
   latest_report="$(ls -1t "$HOME"/Library/Logs/DiagnosticReports/DraftingTable* 2>/dev/null | head -n 1 || true)"
   if [[ -n "$latest_report" ]]; then
     echo "Latest host crash report: $latest_report" >&2
     tail -n 1200 "$latest_report" || true
+  else
+    echo "no host DiagnosticReports for DraftingTable" >&2
   fi
   simulator_report_dir="$HOME/Library/Developer/CoreSimulator/Devices/$device_udid/data/Library/Logs/CrashReporter"
   simulator_report="$(find "$simulator_report_dir" -type f -name 'DraftingTable*' -print 2>/dev/null | sort | tail -n 1 || true)"
   if [[ -n "$simulator_report" ]]; then
     echo "Latest simulator crash report: $simulator_report" >&2
     cat "$simulator_report" || true
+  else
+    echo "no simulator CrashReporter file for DraftingTable" >&2
+    ls -la "$simulator_report_dir" 2>/dev/null | tail -n 20 >&2 || true
   fi
   exit 1
 fi

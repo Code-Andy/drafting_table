@@ -111,6 +111,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     }
 
     private func configure() {
+        DTLaunchBreadcrumb("canvas:configure:start")
         colorPixelFormat = .bgra8Unorm
         // Keep the canvas useful even when no Metal pipeline is available. A
         // light, warm paper tone also makes the first blank state obvious.
@@ -129,6 +130,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         preferredFramesPerSecond = 60
         presentsWithTransaction = false
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
+        DTLaunchBreadcrumb("canvas:rendererCreated")
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
         // Hover is temporarily not attached in v0.7.1. Adding a CAShapeLayer
@@ -140,6 +142,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         addGestureRecognizer(rotationGesture)
         restoreViewTransform()
         updateGridRenderer()
+        DTLaunchBreadcrumb("canvas:configure:done")
     }
 
     override func didMoveToWindow() {
