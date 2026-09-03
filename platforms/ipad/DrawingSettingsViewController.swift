@@ -228,9 +228,38 @@ final class DrawingSettingsViewController: UIViewController {
         detail.font = .systemFont(ofSize: 13)
         detail.textColor = .secondaryLabel
         detail.numberOfLines = 0
-        let row = UIStackView(arrangedSubviews: [label, detail, colorWell])
+        let paletteButton = UIButton(type: .system)
+        paletteButton.setTitle("🎨  Palette, recents & my slots", for: .normal)
+        paletteButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        paletteButton.contentHorizontalAlignment = .leading
+        paletteButton.accessibilityLabel = "Open color palette"
+        paletteButton.addTarget(self, action: #selector(openPalette), for: .touchUpInside)
+        let row = UIStackView(arrangedSubviews: [label, detail, colorWell, paletteButton])
         row.axis = .vertical; row.spacing = 5
         return row
+    }
+
+    @objc private func openPalette() {
+        let picker = ColorPickerViewController()
+        picker.initialColorRGBA = Self.rgba(from: colorWell.selectedColor ?? Self.uiColor(from: Self.defaultBrushColorRGBA))
+        picker.onColorChanged = { [weak self] packed in self?.applyPickedColor(packed) }
+        picker.onColorPicked = { [weak self] packed in self?.applyPickedColor(packed) }
+        picker.onEyedropperRequested = { [weak self] in
+            self?.dismiss(animated: true)
+            self?.onEyedropperToast?()
+        }
+        let navigation = UINavigationController(rootViewController: picker)
+        navigation.modalPresentationStyle = .formSheet
+        present(navigation, animated: true)
+    }
+
+    /// Fired when the picker asks for the eyedropper (no pixel sampler yet).
+    var onEyedropperToast: (() -> Void)?
+
+    private func applyPickedColor(_ packed: UInt32) {
+        colorWell.selectedColor = Self.uiColor(from: packed)
+        UserDefaults.standard.set(Int(packed), forKey: Self.brushColorKey)
+        onBrushColorChanged?(packed)
     }
 
     private func switchRow(title: String, detail: String, control: UISwitch) -> UIView {

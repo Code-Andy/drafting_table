@@ -539,10 +539,11 @@ typedef struct {
                                       passOpacity, eraseFlag, color, hardness);
                 }
                 for (size_t index = 0; index < points.size(); ++index) {
-                    // Dense smoothed quads overlap naturally. Periodic caps
-                    // preserve curved joins without allocating a fan at every
-                    // interpolated point on long retained strokes.
-                    if (index != 0 && index + 1 != points.size() && index % 4 != 0) continue;
+                    // v0.9.0: caps only at stroke ends. Dense smoothed quads
+                    // already overlap along the body; the periodic fans used
+                    // to bead along curves and read as pen-sample dots.
+                    // Single-point strokes still render as a dot above.
+                    if (index != 0 && index + 1 != points.size()) continue;
                     const DTSampledPoint& point = points[index];
                     addRoundCapStyled(geometry, point.position,
                                       strokeRadius(point.pressure, brushSize) * passScale,

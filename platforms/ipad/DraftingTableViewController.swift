@@ -183,6 +183,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         } else if let active = canvas.engineBridge.pageInfos.first(where: { $0.selected }) {
             pageThumbnailCache.removeValue(forKey: active.index)
         }
+        // Any in-flight background renders belong to the previous document
+        // state; bumping the epoch orphans them so stale art can never land.
+        thumbnailEpoch &+= 1
         saveDocument(); emptyState.isHidden = canvas.engineBridge.strokeCount > 0
         refreshRails()
         updateUndoRedoState(); canvas.setNeedsDisplay()
@@ -195,6 +198,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             return
         }
         pageThumbnailCache.removeAll(keepingCapacity: true)
+        thumbnailEpoch &+= 1
         emptyState.isHidden = canvas.engineBridge.strokeCount > 0; canvas.setNeedsDisplay(); refreshRails()
     }
 
@@ -241,6 +245,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         settings.onBrushHardnessChanged = { [weak self] value in self?.canvas.engineBridge.brushHardness = value; self?.saveDocument() }
         settings.onBrushColorChanged = { [weak self] value in self?.canvas.engineBridge.brushColorRGBA = value; self?.saveDocument() }
         settings.onGridChanged = { [weak self] value in self?.canvas.gridVisible = value; self?.saveDocument() }
+        settings.onEyedropperToast = { [weak self] in self?.showToast("Eyedropper needs the tile sampler (M2)") }
         let navigation = UINavigationController(rootViewController: settings); navigation.modalPresentationStyle = .formSheet
         if let sheet = navigation.sheetPresentationController { sheet.detents = [.medium(), .large()]; sheet.prefersGrabberVisible = true }
         present(navigation, animated: true)
@@ -279,10 +284,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func configurePagesRail() {
-        // Thumbnail generation is disabled for the v0.7.1 launch hotfix. It
-        // previously ran synchronously from layout and is being moved to an
-        // isolated background cache before re-enabling.
-        pagesRail.thumbnailForPage = nil
+        // v0.9.0: thumbnails are back through the background cache. The rail
+        // callback stays synchronous and cheap; raster work happens off-main
+        // and refreshes the rail when ready.
+        pagesRail.thumbnailForPage = { [weak self] index in self?.thumbnail(forPageAt: index) }
         pagesRail.onSelect = { [weak self] index in
             guard let self else { return }
             self.canvas.engineBridge.setActivePageIndex(UInt(index))
@@ -769,13 +774,40 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func thumbnail(forPageAt index: UInt) -> UIImage? {
         if let cached = pageThumbnailCache[index] { return cached }
-        let target = CGSize(width: 68, height: 42)
-        guard let thumbnail = DocumentExportService.thumbnail(
-            strokes: canvas.engineBridge.renderableStrokes(forPageAt: index),
-            canvasSize: canvas.bounds.size,
-            targetSize: target
-        ) else { return nil }
-        pageThumbnailCache[index] = thumbnail
-        return thumbnail
+        // v0.9.0: thumbnails render on a background queue and pop in when
+        // ready. The synchronous rail callback must never snapshot or raster
+        // on the main thread (that jank was the v0.7 launch surface).
+        requestThumbnail(forPageAt: index)
+        return nil
+    }
+
+    /// Serial background queue plus epoch guard for page thumbnails.
+    private let thumbnailQueue = DispatchQueue(label: "draftingTable.thumbnails", qos: .utility)
+    private var thumbnailsInFlight: Set<UInt> = []
+    private var thumbnailEpoch: UInt64 = 0
+
+    private func requestThumbnail(forPageAt index: UInt) {
+        guard !thumbnailsInFlight.contains(index) else { return }
+        let canvasSize = canvas.bounds.size
+        guard canvasSize.width >= 1, canvasSize.height >= 1 else { return }
+        thumbnailsInFlight.insert(index)
+        let epoch = thumbnailEpoch
+        let bridge = canvas.engineBridge
+        thumbnailQueue.async { [weak self] in
+            let strokes = bridge.renderableStrokes(forPageAt: index)
+            let image = DocumentExportService.thumbnail(
+                strokes: strokes,
+                canvasSize: canvasSize,
+                targetSize: CGSize(width: 96, height: 60))
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.thumbnailsInFlight.remove(index)
+                guard epoch == self.thumbnailEpoch,
+                      let image,
+                      self.pageThumbnailCache[index] == nil else { return }
+                self.pageThumbnailCache[index] = image
+                self.refreshRails()
+            }
+        }
     }
 }
