@@ -123,6 +123,11 @@ static void addSegmentStyled(std::vector<DTMetalVertex>& out,
     }
 }
 
+static void addEllipseOutline(std::vector<DTMetalVertex>& out,
+                              vector_float2 center, vector_float2 radii,
+                              float radius, float opacity, vector_float4 color,
+                              float hardness);
+
 static void addShapeOutline(std::vector<DTMetalVertex>& out,
                             uint32_t tool, vector_float2 first, vector_float2 last,
                             float radius, float opacity, vector_float4 color,
@@ -149,6 +154,24 @@ static void addShapeOutline(std::vector<DTMetalVertex>& out,
         const vector_float2 radii = (vector_float2){
             fmaxf(0.5f, fabsf(last.x - first.x) * 0.5f),
             fmaxf(0.5f, fabsf(last.y - first.y) * 0.5f)};
+        addEllipseOutline(out, center, radii, radius, opacity, color, hardness);
+        return;
+    }
+    if (tool == 5u) { // circle: corner-drag defines the bounding square
+        const vector_float2 center = (first + last) * 0.5f;
+        const float circleRadius = fmaxf(
+            0.5f,
+            fmaxf(fabsf(last.x - first.x), fabsf(last.y - first.y)) * 0.5f);
+        addEllipseOutline(out, center, (vector_float2){circleRadius, circleRadius},
+                          radius, opacity, color, hardness);
+        return;
+    }
+}
+
+static void addEllipseOutline(std::vector<DTMetalVertex>& out,
+                              vector_float2 center, vector_float2 radii,
+                              float radius, float opacity, vector_float4 color,
+                              float hardness) {
         constexpr int kSegments = 64;
         for (int i = 0; i < kSegments; ++i) {
             const float t0 = (2.0f * kPi * i) / kSegments;
@@ -157,7 +180,6 @@ static void addShapeOutline(std::vector<DTMetalVertex>& out,
             const vector_float2 p1 = center + (vector_float2){cosf(t1) * radii.x, sinf(t1) * radii.y};
             addSegmentStyled(out, p0, p1, radius, opacity, 0.0f, color, hardness, false);
         }
-    }
 }
 
 struct DTSampledPoint {
@@ -448,7 +470,7 @@ typedef struct {
         const float eraseFlag = eraser ? 1.0f : 0.0f;
         // Shape tools use first/last real samples, excluding predicted tail
         // points so a transient prediction never reaches the retained result.
-        if (tool >= 2u && tool <= 4u) {
+        if (tool >= 2u && tool <= 5u) {
             size_t firstReal = 0;
             while (firstReal + 1 < points.size() && points[firstReal].predicted > 0.5f) ++firstReal;
             size_t lastReal = points.size() - 1;

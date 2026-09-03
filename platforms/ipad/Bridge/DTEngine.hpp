@@ -13,7 +13,12 @@
 // vector<Page> across translation units and Engine::Engine() overflowed
 // the heap on first launch (v0.7/v0.7.1 beige-screen SIGABRT).
 namespace drafting_table::ipad {
-enum class DTTool : std::uint8_t { Brush = 0, Eraser = 1, Line = 2, Rectangle = 3, Ellipse = 4 };
+// Tool values match the Android toolset order (brush, eraser, line,
+// rectangle, ellipse) plus circle. Bucket, shade, and selection tools have
+// no retained-stroke representation yet and intentionally have no values:
+// unknown raw values fail archive decode, so placeholders must never be
+// persisted.
+enum class DTTool : std::uint8_t { Brush = 0, Eraser = 1, Line = 2, Rectangle = 3, Ellipse = 4, Circle = 5 };
 constexpr std::uint32_t kDefaultBrushColorRGBA = 0x2B2926FFu;
 constexpr float kDefaultBrushHardness = 0.8f;
 struct Stroke {

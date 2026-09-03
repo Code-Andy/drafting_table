@@ -157,12 +157,12 @@ int main() {
     CHECK(roundTrip.pageCount() == document.pageCount());
     CHECK(roundTrip.layerNames() == document.layerNames());
 
-    for (auto shape : {dt_ipad::DTTool::Line, dt_ipad::DTTool::Rectangle, dt_ipad::DTTool::Ellipse}) {
+    for (auto shape : {dt_ipad::DTTool::Line, dt_ipad::DTTool::Rectangle, dt_ipad::DTTool::Ellipse, dt_ipad::DTTool::Circle}) {
         document.setTool(shape); document.beginStroke(); document.appendSamples(std::span<const dt::PencilSample>(&sample, 1), {}); document.endStroke();
     }
     auto shapedArchive = document.archive(); dt_ipad::Engine shapedRoundTrip; CHECK(shapedRoundTrip.loadArchive(shapedArchive));
-    auto shaped = shapedRoundTrip.snapshot(); CHECK(shaped.size() >= 3);
-    CHECK(shaped[shaped.size()-3].tool == dt_ipad::DTTool::Line); CHECK(shaped[shaped.size()-2].tool == dt_ipad::DTTool::Rectangle); CHECK(shaped.back().tool == dt_ipad::DTTool::Ellipse);
+    auto shaped = shapedRoundTrip.snapshot(); CHECK(shaped.size() >= 4);
+    CHECK(shaped[shaped.size()-4].tool == dt_ipad::DTTool::Line); CHECK(shaped[shaped.size()-3].tool == dt_ipad::DTTool::Rectangle); CHECK(shaped[shaped.size()-2].tool == dt_ipad::DTTool::Ellipse); CHECK(shaped.back().tool == dt_ipad::DTTool::Circle);
 
     const auto originalPages = document.pageCount(); CHECK(document.duplicatePage(0) == 1); CHECK(document.pageCount() == originalPages + 1);
     CHECK(document.snapshotForPage(0).size() > 0); CHECK(document.movePage(1, 0)); CHECK(document.activePageIndex() == 0);

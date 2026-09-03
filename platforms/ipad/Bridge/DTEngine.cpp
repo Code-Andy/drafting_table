@@ -10,7 +10,7 @@ template<class T> struct Bits{using type=std::make_unsigned_t<T>;}; template<>st
 template<class T> void put(std::vector<std::uint8_t>&o,T v){using U=typename Bits<T>::type;U b{};if constexpr(std::is_same_v<T,float>||std::is_same_v<T,double>)std::memcpy(&b,&v,sizeof v);else b=(U)v;for(size_t i=0;i<sizeof(U);++i)o.push_back((uint8_t)(b>>(8*i)));}
 template<class T> bool get(std::span<const uint8_t>d,size_t&a,T&v){using U=typename Bits<T>::type;if(a>d.size()||sizeof(U)>d.size()-a)return false;U b=0;for(size_t i=0;i<sizeof(U);++i)b|=(U)d[a++]<<(8*i);if constexpr(std::is_same_v<T,float>||std::is_same_v<T,double>)std::memcpy(&v,&b,sizeof v);else v=(T)b;return true;}
 bool style(float s,float o,std::uint32_t,float hardness){return std::isfinite(s)&&std::isfinite(o)&&s>=1&&s<=40&&o>=.05f&&o<=1&&std::isfinite(hardness)&&hardness>=0&&hardness<=1;}
-bool validTool(std::uint8_t raw){return raw<=static_cast<std::uint8_t>(DTTool::Ellipse);}
+bool validTool(std::uint8_t raw){return raw<=static_cast<std::uint8_t>(DTTool::Circle);}
 bool point(const PencilSample&p){return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.pressure)&&p.pressure>=0&&p.pressure<=1&&std::isfinite(p.altitude)&&std::isfinite(p.azimuth)&&std::isfinite(p.roll)&&std::isfinite(p.hoverDistance)&&std::isfinite(p.timestamp);}
 bool nameOK(const std::string&n){return n.size()<=kMaxString;}
 void putString(std::vector<uint8_t>&o,const std::string&s){put<uint32_t>(o,(uint32_t)s.size());o.insert(o.end(),s.begin(),s.end());}
@@ -20,7 +20,7 @@ bool getStroke(std::span<const uint8_t>d,size_t&a,Stroke&s,uint64_t&total,uint32
 }}
 namespace drafting_table::ipad {
 Engine::Engine(){pages_.push_back(Page{});pages_[0].layers.push_back(Layer{});}
-DTTool Engine::tool()const{std::lock_guard l(mutex_);return tool_;} void Engine::setTool(DTTool v){std::lock_guard l(mutex_);if(static_cast<std::uint8_t>(v)>static_cast<std::uint8_t>(DTTool::Ellipse))v=DTTool::Brush;if(tool_!=v){tool_=v;++revision_;}}
+DTTool Engine::tool()const{std::lock_guard l(mutex_);return tool_;} void Engine::setTool(DTTool v){std::lock_guard l(mutex_);if(static_cast<std::uint8_t>(v)>static_cast<std::uint8_t>(DTTool::Circle))v=DTTool::Brush;if(tool_!=v){tool_=v;++revision_;}}
 float Engine::brushSize()const{std::lock_guard l(mutex_);return brushSize_;} void Engine::setBrushSize(float v){std::lock_guard l(mutex_);v=std::isfinite(v)?std::clamp(v,1.f,40.f):8.f;if(v!=brushSize_){brushSize_=v;++revision_;}}
 float Engine::brushOpacity()const{std::lock_guard l(mutex_);return brushOpacity_;} void Engine::setBrushOpacity(float v){std::lock_guard l(mutex_);v=std::isfinite(v)?std::clamp(v,.05f,1.f):1.f;if(v!=brushOpacity_){brushOpacity_=v;++revision_;}}
 std::uint32_t Engine::brushColorRGBA()const{std::lock_guard l(mutex_);return brushColorRGBA_;} void Engine::setBrushColorRGBA(std::uint32_t v){std::lock_guard l(mutex_);if(brushColorRGBA_!=v){brushColorRGBA_=v;++revision_;}}

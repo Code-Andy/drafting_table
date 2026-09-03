@@ -46,6 +46,11 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         set { activationPressureValue = min(max(newValue, 0), 0.20) }
     }
 
+    /// Motion prediction (mirrors the original app's status-bar toggle).
+    /// When off, predicted samples are excluded so the stroke only contains
+    /// coalesced real touches, at the cost of a little extra latency.
+    var predictionEnabled: Bool = true
+
     /// Document-to-view viewport transform. Translation is in view points;
     /// scale and rotation are applied around the document origin.
     private(set) var canvasScale: CGFloat = 1.0
@@ -173,9 +178,13 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         case .line: return "line"
         case .rectangle: return "rectangle"
         case .ellipse: return "ellipse"
+        case .circle: return "circle"
         default: return "brush"
         }
     }
+
+    /// Status-bar display name for the active tool.
+    var activeToolDisplayName: String { activeToolName }
 
     private func togglePencilTool(source: String) {
         // The bridge currently exposes Brush/Eraser. If shape tools are added
@@ -294,7 +303,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         let real = eligibleTouches.map {
             makeSample($0, predicted: false, coalesced: $0 !== touch)
         }
-        let predicted = includePredicted && !real.isEmpty
+        let predicted = includePredicted && predictionEnabled && !real.isEmpty
             ? (event?.predictedTouches(for: touch) ?? []).map {
             makeSample($0, predicted: true)
             }

@@ -41,6 +41,7 @@ typedef NS_ENUM(uint8_t, DTTool) {
     DTToolLine = 2,
     DTToolRectangle = 3,
     DTToolEllipse = 4,
+    DTToolCircle = 5,
 };
 
 /// Immutable render snapshot carrying the stroke's style as well as its
