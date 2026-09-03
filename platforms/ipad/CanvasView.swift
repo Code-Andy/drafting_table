@@ -51,6 +51,12 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     /// coalesced real touches, at the cost of a little extra latency.
     var predictionEnabled: Bool = true
 
+    /// Grid snapping for shape tools (mirrors the original's snap toggle).
+    /// When on and the grid is visible, shape-tool samples round to grid
+    /// intersections. Brush strokes never snap.
+    var snapToGrid: Bool = false
+    var gridSpacing: CGFloat = 32
+
     /// Document-to-view viewport transform. Translation is in view points;
     /// scale and rotation are applied around the document origin.
     private(set) var canvasScale: CGFloat = 1.0
@@ -259,7 +265,19 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     private func makeSample(_ touch: UITouch,
                             predicted: Bool,
                             coalesced: Bool = false) -> DTPencilSample {
-        let location = documentPoint(for: touch.preciseLocation(in: self))
+        var location = documentPoint(for: touch.preciseLocation(in: self))
+        // Snap shape endpoints to grid intersections. Brush/eraser input is
+        // never snapped; the engine only reads first/last samples for
+        // shapes, so intermediate snapped samples are harmless.
+        if snapToGrid, gridVisible, gridSpacing >= 1 {
+            switch engineBridge.tool {
+            case .line, .rectangle, .ellipse, .circle:
+                location.x = round(location.x / gridSpacing) * gridSpacing
+                location.y = round(location.y / gridSpacing) * gridSpacing
+            default:
+                break
+            }
+        }
         let force = touch.maximumPossibleForce > 0
             ? touch.force / touch.maximumPossibleForce
             : 1.0

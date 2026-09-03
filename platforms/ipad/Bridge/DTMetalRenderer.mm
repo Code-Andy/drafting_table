@@ -103,6 +103,26 @@ static void addRoundCapStyled(std::vector<DTMetalVertex>& out,
     }
 }
 
+// Round join stamped at every interior point with that point's exact local
+// radius. Overlapping stamps at the true local width form a smooth envelope
+// (like dab stamping): segment quads alone leave wedge gaps on tight
+// curves, while sparse oversized fans bead into dots. Six slices keep the
+// vertex cost bounded; the strip covers everything but the outer wedge.
+static void addJoinFan(std::vector<DTMetalVertex>& out,
+                       vector_float2 center, float radius,
+                       float pressure, float predicted, float opacity,
+                       float eraser, vector_float4 color, float hardness) {
+    constexpr int kSlices = 6;
+    for (int i = 0; i < kSlices; ++i) {
+        const float a0 = (2.0f * kPi * static_cast<float>(i)) / kSlices;
+        const float a1 = (2.0f * kPi * static_cast<float>(i + 1)) / kSlices;
+        const vector_float2 p0 = center + (vector_float2){cosf(a0) * radius, sinf(a0) * radius};
+        const vector_float2 p1 = center + (vector_float2){cosf(a1) * radius, sinf(a1) * radius};
+        addTriangleStyled(out, center, p0, p1, pressure, predicted, opacity,
+                          eraser, color, hardness);
+    }
+}
+
 static void addSegmentStyled(std::vector<DTMetalVertex>& out,
                              vector_float2 p0, vector_float2 p1, float radius,
                              float opacity, float eraser, vector_float4 color,
@@ -539,16 +559,23 @@ typedef struct {
                                       passOpacity, eraseFlag, color, hardness);
                 }
                 for (size_t index = 0; index < points.size(); ++index) {
-                    // v0.9.0: caps only at stroke ends. Dense smoothed quads
-                    // already overlap along the body; the periodic fans used
-                    // to bead along curves and read as pen-sample dots.
-                    // Single-point strokes still render as a dot above.
-                    if (index != 0 && index + 1 != points.size()) continue;
+                    // Round joins at the exact local width: stamps overlap
+                    // into a smooth envelope with no wedge gaps on tight
+                    // curves and no beading (v0.9.0 dots came from sparse
+                    // oversized fans). Ends keep full caps; single-point
+                    // strokes render as a dot above.
                     const DTSampledPoint& point = points[index];
-                    addRoundCapStyled(geometry, point.position,
-                                      strokeRadius(point.pressure, brushSize) * passScale,
-                                      point.pressure, point.predicted, passOpacity,
-                                      eraseFlag, color, hardness);
+                    const float joinRadius =
+                        strokeRadius(point.pressure, brushSize) * passScale;
+                    if (index == 0 || index + 1 == points.size()) {
+                        addRoundCapStyled(geometry, point.position, joinRadius,
+                                          point.pressure, point.predicted, passOpacity,
+                                          eraseFlag, color, hardness);
+                    } else {
+                        addJoinFan(geometry, point.position, joinRadius,
+                                   point.pressure, point.predicted, passOpacity,
+                                   eraseFlag, color, hardness);
+                    }
                 }
             }
             if (geometry.empty()) continue;

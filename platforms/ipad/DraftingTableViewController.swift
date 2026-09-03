@@ -51,6 +51,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var rectangleButton: UIButton!
     private var ellipseButton: UIButton!
     private var circleButton: UIButton!
+    private var colorSwatchButton: UIButton!
     private var undoButton: UIButton!
     private var redoButton: UIButton!
     private var clearButton: UIButton!
@@ -219,6 +220,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         canvas.gridVisible = defaults.bool(forKey: Self.gridDefaultsKey)
         canvas.predictionEnabled = defaults.object(forKey: Self.predictionDefaultsKey) == nil
             ? true : defaults.bool(forKey: Self.predictionDefaultsKey)
+        canvas.snapToGrid = defaults.bool(forKey: Self.snapDefaultsKey)
         let storedTool = defaults.integer(forKey: Self.selectedToolDefaultsKey)
         selectedTool = (0...Int(DTTool.circle.rawValue)).contains(storedTool)
             ? (DTTool(rawValue: UInt8(storedTool)) ?? .brush)
@@ -249,6 +251,43 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let navigation = UINavigationController(rootViewController: settings); navigation.modalPresentationStyle = .formSheet
         if let sheet = navigation.sheetPresentationController { sheet.detents = [.medium(), .large()]; sheet.prefersGrabberVisible = true }
         present(navigation, animated: true)
+    }
+
+    /// Color tool: opens the HSV picker directly from the rail swatch.
+    @objc private func openColorPickerDirect() { presentColorPicker() }
+
+    private func presentColorPicker() {
+        let picker = ColorPickerViewController()
+        picker.initialColorRGBA = canvas.engineBridge.brushColorRGBA
+        picker.onColorChanged = { [weak self] packed in self?.applyBrushColor(packed) }
+        picker.onColorPicked = { [weak self] packed in self?.applyBrushColor(packed) }
+        picker.onEyedropperRequested = { [weak self] in
+            self?.dismiss(animated: true)
+            self?.showToast("Eyedropper needs the tile sampler (M2)")
+        }
+        let navigation = UINavigationController(rootViewController: picker)
+        navigation.modalPresentationStyle = .formSheet
+        if let sheet = navigation.sheetPresentationController { sheet.detents = [.medium(), .large()]; sheet.prefersGrabberVisible = true }
+        present(navigation, animated: true)
+    }
+
+    private func applyBrushColor(_ packed: UInt32) {
+        canvas.engineBridge.brushColorRGBA = packed
+        UserDefaults.standard.set(Int(packed), forKey: DrawingSettingsViewController.brushColorKey)
+        saveDocument()
+        refreshColorSwatch()
+    }
+
+    private func refreshColorSwatch() {
+        guard let colorSwatchButton else { return }
+        let packed = isViewLoaded ? canvas.engineBridge.brushColorRGBA : DrawingSettingsViewController.defaultBrushColorRGBA
+        colorSwatchButton.backgroundColor = DrawingSettingsViewController.uiColor(from: packed)
+        let r = CGFloat((packed >> 24) & 0xff) / 255
+        let g = CGFloat((packed >> 16) & 0xff) / 255
+        let b = CGFloat((packed >> 8) & 0xff) / 255
+        let ink: UIColor = (0.299 * r + 0.587 * g + 0.114 * b) > 0.5
+            ? UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1) : .white
+        colorSwatchButton.setTitleColor(ink, for: .normal)
     }
 
     private func commandMenuButton() -> UIBarButtonItem {
@@ -445,7 +484,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         clearButton = railToolButton(glyph: "🗑", label: "Clear", action: #selector(clearCanvas))
         settingsButton = railToolButton(glyph: "⚙", label: "Tune", action: #selector(openSettings))
         stack.addArrangedSubview(railTitle("DRAW"))
-        [brushButton, eraserButton, bucketButton, shadeButton].forEach(stack.addArrangedSubview)
+        colorSwatchButton = railToolButton(glyph: "●", label: "Color", action: #selector(openColorPickerDirect))
+        refreshColorSwatch()
+        [colorSwatchButton, brushButton, eraserButton, bucketButton, shadeButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
         stack.addArrangedSubview(railTitle("SHAPE"))
         [lineButton, rectangleButton, circleButton, ellipseButton].forEach(stack.addArrangedSubview)
@@ -576,7 +617,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     @objc private func toggleSnapChip() {
         let next = !UserDefaults.standard.bool(forKey: Self.snapDefaultsKey)
         UserDefaults.standard.set(next, forKey: Self.snapDefaultsKey)
-        if next { showToast("Snap arms with vector snapping (M5)") }
+        canvas.snapToGrid = next
         updateStatusBar()
     }
 
@@ -650,6 +691,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             button.layer.borderColor = (button.isSelected ? UIColor.systemBlue : UIColor.black.withAlphaComponent(0.08)).cgColor
             button.accessibilityValue = button.isSelected ? "Selected" : "Not selected"
         }
+        refreshColorSwatch()
         updateStatusBar()
     }
 
