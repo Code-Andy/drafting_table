@@ -1,10 +1,10 @@
-﻿import UIKit
+import UIKit
 
 /// Radial contextual tool wheel for Apple Pencil Pro squeeze gestures.
 /// Displays tools arranged circularly around the pencil tip / hover point on the glass,
 /// replacing the fallback action sheet menu tab with a fluid, native radial experience.
 final class CircularRadialMenuView: UIView {
-    enum RadialAction {
+    enum RadialAction: Equatable {
         case selectTool(DTTool)
         case openColorPicker
         case undo

@@ -765,7 +765,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         present(alert, animated: true)
     }
 
-    @objc private func showExportMenu(sourceView: UIView? = nil) {
+    private func showExportMenu(sourceView: UIView? = nil) {
         let alert = UIAlertController(title: "Export & Share", message: nil, preferredStyle: .actionSheet)
         let anchor = sourceView ?? mainMenuButton ?? view
         alert.popoverPresentationController?.sourceView = anchor

@@ -1166,8 +1166,8 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
             for stroke in strokes {
                 let pts: [DTRenderPoint] = stroke.points.map { v in
-                    var p = DTRenderPoint()
-                    v.getValue(&p)
+                    var p = DTRenderPoint(x: 0, y: 0, pressure: 0, predicted: 0)
+                    v.getValue(&p, size: MemoryLayout<DTRenderPoint>.size)
                     return p
                 }
                 guard !pts.isEmpty else { continue }
@@ -1346,18 +1346,20 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         var samples = [DTPencilSample]()
         samples.reserveCapacity(simplified.count)
         for pt in simplified {
-            var s = DTPencilSample()
-            s.x = Float(pt.x)
-            s.y = Float(pt.y)
-            s.pressure = 1.0
-            s.altitude = Float(CGFloat.pi * 0.5)
-            s.azimuth = 0
-            s.roll = 0
-            s.hoverDistance = 0
-            s.timestamp = CACurrentMediaTime()
-            s.sampleID = nextSampleID
+            let s = DTPencilSample(
+                x: Float(pt.x),
+                y: Float(pt.y),
+                pressure: 1.0,
+                altitude: Float(CGFloat.pi * 0.5),
+                azimuth: 0.0,
+                roll: 0.0,
+                hoverDistance: 0.0,
+                timestamp: CACurrentMediaTime(),
+                sampleID: nextSampleID,
+                estimationUpdateIndex: 0,
+                flags: .real
+            )
             nextSampleID &+= 1
-            s.flags = .real
             samples.append(s)
         }
 
