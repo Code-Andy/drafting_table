@@ -11,6 +11,7 @@ xcodebuild \
   -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$derived_data" \
+  -enableAddressSanitizer YES \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
   build
