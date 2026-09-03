@@ -203,6 +203,12 @@ static void addEllipseOutline(std::vector<DTMetalVertex>& out,
         }
 }
 
+struct DTSampledPoint {
+    vector_float2 position;
+    float pressure;
+    float predicted;
+};
+
 static void addPolygonFill(std::vector<DTMetalVertex>& out,
                            const std::vector<DTSampledPoint>& points,
                            float opacity, vector_float4 color, float hardness) {
@@ -225,12 +231,6 @@ static void addPolygonFill(std::vector<DTMetalVertex>& out,
                           1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
     }
 }
-
-struct DTSampledPoint {
-    vector_float2 position;
-    float pressure;
-    float predicted;
-};
 
 static DTSampledPoint catmullRom(const DTSampledPoint& p0,
                                  const DTSampledPoint& p1,
