@@ -2,7 +2,7 @@ name: DraftingTable
 
 options:
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "17.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -17,7 +17,7 @@ targets:
   DraftingTable:
     type: application
     platform: iOS
-    deploymentTarget: "18.0"
+    deploymentTarget: "17.0"
     sources:
       - path: platforms/ipad
         excludes:
@@ -33,8 +33,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.draftingtable.ipad
         PRODUCT_NAME: DraftingTable
-        MARKETING_VERSION: 0.7.1
-        CURRENT_PROJECT_VERSION: 9
+        MARKETING_VERSION: 0.7.2
+        CURRENT_PROJECT_VERSION: 10
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: platforms/ipad/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: platforms/ipad/DraftingTable-Bridging-Header.h

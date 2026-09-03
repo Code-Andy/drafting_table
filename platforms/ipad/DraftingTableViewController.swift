@@ -87,12 +87,47 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             action: #selector(resetCanvasView)
         )
         navigationItem.rightBarButtonItems = [reset, commandMenuButton()]
-        restoreDocument(); applyStoredSettings(); refreshRails(); updateToolSelection(); updateUndoRedoState()
+        // v0.7.2: keep scene connection instant. Restoring the autosaved
+        // archive, reading UserDefaults, and laying out the rails now happens
+        // after the window is visible so the watchdog never kills us between
+        // the beige launch screen and the first committed frame.
+        NSLog("DraftingTable launch: viewDidLoad, deferring restore")
+        applyStoredSettings()
+        refreshRails(); updateToolSelection(); updateUndoRedoState()
+        updateLaunchBreadcrumb(stage: "viewDidLoad")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            NSLog("DraftingTable launch: deferred restore begin")
+            self.restoreDocument()
+            self.refreshRails(); self.updateToolSelection(); self.updateUndoRedoState()
+            self.canvas.setNeedsDisplay()
+            NSLog("DraftingTable launch: deferred restore done strokes=%lu",
+                  UInt(self.canvas.engineBridge.strokeCount))
+            self.updateLaunchBreadcrumb(stage: "restored")
+        }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // On-demand renderer needs one explicit kick once layout has a real size.
+        canvas.setNeedsDisplay()
+        updateLaunchBreadcrumb(stage: "appeared")
     }
 
     /// Called by the scene delegate before suspension as a final autosave.
     func saveDocument() {
         do { try persistence.save(canvas.engineBridge.archiveData()) } catch { /* retry on next mutation */ }
+    }
+
+    /// Tiny launch breadcrumb for the next crash report. If the app ever dies
+    /// between the beige launch screen and first draw again, this file tells
+    /// us exactly which stage completed on the previous attempt.
+    private func updateLaunchBreadcrumb(stage: String) {
+        let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("DraftingTable-last-launch.txt", isDirectory: false)
+        guard let url else { return }
+        let entry = "\(Date().timeIntervalSince1970) \(stage)\n"
+        try? entry.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func documentDidChange(invalidateAllThumbnails: Bool = false) {

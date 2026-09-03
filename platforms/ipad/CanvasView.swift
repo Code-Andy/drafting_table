@@ -118,9 +118,15 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         framebufferOnly = true
         isMultipleTouchEnabled = true
         isOpaque = true
-        enableSetNeedsDisplay = false
-        isPaused = false
-        preferredFramesPerSecond = UIScreen.main.maximumFramesPerSecond
+        // v0.7.2: on-demand rendering. Continuous 120fps full-document
+        // re-rasterization (snapshot + NSValue boxing + Catmull-Rom + one
+        // MTLBuffer per stroke) ran every frame even while idle. On a
+        // physical iPad that stalls first-frame commit and trips the launch
+        // watchdog (beige launch screen, then exit). Now a frame is only
+        // produced after real input, transform, or settings changes.
+        enableSetNeedsDisplay = true
+        isPaused = true
+        preferredFramesPerSecond = 60
         presentsWithTransaction = false
         renderer = DTMetalRenderer(view: self, engine: engineBridge)
         delegate = renderer
@@ -297,6 +303,8 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                                        count: UInt(buffer.count),
                                        realCount: UInt(real.count))
         }
+        // On-demand rendering: schedule exactly one frame per input batch.
+        setNeedsDisplay()
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -314,6 +322,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         appendBatch(for: touch,
                     event: event,
                     minimumPencilPressure: touch.type == .pencil ? activationPressure : nil)
+        setNeedsDisplay()
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -331,6 +340,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                     engineBridge.endStroke()
                     onDocumentChanged?()
                     strokeEngaged = false
+                    setNeedsDisplay()
                 } else {
                     appendBatch(for: activeTouch, event: event)
                 }
@@ -343,6 +353,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                             event: event,
                             includePredicted: false,
                             minimumPencilPressure: activationPressure)
+                setNeedsDisplay()
             }
             return
         }
@@ -364,6 +375,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         strokeEngaged = false
         self.activeTouch = nil
         hideHoverPreview()
+        setNeedsDisplay()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -375,6 +387,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         strokeEngaged = false
         activeTouch = nil
         hideHoverPreview()
+        setNeedsDisplay()
     }
 
     // MARK: - Canvas transform and gestures

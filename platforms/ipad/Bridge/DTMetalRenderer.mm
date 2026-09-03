@@ -322,6 +322,12 @@ typedef struct {
 
 - (void)drawInMTKView:(MTKView *)view {
     self.frameCount += 1;
+    // v0.7.2: never block launch on a zero-size first layout and never let
+    // one pathological retained document exhaust the device heap in a single
+    // frame. Zero-size views can occur during scene connection; oversized
+    // geometry previously ran at display refresh until the watchdog killed
+    // the app after the beige launch screen.
+    if (view.bounds.size.width < 1.0 || view.bounds.size.height < 1.0) return;
     id<CAMetalDrawable> drawable = view.currentDrawable;
     if (!drawable || !self.commandQueue) return;
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
@@ -329,7 +335,9 @@ typedef struct {
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0.965, 0.945, 0.900, 1.0);
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+    if (!commandBuffer) return;
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) return;
     if (!self.pipeline) {
         [encoder endEncoding];
         [commandBuffer presentDrawable:drawable];
@@ -407,8 +415,19 @@ typedef struct {
         }
     }
 
-    NSArray<DTRenderStroke *> *strokes = [self.engine renderableStrokes];
+    NSArray<DTRenderStroke *> *strokes = nil;
+    @try {
+        strokes = [self.engine renderableStrokes];
+    } @catch (NSException *exception) {
+        NSLog(@"DraftingTable snapshot failed: %@", exception);
+        strokes = @[];
+    }
+    // Hard per-frame ceiling so one huge retained document degrades to a
+    // partial frame instead of an OOM/watchdog kill after the launch screen.
+    size_t frameVertexBudget = 220000;
+    size_t frameVerticesUsed = 0;
     for (DTRenderStroke *stroke in strokes) {
+        if (frameVerticesUsed >= frameVertexBudget) break;
         NSArray<NSValue *> *strokeValues = stroke.points;
         if (strokeValues.count == 0) continue;
         const uint32_t tool = static_cast<uint32_t>(stroke.tool);
@@ -439,16 +458,21 @@ typedef struct {
             addShapeOutline(geometry, tool, points[firstReal].position, points[lastReal].position,
                             radius, opacity * (0.22f + 0.78f * hardness), strokeColor, hardness);
             if (!geometry.empty()) {
+                if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
+                    const size_t remaining = frameVertexBudget - frameVerticesUsed;
+                    geometry.resize((remaining / 3) * 3);
+                }
                 id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
                                                                       length:sizeof(DTMetalVertex) * geometry.size()
                                                                      options:MTLResourceStorageModeShared];
-                if (buffer) {
+                if (buffer && !geometry.empty()) {
                     DTMetalFragmentUniforms fragmentUniforms{};
                     fragmentUniforms.color = strokeColor;
                     fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
                     [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
                     [encoder setVertexBuffer:buffer offset:0 atIndex:0];
                     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+                    frameVerticesUsed += geometry.size();
                 }
             }
             continue;
@@ -462,6 +486,7 @@ typedef struct {
         const float fringeRadiusScale = 1.08f + 0.24f * (1.0f - hardness);
         const float fringeOpacity = opacity * (0.12f + 0.30f * (1.0f - hardness));
         for (int pass = 0; pass < (eraser ? 1 : 2); ++pass) {
+            if (frameVerticesUsed >= frameVertexBudget) break;
             const bool fringe = pass == 0 && !eraser;
             const float passScale = fringe ? fringeRadiusScale : 1.0f;
             const float passOpacity = fringe ? fringeOpacity : opacity;
@@ -504,6 +529,12 @@ typedef struct {
                 }
             }
             if (geometry.empty()) continue;
+            if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
+                const size_t remaining = frameVertexBudget - frameVerticesUsed;
+                if (remaining < 3) break;
+                geometry.resize((remaining / 3) * 3);
+            }
+            if (geometry.empty()) continue;
             id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
                                                               length:sizeof(DTMetalVertex) * geometry.size()
                                                              options:MTLResourceStorageModeShared];
@@ -514,6 +545,7 @@ typedef struct {
                 [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
                 [encoder setVertexBuffer:buffer offset:0 atIndex:0];
                 [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+                frameVerticesUsed += geometry.size();
             }
         }
     }
