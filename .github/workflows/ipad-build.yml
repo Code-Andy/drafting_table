@@ -91,9 +91,10 @@ jobs:
         shell: bash
         run: |
           if [[ -f /tmp/xcodebuild.log ]]; then
-            echo "::error::Build failed! Relevant compiler errors:"
-            grep -E 'error:|fatal error:' /tmp/xcodebuild.log | head -n 30 || true
-            echo "=== Last 60 lines of build log ==="
+            echo "::error::--- XCODEBUILD ERRORS ---"
+            grep -E 'error:|fatal error:' /tmp/xcodebuild.log | head -n 40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
             tail -n 60 /tmp/xcodebuild.log
           fi
 

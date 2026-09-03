@@ -233,11 +233,11 @@ static void addPolygonFill(std::vector<DTMetalVertex>& out,
     std::vector<vector_float2> poly;
     poly.reserve(points.size());
     for (const auto& pt : points) {
-        if (poly.empty() || simd_distance(poly.back(), pt.position) > 0.1f) {
+        if (poly.empty() || simd_length(poly.back() - pt.position) > 0.1f) {
             poly.push_back(pt.position);
         }
     }
-    if (poly.size() >= 3 && simd_distance(poly.front(), poly.back()) < 0.1f) {
+    if (poly.size() >= 3 && simd_length(poly.front() - poly.back()) < 0.1f) {
         poly.pop_back();
     }
     if (poly.size() < 3) return;
