@@ -15,12 +15,17 @@ private final class InsetLabel: UILabel {
 final class DraftingTableViewController: UIViewController, UIDocumentPickerDelegate {
     private static let selectedToolDefaultsKey = "draftingTable.selectedTool"
     private static let gridDefaultsKey = DrawingSettingsViewController.gridKey
-    private let canvas = CanvasView(frame: .zero)
-    private let diagnostics = DiagnosticsOverlay(frame: .zero)
-    private let emptyState = InsetLabel()
-    private let pagesRail = PagesRailView(frame: .zero)
-    private let layersRail = LayersRailView(frame: .zero)
-    private let toolRail = UIView()
+    // v0.7.2: views are created in loadView (with per-step breadcrumbs), not
+    // as eager property initializers. CI forensics showed the process dying
+    // inside UIViewController init before any view code ran; staging creation
+    // after the window/scene exists isolates which surface aborts and keeps
+    // Metal init off the scene-connection path.
+    private var canvas: CanvasView!
+    private var diagnostics: DiagnosticsOverlay!
+    private var emptyState: InsetLabel!
+    private var pagesRail: PagesRailView!
+    private var layersRail: LayersRailView!
+    private var toolRail: UIView!
     private let persistence = StrokePersistenceStore()
     private var brushButton: UIButton!
     private var eraserButton: UIButton!
@@ -36,14 +41,26 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var pageThumbnailCache: [UInt: UIImage] = [:]
 
     override func loadView() {
+        DTLaunchBreadcrumb("vc:loadView:start")
         let root = UIView()
         root.backgroundColor = UIColor(red: 0.965, green: 0.935, blue: 0.865, alpha: 1)
+        DTLaunchBreadcrumb("vc:create:canvas:start")
+        canvas = CanvasView(frame: .zero)
+        DTLaunchBreadcrumb("vc:create:canvas:done")
+        diagnostics = DiagnosticsOverlay(frame: .zero)
+        DTLaunchBreadcrumb("vc:create:diagnostics:done")
+        emptyState = InsetLabel()
+        pagesRail = PagesRailView(frame: .zero)
+        layersRail = LayersRailView(frame: .zero)
+        toolRail = UIView()
+        DTLaunchBreadcrumb("vc:create:rails:done")
         view = root
         [canvas, diagnostics, emptyState, pagesRail, layersRail, toolRail].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview($0)
         }
         configureEmptyState(); configurePagesRail(); configureLayersRail(); configureToolRail()
+        DTLaunchBreadcrumb("vc:loadView:done")
 
         let safe = root.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -116,6 +133,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     /// Called by the scene delegate before suspension as a final autosave.
     func saveDocument() {
+        guard isViewLoaded, let canvas else { return }
         do { try persistence.save(canvas.engineBridge.archiveData()) } catch { /* retry on next mutation */ }
     }
 

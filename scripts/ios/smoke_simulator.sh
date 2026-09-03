@@ -62,6 +62,12 @@ if [[ -z "$pid" ]]; then
   wait "$log_stream_pid" >/dev/null 2>&1 || true
   log_stream_pid=""
   tail -n 800 "$runtime_log" || true
+  # The streaming capture misses instantly-aborting processes, so also read
+  # the persisted log, which retains the dead process's messages including
+  # Swift traps, NSExceptions, and Metal validation errors.
+  echo "--- persisted log for DraftingTable (last 2m) ---" >&2
+  xcrun simctl spawn "$device_udid" log show --last 2m --style compact \
+    --predicate 'process == "DraftingTable"' 2>&1 | tail -n 200 >&2 || true
   # Launch breadcrumbs are written to the app's Caches directory at every
   # startup stage, so a fast abort still leaves the last completed stage.
   echo "--- app container breadcrumbs ---" >&2
