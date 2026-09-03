@@ -98,8 +98,27 @@ archive, not yet the final lazy sparse-tile package.
 Version 0.7.1 fixes the v0.7 beige-screen launch abort. It restores the compact
 Metal vertex ABI, moves style to aligned fragment uniforms, bounds display and
 geometry allocations, guards Metal buffer creation, and adds a clean-simulator
-process-survival gate. Automatic thumbnails and the hover layer are temporarily
-disabled while they are redesigned off the synchronous startup/Metal layer path.
+process-survival gate.
+
+Version 0.7.2 resolves the persistent device launch kill. ASan identified an
+ODR violation caused by differing `Page` struct sizes in `DTDocument.hpp` and
+`DTEngine.hpp`; the bridge engine types were isolated into `drafting_table::ipad`.
+It introduces on-demand MTKView rendering, a 220,000-vertex per-frame budget,
+and persistent launch breadcrumbs.
+
+Version 0.8.0 ties the iPad UI layout directly to the original Android app:
+a left vertical rail divided into DRAW, SHAPE, and SELECT sections; bottom status
+bar chips; and full end-to-end support for the Circle shape tool.
+
+Version 0.9.0 establishes the 0.9.x stabilization line: intermediate round cap
+fans were removed to eliminate curve beading; a dedicated HSV Color Picker dialog
+with the upstream 32-color palette, recents, and user slots was added; and page
+thumbnails were restored via an asynchronous utility-queue cache.
+
+Version 0.9.1 introduces a visible color swatch tool button on the rail opening
+the HSV picker directly, six-slice exact-radius round joins for smooth tight
+curves without gaps or beading, and live grid snapping for shape tools.
+
 
 ## Implemented architecture
 
