@@ -100,7 +100,20 @@ enum DocumentExportService {
                 let circleRect = CGRect(x: center.x - side * 0.5, y: center.y - side * 0.5, width: side, height: side)
                 context.setLineWidth(max(1, stroke.brushSize))
                 context.strokeEllipse(in: circleRect)
-            case .shade, .bucket:
+            case .bucket:
+                if points.count >= 3 {
+                    context.beginPath()
+                    context.move(to: CGPoint(x: CGFloat(points[0].x), y: CGFloat(points[0].y)))
+                    for i in 1..<points.count {
+                        context.addLine(to: CGPoint(x: CGFloat(points[i].x), y: CGFloat(points[i].y)))
+                    }
+                    context.closePath()
+                    let fillAlpha = min(max(stroke.brushOpacity * (0.35 + 0.65 * stroke.brushHardness), 0), 1)
+                    let fillColor = decodedColor(stroke.brushColorRGBA, opacity: fillAlpha)
+                    context.setFillColor(fillColor.cgColor)
+                    context.fillPath()
+                }
+            case .shade:
                 if points.count >= 3 {
                     context.beginPath()
                     context.move(to: CGPoint(x: CGFloat(points[0].x), y: CGFloat(points[0].y)))

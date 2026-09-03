@@ -9,6 +9,7 @@ final class PagesRailView: UIView {
     var onDelete: ((Int) -> Void)?
     var onDuplicate: ((Int) -> Void)?
     var onMove: ((Int, Int) -> Void)?
+    var onDocsMenu: (() -> Void)?
     var thumbnailForPage: ((UInt) -> UIImage?)?
 
     var pageInfos: [DTPageInfo] = [] { didSet { reload() } }
@@ -69,6 +70,21 @@ final class PagesRailView: UIView {
 
     private func reload() {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let docsBtn = UIButton(type: .system)
+        var docCfg = UIButton.Configuration.plain()
+        docCfg.image = UIImage(systemName: "doc.text")
+        docCfg.title = "DOCS ∨"
+        docCfg.imagePadding = 4
+        docCfg.baseForegroundColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
+        docsBtn.configuration = docCfg
+        docsBtn.titleLabel?.font = .systemFont(ofSize: 11, weight: .bold)
+        docsBtn.backgroundColor = UIColor.white.withAlphaComponent(0.85)
+        docsBtn.layer.cornerRadius = 6
+        docsBtn.layer.borderWidth = 1
+        docsBtn.layer.borderColor = UIColor.black.withAlphaComponent(0.08).cgColor
+        docsBtn.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        docsBtn.addAction(UIAction { [weak self] _ in self?.onDocsMenu?() }, for: .touchUpInside)
+        stack.addArrangedSubview(docsBtn)
         stack.addArrangedSubview(titleLabel("PAGES"))
         let canDelete = pageInfos.count > 1
         for info in pageInfos {

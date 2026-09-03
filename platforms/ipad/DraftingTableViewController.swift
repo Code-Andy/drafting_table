@@ -41,7 +41,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var layersRail: LayersRailView!
     private var toolRail: UIView!
     private var statusBar: UIView!
-    private var topMenuBar: UIView!
     private var statusDocLabel: UILabel!
     private var statusToolLabel: UILabel!
     private var statusGridChip: UIButton!
@@ -57,15 +56,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var selectionCountLabel: UILabel!
     private let persistence = StrokePersistenceStore()
 
-    // Top menu bar items
-    private var topNotebooksButton: UIButton!
-    private var docTitleButton: UIButton!
-    private var quickToolSegment: UISegmentedControl!
-    private var topUndoButton: UIButton!
-    private var topRedoButton: UIButton!
-    private var topImportButton: UIButton!
-    private var topExportButton: UIButton!
-    private var topSettingsButton: UIButton!
+    // Top-left chrome & Sub-tool UI
+    private var mainMenuButton: UIButton!
+    private var undoRedoChip: UIView!
+    private var chipUndoButton: UIButton!
+    private var chipRedoButton: UIButton!
+    private var bucketSubToolBar: UIView!
+    private var gapSegment: UISegmentedControl!
+    private var bleedSegment: UISegmentedControl!
 
     // Tool rail buttons
     private var brushButton: UIButton!
@@ -104,48 +102,54 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         layersRail = LayersRailView(frame: .zero)
         toolRail = UIView()
         statusBar = UIView()
-        topMenuBar = UIView()
         toastLabel = InsetLabel()
+        configureUndoRedoChip()
+        configureBucketSubToolBar()
         configureSelectionActionBar()
         DTLaunchBreadcrumb("vc:create:rails:done")
         view = root
-        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, topMenuBar, selectionActionBar, toastLabel].forEach {
+        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, undoRedoChip, bucketSubToolBar, selectionActionBar, toastLabel].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview($0)
         }
-        configureTopMenuBar(); configureEmptyState(); configurePagesRail(); configureLayersRail(); configureToolRail(); configureStatusBar(); configureToast()
+        configureEmptyState(); configurePagesRail(); configureLayersRail(); configureToolRail(); configureStatusBar(); configureToast()
         DTLaunchBreadcrumb("vc:loadView:done")
 
         let safe = root.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
+            // Canvas covers full screen to true paper edges, zero top bar overhead
             canvas.leadingAnchor.constraint(equalTo: root.leadingAnchor), canvas.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             canvas.topAnchor.constraint(equalTo: root.topAnchor), canvas.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             hoverOverlay.leadingAnchor.constraint(equalTo: canvas.leadingAnchor), hoverOverlay.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
             hoverOverlay.topAnchor.constraint(equalTo: canvas.topAnchor), hoverOverlay.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
 
-            // Top Compact Header Menu Bar
-            topMenuBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            topMenuBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            topMenuBar.topAnchor.constraint(equalTo: safe.topAnchor),
-            topMenuBar.heightAnchor.constraint(equalToConstant: 40),
-
-            // Left vertical tool rail (compact 54pt width)
+            // Left vertical tool rail (compact 54pt width, starts at top of screen)
             toolRail.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 8),
-            toolRail.topAnchor.constraint(equalTo: topMenuBar.bottomAnchor, constant: 6),
+            toolRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
             toolRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
             toolRail.widthAnchor.constraint(equalToConstant: 54),
 
             // Page sidebar
             pagesRail.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 8),
-            pagesRail.topAnchor.constraint(equalTo: topMenuBar.bottomAnchor, constant: 6),
+            pagesRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
             pagesRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
             pagesRail.widthAnchor.constraint(equalToConstant: 80),
 
             // Layer sidebar
             layersRail.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -8),
-            layersRail.topAnchor.constraint(equalTo: topMenuBar.bottomAnchor, constant: 6),
+            layersRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
             layersRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
             layersRail.widthAnchor.constraint(equalToConstant: 156),
+
+            // Floating Undo / Redo chip over top-left canvas
+            undoRedoChip.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 12),
+            undoRedoChip.topAnchor.constraint(equalTo: safe.topAnchor, constant: 8),
+            undoRedoChip.heightAnchor.constraint(equalToConstant: 34),
+
+            // Bucket Sub-Tool Menu (gap error margin & bleed)
+            bucketSubToolBar.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 12),
+            bucketSubToolBar.topAnchor.constraint(equalTo: undoRedoChip.bottomAnchor, constant: 8),
+            bucketSubToolBar.widthAnchor.constraint(equalToConstant: 248),
 
             // Status bar touching true bottom edge
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
@@ -161,7 +165,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             toastLabel.trailingAnchor.constraint(lessThanOrEqualTo: layersRail.leadingAnchor, constant: -18),
             emptyState.centerXAnchor.constraint(equalTo: root.centerXAnchor), emptyState.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: -12),
             emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: pagesRail.trailingAnchor, constant: 18), emptyState.trailingAnchor.constraint(lessThanOrEqualTo: layersRail.leadingAnchor, constant: -18),
-            diagnostics.leadingAnchor.constraint(equalTo: pagesRail.trailingAnchor, constant: 12), diagnostics.topAnchor.constraint(equalTo: topMenuBar.bottomAnchor, constant: 10),
+            diagnostics.leadingAnchor.constraint(equalTo: pagesRail.trailingAnchor, constant: 12), diagnostics.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
             diagnostics.widthAnchor.constraint(greaterThanOrEqualToConstant: 150), diagnostics.widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
         canvas.onDiagnostics = { [weak self] text in
@@ -192,6 +196,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        navigationController?.setNavigationBarHidden(true, animated: false)
         title = "Drafting Table"; navigationItem.largeTitleDisplayMode = .never
         navigationController?.navigationBar.prefersLargeTitles = false
         let appearance = navigationAppearance()
@@ -223,6 +228,11 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
                   UInt(self.canvas.engineBridge.strokeCount))
             self.updateLaunchBreadcrumb(stage: "restored")
         }
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        navigationController?.setNavigationBarHidden(true, animated: animated)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -459,6 +469,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         pagesRail.onDelete = { [weak self] index in self?.deletePage(at: index) }
         pagesRail.onDuplicate = { [weak self] index in self?.duplicatePage(at: index) }
         pagesRail.onMove = { [weak self] from, to in self?.movePage(from: from, to: to) }
+        pagesRail.onDocsMenu = { [weak self] in self?.openGallery() }
     }
 
     private func configureLayersRail() {
@@ -578,106 +589,187 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         present(alert, animated: true)
     }
 
-    private func configureTopMenuBar() {
-        topMenuBar.backgroundColor = DraftingTheme.paperDeep
-        let hairline = UIView()
-        hairline.backgroundColor = DraftingTheme.rule
-        hairline.translatesAutoresizingMaskIntoConstraints = false
-        topMenuBar.addSubview(hairline)
-        NSLayoutConstraint.activate([
-            hairline.leadingAnchor.constraint(equalTo: topMenuBar.leadingAnchor),
-            hairline.trailingAnchor.constraint(equalTo: topMenuBar.trailingAnchor),
-            hairline.bottomAnchor.constraint(equalTo: topMenuBar.bottomAnchor),
-            hairline.heightAnchor.constraint(equalToConstant: 1)
-        ])
+    private func configureUndoRedoChip() {
+        undoRedoChip = UIView()
+        undoRedoChip.backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.95)
+        undoRedoChip.layer.cornerRadius = 8
+        undoRedoChip.layer.borderWidth = 1
+        undoRedoChip.layer.borderColor = DraftingTheme.rule.cgColor
+        undoRedoChip.layer.shadowColor = UIColor.black.cgColor
+        undoRedoChip.layer.shadowOpacity = 0.08
+        undoRedoChip.layer.shadowRadius = 4
+        undoRedoChip.layer.shadowOffset = CGSize(width: 0, height: 1.5)
+        undoRedoChip.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = UIStackView()
         stack.axis = .horizontal
         stack.alignment = .center
-        stack.spacing = 10
+        stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
-        topMenuBar.addSubview(stack)
+        undoRedoChip.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: topMenuBar.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(equalTo: topMenuBar.trailingAnchor, constant: -16),
-            stack.topAnchor.constraint(equalTo: topMenuBar.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: topMenuBar.bottomAnchor)
+            stack.leadingAnchor.constraint(equalTo: undoRedoChip.leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: undoRedoChip.trailingAnchor, constant: -4),
+            stack.topAnchor.constraint(equalTo: undoRedoChip.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: undoRedoChip.bottomAnchor)
         ])
 
-        // Leading: Notebooks & Document Title
-        topNotebooksButton = UIButton(type: .system)
-        var nbConfig = UIButton.Configuration.plain()
-        nbConfig.image = UIImage(systemName: "folder")
-        nbConfig.title = "Notebooks"
-        nbConfig.imagePadding = 4
-        nbConfig.baseForegroundColor = DraftingTheme.ink
-        topNotebooksButton.configuration = nbConfig
-        topNotebooksButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
-        topNotebooksButton.addTarget(self, action: #selector(openGallery), for: .touchUpInside)
+        chipUndoButton = UIButton(type: .system)
+        let undoCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        chipUndoButton.setImage(UIImage(systemName: "arrow.uturn.backward", withConfiguration: undoCfg), for: .normal)
+        chipUndoButton.tintColor = DraftingTheme.ink
+        chipUndoButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        chipUndoButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        chipUndoButton.addTarget(self, action: #selector(undoCanvas), for: .touchUpInside)
+        chipUndoButton.accessibilityLabel = "Undo"
 
-        docTitleButton = UIButton(type: .system)
-        var titleConfig = UIButton.Configuration.plain()
-        titleConfig.image = UIImage(systemName: "pencil")
-        let currentTitle = UserDefaults.standard.string(forKey: Self.docTitleDefaultsKey) ?? "DraftingTable"
-        titleConfig.title = currentTitle
-        titleConfig.imagePadding = 4
-        titleConfig.baseForegroundColor = DraftingTheme.ink
-        docTitleButton.configuration = titleConfig
-        docTitleButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        docTitleButton.addTarget(self, action: #selector(promptRenameDocument), for: .touchUpInside)
+        let div = UIView()
+        div.backgroundColor = DraftingTheme.rule
+        div.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        div.heightAnchor.constraint(equalToConstant: 18).isActive = true
 
-        // Center: Quick Tool Selector (Brush, Eraser, Select)
-        let toolImages = [
-            UIImage(systemName: "pencil.tip") ?? UIImage(),
-            UIImage(systemName: "eraser") ?? UIImage(),
-            UIImage(systemName: "rectangle.dashed") ?? UIImage()
-        ]
-        quickToolSegment = UISegmentedControl(items: toolImages)
-        quickToolSegment.selectedSegmentIndex = 0
-        quickToolSegment.addTarget(self, action: #selector(quickToolChanged(_:)), for: .valueChanged)
-        quickToolSegment.selectedSegmentTintColor = DraftingTheme.paper
-        quickToolSegment.backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.8)
+        chipRedoButton = UIButton(type: .system)
+        let redoCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        chipRedoButton.setImage(UIImage(systemName: "arrow.uturn.forward", withConfiguration: redoCfg), for: .normal)
+        chipRedoButton.tintColor = DraftingTheme.ink
+        chipRedoButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        chipRedoButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        chipRedoButton.addTarget(self, action: #selector(redoCanvas), for: .touchUpInside)
+        chipRedoButton.accessibilityLabel = "Redo"
 
-        // Trailing: Undo, Redo, Import, Export, Settings
-        let spacerL = UIView()
-        spacerL.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let spacerR = UIView()
-        spacerR.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        topUndoButton = topBarIconButton(systemName: "arrow.uturn.backward", action: #selector(undoCanvas))
-        topRedoButton = topBarIconButton(systemName: "arrow.uturn.forward", action: #selector(redoCanvas))
-        topImportButton = topBarIconButton(systemName: "photo.badge.plus", action: #selector(promptImportPhoto))
-        topExportButton = topBarIconButton(systemName: "square.and.arrow.up", action: #selector(showExportMenu))
-        topSettingsButton = topBarIconButton(systemName: "gearshape", action: #selector(openSettings))
-
-        [topNotebooksButton, docTitleButton, spacerL, quickToolSegment, spacerR,
-         topUndoButton, topRedoButton, topImportButton, topExportButton, topSettingsButton].forEach(stack.addArrangedSubview)
+        [chipUndoButton, div, chipRedoButton].forEach(stack.addArrangedSubview)
     }
 
-    private func topBarIconButton(systemName: String, action: Selector) -> UIButton {
-        let btn = UIButton(type: .system)
-        let cfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-        btn.setImage(UIImage(systemName: systemName, withConfiguration: cfg), for: .normal)
-        btn.tintColor = DraftingTheme.ink
-        btn.addTarget(self, action: action, for: .touchUpInside)
-        btn.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        btn.heightAnchor.constraint(equalToConstant: 32).isActive = true
-        return btn
-    }
+    private func configureBucketSubToolBar() {
+        bucketSubToolBar = UIView()
+        bucketSubToolBar.backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.96)
+        bucketSubToolBar.layer.cornerRadius = 9
+        bucketSubToolBar.layer.borderWidth = 1
+        bucketSubToolBar.layer.borderColor = DraftingTheme.rule.cgColor
+        bucketSubToolBar.layer.shadowColor = UIColor.black.cgColor
+        bucketSubToolBar.layer.shadowOpacity = 0.10
+        bucketSubToolBar.layer.shadowRadius = 6
+        bucketSubToolBar.layer.shadowOffset = CGSize(width: 0, height: 2)
+        bucketSubToolBar.translatesAutoresizingMaskIntoConstraints = false
+        bucketSubToolBar.isHidden = true
 
-    @objc private func quickToolChanged(_ sender: UISegmentedControl) {
-        switch sender.selectedSegmentIndex {
-        case 0: selectTool(.brush)
-        case 1: selectTool(.eraser)
-        case 2: selectTool(.select)
-        default: break
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .fill
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        bucketSubToolBar.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: bucketSubToolBar.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: bucketSubToolBar.trailingAnchor, constant: -8),
+            stack.topAnchor.constraint(equalTo: bucketSubToolBar.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: bucketSubToolBar.bottomAnchor, constant: -8)
+        ])
+
+        let titleLbl = UILabel()
+        titleLbl.text = "BUCKET FILL OPTIONS"
+        titleLbl.font = .systemFont(ofSize: 10, weight: .bold)
+        titleLbl.textColor = DraftingTheme.inkSoft
+        stack.addArrangedSubview(titleLbl)
+
+        let gapLabel = UILabel()
+        gapLabel.text = "GAP ERROR MARGIN"
+        gapLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        gapLabel.textColor = DraftingTheme.inkSoft
+        stack.addArrangedSubview(gapLabel)
+
+        let gapValues = [0, 2, 4, 8, 12, 16]
+        let gapTitles = ["0px", "2px", "4px", "8px", "12px", "16px"]
+        gapSegment = UISegmentedControl(items: gapTitles)
+        let currentGap = canvas.bucketGapSize
+        if let idx = gapValues.firstIndex(of: currentGap) {
+            gapSegment.selectedSegmentIndex = idx
+        } else {
+            gapSegment.selectedSegmentIndex = 2
         }
+        gapSegment.selectedSegmentTintColor = DraftingTheme.paper
+        gapSegment.backgroundColor = DraftingTheme.paper.withAlphaComponent(0.6)
+        gapSegment.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let idx = self.gapSegment.selectedSegmentIndex
+            if idx >= 0 && idx < gapValues.count {
+                self.canvas.bucketGapSize = gapValues[idx]
+                self.showToast("Bucket Gap Margin: \(gapTitles[idx])")
+            }
+        }, for: .valueChanged)
+        stack.addArrangedSubview(gapSegment)
+
+        let bleedLabel = UILabel()
+        bleedLabel.text = "BLEED / EXPANSION"
+        bleedLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        bleedLabel.textColor = DraftingTheme.inkSoft
+        stack.addArrangedSubview(bleedLabel)
+
+        let bleedValues = [0, 1, 2, 4]
+        let bleedTitles = ["0px", "1px", "2px", "4px"]
+        bleedSegment = UISegmentedControl(items: bleedTitles)
+        let currentBleed = canvas.bucketBleed
+        if let idx = bleedValues.firstIndex(of: currentBleed) {
+            bleedSegment.selectedSegmentIndex = idx
+        } else {
+            bleedSegment.selectedSegmentIndex = 2
+        }
+        bleedSegment.selectedSegmentTintColor = DraftingTheme.paper
+        bleedSegment.backgroundColor = DraftingTheme.paper.withAlphaComponent(0.6)
+        bleedSegment.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let idx = self.bleedSegment.selectedSegmentIndex
+            if idx >= 0 && idx < bleedValues.count {
+                self.canvas.bucketBleed = bleedValues[idx]
+                self.showToast("Bucket Bleed: \(bleedTitles[idx])")
+            }
+        }, for: .valueChanged)
+        stack.addArrangedSubview(bleedSegment)
     }
 
-    @objc private func showExportMenu() {
+    private func applyQuickColor(_ rgba: UInt32) {
+        canvas.engineBridge.brushColorRGBA = rgba
+        UserDefaults.standard.set(Int64(rgba), forKey: DrawingSettingsViewController.brushColorDefaultsKey)
+        refreshColorSwatch()
+        HapticFeedbackService.shared.toolSwitched()
+    }
+
+    @objc private func showMainMenu(_ sender: UIButton) {
+        let alert = UIAlertController(title: "Drafting Table", message: nil, preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(title: "Notebooks Gallery", style: .default) { [weak self] _ in
+            self?.openGallery()
+        })
+        alert.addAction(UIAlertAction(title: "Rename Document", style: .default) { [weak self] _ in
+            self?.promptRenameDocument()
+        })
+        alert.addAction(UIAlertAction(title: "Export & Share...", style: .default) { [weak self] _ in
+            self?.showExportMenu(sourceView: sender)
+        })
+        alert.addAction(UIAlertAction(title: "Import Photo...", style: .default) { [weak self] _ in
+            self?.promptImportPhoto()
+        })
+        alert.addAction(UIAlertAction(title: "Settings...", style: .default) { [weak self] _ in
+            self?.openSettings()
+        })
+        alert.addAction(UIAlertAction(title: "Reset Canvas View", style: .default) { [weak self] _ in
+            self?.resetCanvasView()
+        })
+        alert.addAction(UIAlertAction(title: "Clear Document", style: .destructive) { [weak self] _ in
+            self?.confirmClearDocument()
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = sender
+            popover.sourceRect = sender.bounds
+        }
+        present(alert, animated: true)
+    }
+
+    @objc private func showExportMenu(sourceView: UIView? = nil) {
         let alert = UIAlertController(title: "Export & Share", message: nil, preferredStyle: .actionSheet)
-        alert.popoverPresentationController?.sourceView = topExportButton
-        alert.popoverPresentationController?.sourceRect = topExportButton.bounds
+        let anchor = sourceView ?? mainMenuButton ?? view
+        alert.popoverPresentationController?.sourceView = anchor
+        alert.popoverPresentationController?.sourceRect = anchor?.bounds ?? .zero
 
         alert.addAction(UIAlertAction(title: "Export Current Page (PNG)", style: .default) { [weak self] _ in
             self?.exportCurrentPagePNG()
@@ -700,9 +792,61 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let stack = UIStackView()
         stack.axis = .vertical; stack.alignment = .fill; stack.spacing = 4; stack.translatesAutoresizingMaskIntoConstraints = false
 
+        mainMenuButton = railToolButton(systemName: "line.3.horizontal", label: "Menu", action: #selector(showMainMenu(_:)))
+        stack.addArrangedSubview(mainMenuButton)
+        stack.addArrangedSubview(railRule())
+
+        // Primitive Color Selector & Pen Colors
+        colorSwatchButton = railToolButton(systemName: "circle.fill", label: "Color", action: #selector(openColorPickerDirect))
+        refreshColorSwatch()
+        stack.addArrangedSubview(colorSwatchButton)
+
+        let paletteGrid = UIStackView()
+        paletteGrid.axis = .vertical
+        paletteGrid.spacing = 3
+        paletteGrid.alignment = .center
+
+        let quickColors: [(UInt32, String)] = [
+            (0x000000FF, "Black"), (0x2B2926FF, "Ink"),
+            (0xB5482EFF, "Red"),   (0x2A5D8FFF, "Blue"),
+            (0x3D5E26FF, "Green"), (0xC8A030FF, "Amber"),
+            (0x7A7368FF, "Gray"),  (0xFFFFFFFF, "White")
+        ]
+        for r in 0..<4 {
+            let rowStack = UIStackView()
+            rowStack.axis = .horizontal
+            rowStack.spacing = 4
+            rowStack.alignment = .center
+            for c in 0..<2 {
+                let idx = r * 2 + c
+                let (rgba, name) = quickColors[idx]
+                let btn = UIButton(type: .custom)
+                btn.translatesAutoresizingMaskIntoConstraints = false
+                btn.widthAnchor.constraint(equalToConstant: 18).isActive = true
+                btn.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                btn.layer.cornerRadius = 9
+                btn.backgroundColor = UIColor(
+                    red: CGFloat((rgba >> 24) & 0xff) / 255.0,
+                    green: CGFloat((rgba >> 16) & 0xff) / 255.0,
+                    blue: CGFloat((rgba >> 8) & 0xff) / 255.0,
+                    alpha: 1.0
+                )
+                btn.layer.borderWidth = 1.0
+                btn.layer.borderColor = UIColor(red: 0.35, green: 0.30, blue: 0.22, alpha: 0.35).cgColor
+                btn.accessibilityLabel = name
+                btn.addAction(UIAction { [weak self] _ in
+                    self?.applyQuickColor(rgba)
+                }, for: .touchUpInside)
+                rowStack.addArrangedSubview(btn)
+            }
+            paletteGrid.addArrangedSubview(rowStack)
+        }
+        stack.addArrangedSubview(paletteGrid)
+        stack.addArrangedSubview(railRule())
+
         brushButton = railToolButton(systemName: "pencil.tip", label: "Brush", action: #selector(selectBrush))
         eraserButton = railToolButton(systemName: "eraser", label: "Eraser", action: #selector(selectEraser))
-        bucketButton = railToolButton(systemName: "drop", label: "Bucket", action: #selector(selectBucket))
+        bucketButton = railToolButton(systemName: "drop.fill", label: "Bucket", action: #selector(selectBucket))
         shadeButton = railToolButton(systemName: "skew", label: "Shade", action: #selector(selectShade))
         lineButton = railToolButton(systemName: "line.diagonal", label: "Line", action: #selector(selectLine))
         rectangleButton = railToolButton(systemName: "rectangle", label: "Rect", action: #selector(selectRectangle))
@@ -717,11 +861,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         clearButton = railToolButton(systemName: "trash", label: "Clear", action: #selector(confirmClearDocument))
 
         stack.addArrangedSubview(railTitle("DRAW"))
-        colorSwatchButton = railToolButton(systemName: "circle.fill", label: "Color", action: #selector(openColorPickerDirect))
-        refreshColorSwatch()
-        [colorSwatchButton, brushButton, eraserButton, bucketButton, shadeButton].forEach(stack.addArrangedSubview)
+        [brushButton, eraserButton, bucketButton, shadeButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
-        stack.addArrangedSubview(railTitle("SHAPE"))
+        stack.addArrangedSubview(railTitle("VECTOR"))
         [lineButton, rectangleButton, circleButton, ellipseButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
         stack.addArrangedSubview(railTitle("SELECT"))
@@ -1014,26 +1156,32 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func handlePencilSqueeze() {
-        let alert = UIAlertController(title: "Quick Tool Switcher", message: "Select a tool", preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(title: "Brush", style: .default) { [weak self] _ in self?.selectTool(.brush) })
-        alert.addAction(UIAlertAction(title: "Eraser", style: .default) { [weak self] _ in self?.selectTool(.eraser) })
-        alert.addAction(UIAlertAction(title: "Bucket Fill", style: .default) { [weak self] _ in self?.selectBucket() })
-        alert.addAction(UIAlertAction(title: "Shade Fill", style: .default) { [weak self] _ in self?.selectTool(.shade) })
-        alert.addAction(UIAlertAction(title: "Line", style: .default) { [weak self] _ in self?.selectTool(.line) })
-        alert.addAction(UIAlertAction(title: "Rectangle", style: .default) { [weak self] _ in self?.selectTool(.rectangle) })
-        alert.addAction(UIAlertAction(title: "Circle", style: .default) { [weak self] _ in self?.selectTool(.circle) })
-        alert.addAction(UIAlertAction(title: "Ellipse", style: .default) { [weak self] _ in self?.selectTool(.ellipse) })
-        alert.addAction(UIAlertAction(title: "Marquee Select", style: .default) { [weak self] _ in self?.selectTool(.select) })
-        alert.addAction(UIAlertAction(title: "Lasso Select", style: .default) { [weak self] _ in self?.selectTool(.lasso) })
-        alert.addAction(UIAlertAction(title: "Color Swatch", style: .default) { [weak self] _ in self?.openColorPickerDirect() })
-        alert.addAction(UIAlertAction(title: "Undo", style: .default) { [weak self] _ in self?.undoCanvas() })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = view
-            let hoverPt = hoverOverlay?.hoverPoint ?? CGPoint(x: view.bounds.midX, y: view.bounds.midY)
-            popover.sourceRect = CGRect(origin: hoverPt, size: CGSize(width: 1, height: 1))
+        let hoverPt = hoverOverlay?.hoverPoint ?? canvas.lastTouchPoint
+        let targetPt = (hoverPt == .zero) ? CGPoint(x: view.bounds.midX, y: view.bounds.midY) : hoverPt
+        let current = canvas.engineBridge.brushColorRGBA
+        let currentUIColor = UIColor(
+            red: CGFloat((current >> 24) & 0xff) / 255.0,
+            green: CGFloat((current >> 16) & 0xff) / 255.0,
+            blue: CGFloat((current >> 8) & 0xff) / 255.0,
+            alpha: CGFloat(current & 0xff) / 255.0
+        )
+        let radial = CircularRadialMenuView(activeTool: canvas.currentTool, activeColor: currentUIColor)
+        radial.onAction = { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .selectTool(let tool):
+                if tool == .bucket {
+                    self.selectBucket()
+                } else {
+                    self.selectTool(tool)
+                }
+            case .openColorPicker:
+                self.openColorPickerDirect()
+            case .undo:
+                self.undoCanvas()
+            }
         }
-        present(alert, animated: true)
+        radial.present(in: view, around: targetPt)
     }
 
     private func configureToast() {
@@ -1089,14 +1237,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             button.layer.borderColor = (button.isSelected ? UIColor.systemBlue : DraftingTheme.rule.withAlphaComponent(0.6)).cgColor
             button.accessibilityValue = button.isSelected ? "Selected" : "Not selected"
         }
-        if let quickToolSegment {
-            switch selectedTool {
-            case .brush: quickToolSegment.selectedSegmentIndex = 0
-            case .eraser: quickToolSegment.selectedSegmentIndex = 1
-            case .select, .lasso: quickToolSegment.selectedSegmentIndex = 2
-            default: quickToolSegment.selectedSegmentIndex = UISegmentedControl.noSegment
-            }
-        }
+        bucketSubToolBar?.isHidden = (selectedTool != .bucket)
         refreshColorSwatch()
         updateStatusBar()
     }
@@ -1106,8 +1247,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let canRedo = canvas.engineBridge.canRedo
         undoButton?.isEnabled = canUndo
         redoButton?.isEnabled = canRedo
-        topUndoButton?.isEnabled = canUndo
-        topRedoButton?.isEnabled = canRedo
+        chipUndoButton?.isEnabled = canUndo
+        chipUndoButton?.alpha = canUndo ? 1.0 : 0.35
+        chipRedoButton?.isEnabled = canRedo
+        chipRedoButton?.alpha = canRedo ? 1.0 : 0.35
         clearButton?.isEnabled = canvas.engineBridge.strokeCount > 0
     }
 

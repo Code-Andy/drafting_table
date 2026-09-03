@@ -112,6 +112,15 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
     }
 
+    // Bucket Fill Configuration (Error margin between gaps & bleed)
+    var bucketGapSize: Int = UserDefaults.standard.object(forKey: "draftingTable.bucketGapSize") as? Int ?? 4 {
+        didSet { UserDefaults.standard.set(bucketGapSize, forKey: "draftingTable.bucketGapSize") }
+    }
+    var bucketBleed: Int = UserDefaults.standard.object(forKey: "draftingTable.bucketBleed") as? Int ?? 2 {
+        didSet { UserDefaults.standard.set(bucketBleed, forKey: "draftingTable.bucketBleed") }
+    }
+    private(set) var lastTouchPoint: CGPoint = .zero
+
     // Selection & Transform tracking
     var selectedStrokeIndices: [Int] = []
     var selectedBoundingBox: CGRect?
@@ -442,7 +451,16 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch == nil, let touch = touches.first(where: accepts) else { return }
+        lastTouchPoint = touch.preciseLocation(in: self)
         activeTouch = touch
+
+        if currentTool == .bucket {
+            let loc = touch.preciseLocation(in: self)
+            let docLoc = documentPoint(for: loc)
+            performBucketFill(at: docLoc)
+            activeTouch = nil
+            return
+        }
 
         // Selection & Transform mode
         if currentTool == .select || currentTool == .lasso {
@@ -1109,5 +1127,382 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                              activeToolName,
                              hover,
                              lastPencilAction))
+    }
+
+    // MARK: - Gap-Closing Bucket Fill
+
+    func performBucketFill(at docPoint: CGPoint) {
+        let strokes = engineBridge.renderableStrokes()
+
+        // Establish adaptive Region of Interest (ROI) centered at docPoint
+        let roiSize: CGFloat = 1600.0
+        let halfSize = roiSize * 0.5
+        let originX = docPoint.x - halfSize
+        let originY = docPoint.y - halfSize
+
+        let width = Int(roiSize)
+        let height = Int(roiSize)
+        guard width > 0 && height > 0 else { return }
+
+        // Rasterize existing strokes to single-channel 8-bit obstacle map
+        var pixels = [UInt8](repeating: 255, count: width * height)
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+
+        pixels.withUnsafeMutableBytes { rawBuf in
+            guard let ptr = rawBuf.baseAddress else { return }
+            guard let ctx = CGContext(data: ptr,
+                                      width: width,
+                                      height: height,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: width,
+                                      space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+
+            ctx.translateBy(x: -originX, y: -originY)
+            ctx.setStrokeColor(gray: 0.0, alpha: 1.0)
+            ctx.setFillColor(gray: 0.0, alpha: 1.0)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+
+            for stroke in strokes {
+                let pts: [DTRenderPoint] = stroke.points.map { v in
+                    var p = DTRenderPoint()
+                    v.getValue(&p)
+                    return p
+                }
+                guard !pts.isEmpty else { continue }
+                let strokeWidth = max(1.5, CGFloat(stroke.brushSize))
+                ctx.setLineWidth(strokeWidth)
+
+                switch stroke.tool {
+                case .brush, .eraser:
+                    if pts.count == 1 {
+                        let pt = CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y))
+                        let r = strokeWidth * 0.5
+                        ctx.fillEllipse(in: CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2))
+                    } else {
+                        ctx.beginPath()
+                        ctx.move(to: CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y)))
+                        for i in 1..<pts.count {
+                            ctx.addLine(to: CGPoint(x: CGFloat(pts[i].x), y: CGFloat(pts[i].y)))
+                        }
+                        ctx.strokePath()
+                    }
+                case .line:
+                    if pts.count >= 2 {
+                        let p0 = CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y))
+                        let p1 = CGPoint(x: CGFloat(pts.last!.x), y: CGFloat(pts.last!.y))
+                        ctx.strokeLineSegments(between: [p0, p1])
+                    }
+                case .rectangle:
+                    if pts.count >= 2 {
+                        let p0 = CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y))
+                        let p1 = CGPoint(x: CGFloat(pts.last!.x), y: CGFloat(pts.last!.y))
+                        let r = CGRect(x: min(p0.x, p1.x), y: min(p0.y, p1.y),
+                                       width: abs(p1.x - p0.x), height: abs(p1.y - p0.y))
+                        ctx.stroke(r)
+                    }
+                case .circle:
+                    if pts.count >= 2 {
+                        let p0 = CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y))
+                        let p1 = CGPoint(x: CGFloat(pts.last!.x), y: CGFloat(pts.last!.y))
+                        let side = max(abs(p1.x - p0.x), abs(p1.y - p0.y))
+                        let cx = (p0.x + p1.x) * 0.5
+                        let cy = (p0.y + p1.y) * 0.5
+                        ctx.strokeEllipse(in: CGRect(x: cx - side * 0.5, y: cy - side * 0.5, width: side, height: side))
+                    }
+                case .ellipse:
+                    if pts.count >= 2 {
+                        let p0 = CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y))
+                        let p1 = CGPoint(x: CGFloat(pts.last!.x), y: CGFloat(pts.last!.y))
+                        let r = CGRect(x: min(p0.x, p1.x), y: min(p0.y, p1.y),
+                                       width: abs(p1.x - p0.x), height: abs(p1.y - p0.y))
+                        ctx.strokeEllipse(in: r)
+                    }
+                case .shade, .bucket:
+                    if pts.count >= 3 {
+                        ctx.beginPath()
+                        ctx.move(to: CGPoint(x: CGFloat(pts[0].x), y: CGFloat(pts[0].y)))
+                        for i in 1..<pts.count {
+                            ctx.addLine(to: CGPoint(x: CGFloat(pts[i].x), y: CGFloat(pts[i].y)))
+                        }
+                        ctx.closePath()
+                        ctx.strokePath()
+                    }
+                @unknown default:
+                    break
+                }
+            }
+        }
+
+        // 1. Build initial obstacle mask (true for lines)
+        var blocked = [Bool](repeating: false, count: width * height)
+        for i in 0..<(width * height) {
+            if pixels[i] <= 128 {
+                blocked[i] = true
+            }
+        }
+
+        // 2. Gap closing: dilate obstacles by (bucketGapSize + 1) / 2
+        let gapRadius = max(0, (bucketGapSize + 1) / 2)
+        var dilatedObstacles = blocked
+        if gapRadius > 0 {
+            dilatedObstacles = dilateBinaryMask(blocked, width: width, height: height, radius: gapRadius)
+        }
+
+        // 3. Seed point resolution
+        var sx = Int(round(docPoint.x - originX))
+        var sy = Int(round(docPoint.y - originY))
+        guard sx >= 0, sx < width, sy >= 0, sy < height else { return }
+
+        // If tap falls on a dilated obstacle line, probe nearby unblocked pixel
+        if dilatedObstacles[sy * width + sx] {
+            var found = false
+            let searchR = gapRadius + 4
+            for r in 1...searchR {
+                for dy in -r...r {
+                    for dx in -r...r {
+                        let nx = sx + dx
+                        let ny = sy + dy
+                        if nx >= 0 && nx < width && ny >= 0 && ny < height {
+                            if !dilatedObstacles[ny * width + nx] {
+                                sx = nx
+                                sy = ny
+                                found = true
+                                break
+                            }
+                        }
+                    }
+                    if found { break }
+                }
+                if found { break }
+            }
+            if !found { return }
+        }
+
+        // 4. BFS flood fill
+        var fillMask = [Bool](repeating: false, count: width * height)
+        var qX = [Int]()
+        var qY = [Int]()
+        qX.reserveCapacity(8192)
+        qY.reserveCapacity(8192)
+
+        qX.append(sx)
+        qY.append(sy)
+        fillMask[sy * width + sx] = true
+
+        var head = 0
+        var minX = sx, maxX = sx, minY = sy, maxY = sy
+
+        while head < qX.count {
+            let cx = qX[head]
+            let cy = qY[head]
+            head += 1
+
+            if cx < minX { minX = cx }
+            if cx > maxX { maxX = cx }
+            if cy < minY { minY = cy }
+            if cy > maxY { maxY = cy }
+
+            let neighbors = [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)]
+            for (nx, ny) in neighbors {
+                guard nx >= 0, nx < width, ny >= 0, ny < height else { continue }
+                let idx = ny * width + nx
+                if !fillMask[idx] && !dilatedObstacles[idx] {
+                    fillMask[idx] = true
+                    qX.append(nx)
+                    qY.append(ny)
+                }
+            }
+        }
+
+        guard head > 0 else { return }
+
+        // 5. Dilate filled region by gapRadius + bucketBleed to restore gap margin & bleed under strokes
+        let bleedExpansion = gapRadius + max(0, bucketBleed)
+        var finalMask = fillMask
+        if bleedExpansion > 0 {
+            finalMask = dilateBinaryMask(fillMask, width: width, height: height, radius: bleedExpansion)
+        }
+
+        // 6. Contour extraction via Moore-neighbor border tracing
+        let rawContour = traceContour(mask: finalMask, width: width, height: height,
+                                      minX: max(0, minX - bleedExpansion),
+                                      maxX: min(width - 1, maxX + bleedExpansion),
+                                      minY: max(0, minY - bleedExpansion),
+                                      maxY: min(height - 1, maxY + bleedExpansion))
+        guard rawContour.count >= 3 else { return }
+
+        // Convert contour points to document coordinates
+        let docPoints: [CGPoint] = rawContour.map { pt in
+            CGPoint(x: originX + CGFloat(pt.x), y: originY + CGFloat(pt.y))
+        }
+
+        // Simplify contour with Ramer-Douglas-Peucker
+        let simplified = simplifyPolygon(points: docPoints, tolerance: 1.0)
+        guard simplified.count >= 3 else { return }
+
+        // 7. Store as Stroke with DTTool.bucket
+        var samples = [DTPencilSample]()
+        samples.reserveCapacity(simplified.count)
+        for pt in simplified {
+            var s = DTPencilSample()
+            s.x = Float(pt.x)
+            s.y = Float(pt.y)
+            s.pressure = 1.0
+            s.altitude = Float(CGFloat.pi * 0.5)
+            s.azimuth = 0
+            s.roll = 0
+            s.hoverDistance = 0
+            s.timestamp = CACurrentMediaTime()
+            s.sampleID = nextSampleID
+            nextSampleID &+= 1
+            s.flags = .real
+            samples.append(s)
+        }
+
+        // Add stroke to active layer
+        samples.withUnsafeBufferPointer { buf in
+            engineBridge.beginStroke()
+            engineBridge.appendSamples(buf.baseAddress, count: UInt(buf.count), realCount: UInt(buf.count))
+            engineBridge.endStroke()
+        }
+
+        HapticFeedbackService.shared.toolSwitched()
+        onDocumentChanged?()
+        setNeedsDisplay()
+    }
+
+    private func dilateBinaryMask(_ mask: [Bool], width: Int, height: Int, radius: Int) -> [Bool] {
+        guard radius > 0 else { return mask }
+        var temp = [Bool](repeating: false, count: width * height)
+        var result = [Bool](repeating: false, count: width * height)
+
+        for y in 0..<height {
+            let rowOffset = y * width
+            var count = 0
+            for x in 0..<width {
+                if x + radius < width && mask[rowOffset + x + radius] { count += 1 }
+                if x - radius - 1 >= 0 && mask[rowOffset + x - radius - 1] { count -= 1 }
+                if count > 0 || mask[rowOffset + x] {
+                    temp[rowOffset + x] = true
+                }
+            }
+        }
+
+        for x in 0..<width {
+            var count = 0
+            for y in 0..<height {
+                if y + radius < height && temp[(y + radius) * width + x] { count += 1 }
+                if y - radius - 1 >= 0 && temp[(y - radius - 1) * width + x] { count -= 1 }
+                if count > 0 || temp[y * width + x] {
+                    result[y * width + x] = true
+                }
+            }
+        }
+        return result
+    }
+
+    private struct IntPoint: Equatable {
+        var x: Int
+        var y: Int
+    }
+
+    private func traceContour(mask: [Bool], width: Int, height: Int,
+                              minX: Int, maxX: Int, minY: Int, maxY: Int) -> [IntPoint] {
+        var startPt: IntPoint?
+        for y in minY...maxY {
+            for x in minX...maxX {
+                if mask[y * width + x] {
+                    startPt = IntPoint(x: x, y: y)
+                    break
+                }
+            }
+            if startPt != nil { break }
+        }
+        guard let start = startPt else { return [] }
+
+        var contour = [IntPoint]()
+        contour.reserveCapacity(1024)
+
+        let directions: [(dx: Int, dy: Int)] = [
+            (0, -1), (1, -1), (1, 0), (1, 1),
+            (0, 1), (-1, 1), (-1, 0), (-1, -1)
+        ]
+
+        var current = start
+        var backtrackDir = 6
+        contour.append(current)
+
+        let maxSteps = (maxX - minX + maxY - minY + 2) * 8
+        var steps = 0
+
+        while steps < maxSteps {
+            steps += 1
+            var nextFound = false
+            let startSearchIdx = (backtrackDir + 1) % 8
+
+            for i in 0..<8 {
+                let dirIdx = (startSearchIdx + i) % 8
+                let nx = current.x + directions[dirIdx].dx
+                let ny = current.y + directions[dirIdx].dy
+                if nx >= 0 && nx < width && ny >= 0 && ny < height {
+                    if mask[ny * width + nx] {
+                        current = IntPoint(x: nx, y: ny)
+                        backtrackDir = (dirIdx + 4) % 8
+                        nextFound = true
+                        break
+                    }
+                }
+            }
+
+            if !nextFound || (current == start && contour.count > 2) {
+                break
+            }
+            contour.append(current)
+        }
+        return contour
+    }
+
+    private func simplifyPolygon(points: [CGPoint], tolerance: CGFloat) -> [CGPoint] {
+        guard points.count > 2 else { return points }
+
+        func perpendicularDistance(_ p: CGPoint, lineStart: CGPoint, lineEnd: CGPoint) -> CGFloat {
+            let dx = lineEnd.x - lineStart.x
+            let dy = lineEnd.y - lineStart.y
+            let mag = hypot(dx, dy)
+            if mag < 0.0001 { return hypot(p.x - lineStart.x, p.y - lineStart.y) }
+            return abs(dy * p.x - dx * p.y + lineEnd.x * lineStart.y - lineEnd.y * lineStart.x) / mag
+        }
+
+        func rdp(_ pts: [CGPoint], tol: CGFloat) -> [CGPoint] {
+            guard pts.count > 2 else { return pts }
+            var dmax: CGFloat = 0
+            var index = 0
+            let start = pts.first!
+            let end = pts.last!
+
+            for i in 1..<(pts.count - 1) {
+                let d = perpendicularDistance(pts[i], lineStart: start, lineEnd: end)
+                if d > dmax {
+                    index = i
+                    dmax = d
+                }
+            }
+
+            if dmax > tol {
+                let left = rdp(Array(pts[0...index]), tol: tol)
+                let right = rdp(Array(pts[index..<pts.count]), tol: tol)
+                return Array(left.dropLast()) + right
+            } else {
+                return [start, end]
+            }
+        }
+
+        var result = rdp(points, tol: tolerance)
+        if result.count > 1 && hypot(result.first!.x - result.last!.x, result.first!.y - result.last!.y) > 0.01 {
+            result.append(result.first!)
+        }
+        return result
     }
 }

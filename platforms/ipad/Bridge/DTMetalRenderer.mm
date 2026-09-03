@@ -210,26 +210,91 @@ struct DTSampledPoint {
     float predicted;
 };
 
+static inline float cross2d(vector_float2 a, vector_float2 b, vector_float2 c) {
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+static inline bool isPointInTriangle(vector_float2 p, vector_float2 a, vector_float2 b, vector_float2 c) {
+    const float cp1 = cross2d(a, b, p);
+    const float cp2 = cross2d(b, c, p);
+    const float cp3 = cross2d(c, a, p);
+    const bool hasNeg = (cp1 < -0.0001f) || (cp2 < -0.0001f) || (cp3 < -0.0001f);
+    const bool hasPos = (cp1 > 0.0001f) || (cp2 > 0.0001f) || (cp3 > 0.0001f);
+    return !(hasNeg && hasPos);
+}
+
 static void addPolygonFill(std::vector<DTMetalVertex>& out,
                            const std::vector<DTSampledPoint>& points,
                            float opacity, vector_float4 color, float hardness) {
     if (points.size() < 3) return;
-    vector_float2 centroid = (vector_float2){0, 0};
-    for (const auto& p : points) {
-        centroid.x += p.position.x;
-        centroid.y += p.position.y;
-    }
-    centroid.x /= static_cast<float>(points.size());
-    centroid.y /= static_cast<float>(points.size());
-
     const float fillOpacity = opacity * (0.35f + 0.65f * hardness);
-    for (size_t i = 0; i < points.size(); ++i) {
-        const size_t next = (i + 1) % points.size();
-        addTriangleStyled(out,
-                          centroid,
-                          points[i].position,
-                          points[next].position,
-                          1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
+
+    // Deduplicate consecutive points
+    std::vector<vector_float2> poly;
+    poly.reserve(points.size());
+    for (const auto& pt : points) {
+        if (poly.empty() || simd_distance(poly.back(), pt.position) > 0.1f) {
+            poly.push_back(pt.position);
+        }
+    }
+    if (poly.size() >= 3 && simd_distance(poly.front(), poly.back()) < 0.1f) {
+        poly.pop_back();
+    }
+    if (poly.size() < 3) return;
+
+    // Ensure CCW orientation via signed area
+    float area = 0.0f;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const size_t next = (i + 1) % poly.size();
+        area += poly[i].x * poly[next].y - poly[next].x * poly[i].y;
+    }
+    if (fabsf(area) < 0.001f) return;
+    if (area < 0) {
+        std::reverse(poly.begin(), poly.end());
+    }
+
+    // Ear-clipping triangulation for general (convex or concave) polygons
+    std::vector<int> indices(poly.size());
+    for (size_t i = 0; i < poly.size(); ++i) indices[i] = static_cast<int>(i);
+
+    size_t count = indices.size();
+    size_t iterations = 0;
+    const size_t maxIterations = count * count * 2;
+    size_t curr = 0;
+
+    while (count > 3 && iterations < maxIterations) {
+        iterations++;
+        const int prevIdx = indices[(curr + count - 1) % count];
+        const int currIdx = indices[curr % count];
+        const int nextIdx = indices[(curr + 1) % count];
+
+        const vector_float2 a = poly[prevIdx];
+        const vector_float2 b = poly[currIdx];
+        const vector_float2 c = poly[nextIdx];
+
+        if (cross2d(a, b, c) > 0.0001f) {
+            bool isEar = true;
+            for (size_t i = 0; i < count; ++i) {
+                const int testIdx = indices[i];
+                if (testIdx == prevIdx || testIdx == currIdx || testIdx == nextIdx) continue;
+                if (isPointInTriangle(poly[testIdx], a, b, c)) {
+                    isEar = false;
+                    break;
+                }
+            }
+            if (isEar) {
+                addTriangleStyled(out, a, b, c, 1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
+                indices.erase(indices.begin() + (curr % count));
+                count--;
+                continue;
+            }
+        }
+        curr = (curr + 1) % count;
+    }
+
+    if (count == 3) {
+        const int i0 = indices[0], i1 = indices[1], i2 = indices[2];
+        addTriangleStyled(out, poly[i0], poly[i1], poly[i2], 1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
     }
 }
 
@@ -595,6 +660,37 @@ typedef struct {
             continue;
         }
 
+        if (tool == 7u) { // bucket: solid polygon fill
+            if (points.size() >= 3) {
+                std::vector<DTMetalVertex> geometry;
+                geometry.reserve(points.size() * 3);
+                addPolygonFill(geometry, points, opacity, strokeColor, hardness);
+                if (!geometry.empty()) {
+                    if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
+                        const size_t remaining = frameVertexBudget - frameVerticesUsed;
+                        if (remaining >= 3) {
+                            geometry.resize((remaining / 3) * 3);
+                        } else {
+                            break;
+                        }
+                    }
+                    id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
+                                                                    length:sizeof(DTMetalVertex) * geometry.size()
+                                                                   options:MTLResourceStorageModeShared];
+                    if (buffer) {
+                        DTMetalFragmentUniforms fragmentUniforms{};
+                        fragmentUniforms.color = strokeColor;
+                        fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
+                        [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
+                        [encoder setVertexBuffer:buffer offset:0 atIndex:0];
+                        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
+                        frameVerticesUsed += geometry.size();
+                    }
+                }
+            }
+            continue;
+        }
+
         points = smoothedPoints(boundedInputPoints(points));
         const vector_float4 color = eraser
             ? (vector_float4){0.965f, 0.945f, 0.900f, 1.0f} : strokeColor;
@@ -609,7 +705,7 @@ typedef struct {
             const float passOpacity = fringe ? fringeOpacity : opacity;
             std::vector<DTMetalVertex> geometry;
             geometry.reserve(points.size() * 28);
-            if ((tool == 6u || tool == 7u) && !fringe && points.size() >= 3) {
+            if (tool == 6u && !fringe && points.size() >= 3) {
                 addPolygonFill(geometry, points, passOpacity, color, hardness);
             }
             if (points.size() == 1) {
