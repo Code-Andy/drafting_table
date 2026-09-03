@@ -24,10 +24,7 @@ final class DraftingTableApp: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         DTLaunchBreadcrumb("didFinishLaunching")
-        NSSetUncaughtExceptionHandler { exception in
-            DTLaunchBreadcrumb("uncaughtException:\(exception.name.rawValue)")
-        }
-        true
+        return true
     }
 
     func application(_ application: UIApplication,
