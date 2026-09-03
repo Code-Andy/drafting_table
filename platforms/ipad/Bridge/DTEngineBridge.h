@@ -136,7 +136,7 @@ typedef NS_ENUM(uint8_t, DTTool) {
 - (NSUInteger)duplicateLayerAtIndex:(NSUInteger)index NS_SWIFT_NAME(duplicateLayer(at:));
 - (BOOL)moveLayerAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex NS_SWIFT_NAME(moveLayer(from:to:));
 
-- (NSUInteger)activeLayerStrokeCount;
+@property(nonatomic, readonly) NSUInteger activeLayerStrokeCount;
 - (BOOL)moveStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy NS_SWIFT_NAME(moveStrokes(at:dx:dy:));
 - (BOOL)deleteStrokesWithIndices:(NSArray<NSNumber *> *)indices NS_SWIFT_NAME(deleteStrokes(at:));
 - (BOOL)duplicateStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy NS_SWIFT_NAME(duplicateStrokes(at:dx:dy:));

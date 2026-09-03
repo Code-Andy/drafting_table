@@ -11,8 +11,8 @@ func DTLaunchBreadcrumb(_ stage: String) {
     let entry = "\(Date().timeIntervalSince1970) \(stage)\n"
     if FileManager.default.fileExists(atPath: url.path),
        let handle = try? FileHandle(forWritingTo: url) {
-        defer { try? handle.close() }
-        try? handle.seekToEnd()
+        defer { _ = try? handle.close() }
+        _ = try? handle.seekToEnd()
         try? handle.write(contentsOf: Data(entry.utf8))
     } else {
         try? entry.write(to: url, atomically: true, encoding: .utf8)

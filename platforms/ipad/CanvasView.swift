@@ -614,7 +614,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
     func duplicateSelection() {
         guard !selectedStrokeIndices.isEmpty else { return }
-        let currentCount = engineBridge.activeLayerStrokeCount
+        let currentCount = Int(engineBridge.activeLayerStrokeCount)
         let nsIndices = selectedStrokeIndices.map { NSNumber(value: $0) }
         if engineBridge.duplicateStrokes(at: nsIndices, dx: 16.0, dy: 16.0) {
             HapticFeedbackService.shared.success()
@@ -648,7 +648,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         hoverOverlay?.selectionRect = nil
         hoverOverlay?.lassoPoints.removeAll()
 
-        let strokes = engineBridge.renderableStrokes
+        let strokes = engineBridge.renderableStrokes()
         var matchedIndices: [Int] = []
         var unionBounds: CGRect?
 
