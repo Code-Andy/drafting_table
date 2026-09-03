@@ -89,6 +89,28 @@ enum DocumentExportService {
                 guard let first = points.first, let last = points.last else { continue }
                 context.setLineWidth(max(1, stroke.brushSize))
                 context.strokeEllipse(in: standardizedRect(first, last))
+            case .circle:
+                guard let first = points.first, let last = points.last else { continue }
+                let rect = standardizedRect(first, last)
+                let side = max(rect.width, rect.height)
+                let center = CGPoint(x: rect.midX, y: rect.midY)
+                let circleRect = CGRect(x: center.x - side * 0.5, y: center.y - side * 0.5, width: side, height: side)
+                context.setLineWidth(max(1, stroke.brushSize))
+                context.strokeEllipse(in: circleRect)
+            case .shade:
+                if points.count >= 3 {
+                    context.beginPath()
+                    context.move(to: CGPoint(x: CGFloat(points[0].x), y: CGFloat(points[0].y)))
+                    for i in 1..<points.count {
+                        context.addLine(to: CGPoint(x: CGFloat(points[i].x), y: CGFloat(points[i].y)))
+                    }
+                    context.closePath()
+                    let fillAlpha = min(max(stroke.brushOpacity * (0.35 + 0.65 * stroke.brushHardness), 0), 1)
+                    let fillColor = decodedColor(stroke.brushColorRGBA, opacity: fillAlpha)
+                    context.setFillColor(fillColor.cgColor)
+                    context.fillPath()
+                }
+                drawPressurePolyline(points, baseWidth: stroke.brushSize, context: context)
             default:
                 drawPressurePolyline(points, baseWidth: stroke.brushSize, context: context)
             }

@@ -157,16 +157,26 @@ int main() {
     CHECK(roundTrip.pageCount() == document.pageCount());
     CHECK(roundTrip.layerNames() == document.layerNames());
 
-    for (auto shape : {dt_ipad::DTTool::Line, dt_ipad::DTTool::Rectangle, dt_ipad::DTTool::Ellipse, dt_ipad::DTTool::Circle}) {
+    for (auto shape : {dt_ipad::DTTool::Line, dt_ipad::DTTool::Rectangle, dt_ipad::DTTool::Ellipse, dt_ipad::DTTool::Circle, dt_ipad::DTTool::Shade}) {
         document.setTool(shape); document.beginStroke(); document.appendSamples(std::span<const dt::PencilSample>(&sample, 1), {}); document.endStroke();
     }
     auto shapedArchive = document.archive(); dt_ipad::Engine shapedRoundTrip; CHECK(shapedRoundTrip.loadArchive(shapedArchive));
-    auto shaped = shapedRoundTrip.snapshot(); CHECK(shaped.size() >= 4);
-    CHECK(shaped[shaped.size()-4].tool == dt_ipad::DTTool::Line); CHECK(shaped[shaped.size()-3].tool == dt_ipad::DTTool::Rectangle); CHECK(shaped[shaped.size()-2].tool == dt_ipad::DTTool::Ellipse); CHECK(shaped.back().tool == dt_ipad::DTTool::Circle);
+    auto shaped = shapedRoundTrip.snapshot(); CHECK(shaped.size() >= 5);
+    CHECK(shaped[shaped.size()-5].tool == dt_ipad::DTTool::Line); CHECK(shaped[shaped.size()-4].tool == dt_ipad::DTTool::Rectangle); CHECK(shaped[shaped.size()-3].tool == dt_ipad::DTTool::Ellipse); CHECK(shaped[shaped.size()-2].tool == dt_ipad::DTTool::Circle); CHECK(shaped.back().tool == dt_ipad::DTTool::Shade);
 
     const auto originalPages = document.pageCount(); CHECK(document.duplicatePage(0) == 1); CHECK(document.pageCount() == originalPages + 1);
     CHECK(document.snapshotForPage(0).size() > 0); CHECK(document.movePage(1, 0)); CHECK(document.activePageIndex() == 0);
     CHECK(document.duplicateLayer(0) == 1); CHECK(document.layerNames().size() >= 2); CHECK(document.moveLayer(1, 0)); CHECK(document.activeLayerIndex() == 0);
+    const std::size_t targetIdx[] = {0};
+    const auto beforeMoveX = document.snapshot()[0].points[0].x;
+    CHECK(document.moveStrokes(targetIdx, 15.0f, -5.0f));
+    CHECK(document.snapshot()[0].points[0].x == beforeMoveX + 15.0f);
+    const auto activeBefore = document.activeLayerStrokeCount();
+    CHECK(document.duplicateStrokes(targetIdx, 2.0f, 2.0f));
+    CHECK(document.activeLayerStrokeCount() == activeBefore + 1);
+    const std::size_t lastIdx[] = {document.activeLayerStrokeCount() - 1};
+    CHECK(document.deleteStrokes(lastIdx));
+    CHECK(document.activeLayerStrokeCount() == activeBefore);
 
     const auto v1 = makeVersion1Archive(sample);
     dt_ipad::Engine migrated;

@@ -93,7 +93,34 @@ PencilSample toCoreSample(const DTPencilSample& input) {
     return static_cast<DTTool>(_engine->tool());
 }
 - (void)setTool:(DTTool)tool {
-    if (_engine) _engine->setTool(static_cast<drafting_table::ipad::DTTool>(tool));
+    if (!_engine) return;
+    if (tool <= DTToolShade) {
+        _engine->setTool(static_cast<drafting_table::ipad::DTTool>(tool));
+    }
+}
+- (NSUInteger)activeLayerStrokeCount {
+    return _engine ? _engine->activeLayerStrokeCount() : 0;
+}
+- (BOOL)moveStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy {
+    if (!_engine || indices.count == 0) return NO;
+    std::vector<std::size_t> vec;
+    vec.reserve(indices.count);
+    for (NSNumber *n in indices) vec.push_back(n.unsignedIntegerValue);
+    return _engine->moveStrokes(vec, (float)dx, (float)dy);
+}
+- (BOOL)deleteStrokesWithIndices:(NSArray<NSNumber *> *)indices {
+    if (!_engine || indices.count == 0) return NO;
+    std::vector<std::size_t> vec;
+    vec.reserve(indices.count);
+    for (NSNumber *n in indices) vec.push_back(n.unsignedIntegerValue);
+    return _engine->deleteStrokes(vec);
+}
+- (BOOL)duplicateStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy {
+    if (!_engine || indices.count == 0) return NO;
+    std::vector<std::size_t> vec;
+    vec.reserve(indices.count);
+    for (NSNumber *n in indices) vec.push_back(n.unsignedIntegerValue);
+    return _engine->duplicateStrokes(vec, (float)dx, (float)dy);
 }
 - (CGFloat)brushSize { return _engine ? _engine->brushSize() : 8.0; }
 - (void)setBrushSize:(CGFloat)size { if (_engine) _engine->setBrushSize((float)size); }

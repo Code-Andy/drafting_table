@@ -23,12 +23,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private static let angleSnapDefaultsKey = "draftingTable.angleSnapEnabled"
     private static let brushPreviewDefaultsKey = "draftingTable.brushPreviewEnabled"
     private static let predictionDefaultsKey = "draftingTable.predictionEnabled"
+    private static let docTitleDefaultsKey = "draftingTable.documentTitle"
     // v0.7.2: views are created in loadView (with per-step breadcrumbs), not
     // as eager property initializers. CI forensics showed the process dying
     // inside UIViewController init before any view code ran; staging creation
     // after the window/scene exists isolates which surface aborts and keeps
     // Metal init off the scene-connection path.
     private var canvas: CanvasView!
+    private var hoverOverlay: HoverOverlayView!
     private var diagnostics: DiagnosticsOverlay!
     private var emptyState: InsetLabel!
     private var pagesRail: PagesRailView!
@@ -44,13 +46,18 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var statusPreviewChip: UIButton!
     private var statusPredictChip: UIButton!
     private var toastLabel: InsetLabel!
+    private var selectionActionBar: UIView!
+    private var selectionCountLabel: UILabel!
     private let persistence = StrokePersistenceStore()
     private var brushButton: UIButton!
     private var eraserButton: UIButton!
+    private var shadeButton: UIButton!
     private var lineButton: UIButton!
     private var rectangleButton: UIButton!
     private var ellipseButton: UIButton!
     private var circleButton: UIButton!
+    private var selectButton: UIButton!
+    private var lassoButton: UIButton!
     private var colorSwatchButton: UIButton!
     private var undoButton: UIButton!
     private var redoButton: UIButton!
@@ -67,6 +74,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         DTLaunchBreadcrumb("vc:create:canvas:start")
         canvas = CanvasView(frame: .zero)
         DTLaunchBreadcrumb("vc:create:canvas:done")
+        hoverOverlay = HoverOverlayView(frame: .zero)
+        canvas.hoverOverlay = hoverOverlay
         diagnostics = DiagnosticsOverlay(frame: .zero)
         DTLaunchBreadcrumb("vc:create:diagnostics:done")
         emptyState = InsetLabel()
@@ -75,9 +84,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         toolRail = UIView()
         statusBar = UIView()
         toastLabel = InsetLabel()
+        configureSelectionActionBar()
         DTLaunchBreadcrumb("vc:create:rails:done")
         view = root
-        [canvas, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, toastLabel].forEach {
+        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, selectionActionBar, toastLabel].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview($0)
         }
@@ -88,6 +98,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         NSLayoutConstraint.activate([
             canvas.leadingAnchor.constraint(equalTo: root.leadingAnchor), canvas.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             canvas.topAnchor.constraint(equalTo: root.topAnchor), canvas.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            hoverOverlay.leadingAnchor.constraint(equalTo: canvas.leadingAnchor), hoverOverlay.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
+            hoverOverlay.topAnchor.constraint(equalTo: canvas.topAnchor), hoverOverlay.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
             // Left vertical tool rail mirrors the original app's rail; the
             // page sidebar sits beside it and the layer column stays right.
             toolRail.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 10), toolRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
@@ -98,6 +110,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             layersRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -10), layersRail.widthAnchor.constraint(equalToConstant: 156),
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor), statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: safe.bottomAnchor), statusBar.heightAnchor.constraint(equalToConstant: 32),
+            selectionActionBar.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            selectionActionBar.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -14),
             toastLabel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             toastLabel.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -14),
             toastLabel.leadingAnchor.constraint(greaterThanOrEqualTo: pagesRail.trailingAnchor, constant: 18),
@@ -110,9 +124,19 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         canvas.onDiagnostics = { [weak self] text in self?.diagnostics.update(text: text) }
         canvas.onDrawingBegan = { [weak self] in self?.emptyState.isHidden = true }
         canvas.onDocumentChanged = { [weak self] in self?.documentDidChange() }
+        canvas.onSqueeze = { [weak self] in self?.handlePencilSqueeze() }
+        canvas.onSelectionChanged = { [weak self] indices, _ in
+            guard let self else { return }
+            if indices.isEmpty {
+                self.selectionActionBar.isHidden = true
+            } else {
+                self.selectionCountLabel.text = "\(indices.count) selected"
+                self.selectionActionBar.isHidden = false
+            }
+        }
         canvas.onToolChanged = { [weak self] in
             guard let self else { return }
-            let tool = self.canvas.engineBridge.tool
+            let tool = self.canvas.currentTool
             self.selectedTool = tool
             UserDefaults.standard.set(Int(tool.rawValue), forKey: Self.selectedToolDefaultsKey)
             self.updateToolSelection()
@@ -221,11 +245,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         canvas.predictionEnabled = defaults.object(forKey: Self.predictionDefaultsKey) == nil
             ? true : defaults.bool(forKey: Self.predictionDefaultsKey)
         canvas.snapToGrid = defaults.bool(forKey: Self.snapDefaultsKey)
+        canvas.pixelGridVisible = defaults.bool(forKey: Self.pixelGridDefaultsKey)
+        canvas.angleSnapEnabled = defaults.bool(forKey: Self.angleSnapDefaultsKey)
+        canvas.brushPreviewEnabled = defaults.bool(forKey: Self.brushPreviewDefaultsKey)
         let storedTool = defaults.integer(forKey: Self.selectedToolDefaultsKey)
-        selectedTool = (0...Int(DTTool.circle.rawValue)).contains(storedTool)
+        selectedTool = (0...Int(DTTool.lasso.rawValue)).contains(storedTool)
             ? (DTTool(rawValue: UInt8(storedTool)) ?? .brush)
             : .brush
-        canvas.engineBridge.tool = selectedTool
+        canvas.currentTool = selectedTool
     }
 
     private func storedFloat(_ defaults: UserDefaults, key: String, fallback: Float) -> Float {
@@ -290,6 +317,47 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         colorSwatchButton.setTitleColor(ink, for: .normal)
     }
 
+    private func updateDocumentTitleLabel() {
+        let title = UserDefaults.standard.string(forKey: Self.docTitleDefaultsKey) ?? "DraftingTable"
+        statusDocLabel?.text = "doc · \(title)"
+        self.title = title
+    }
+
+    @objc private func promptRenameDocument() {
+        let currentTitle = UserDefaults.standard.string(forKey: Self.docTitleDefaultsKey) ?? "DraftingTable"
+        let alert = UIAlertController(title: "Document Title",
+                                      message: "Enter a title for this notebook document:",
+                                      preferredStyle: .alert)
+        alert.addTextField { tf in
+            tf.text = currentTitle
+            tf.placeholder = "Document Title"
+            tf.autocapitalizationType = .words
+            tf.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self, weak alert] _ in
+            guard let self, let name = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return }
+            UserDefaults.standard.set(name, forKey: Self.docTitleDefaultsKey)
+            self.updateDocumentTitleLabel()
+            HapticFeedbackService.shared.success()
+        })
+        present(alert, animated: true)
+    }
+
+    @objc private func confirmClearDocument() {
+        let alert = UIAlertController(title: "Clear Entire Document",
+                                      message: "Are you sure you want to clear all pages and strokes? This cannot be undone.",
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Clear All", style: .destructive) { [weak self] _ in
+            guard let self else { return }
+            self.canvas.engineBridge.clearCanvas()
+            self.documentDidChange(invalidateAllThumbnails: true)
+            HapticFeedbackService.shared.undoRedo()
+        })
+        present(alert, animated: true)
+    }
+
     private func commandMenuButton() -> UIBarButtonItem {
         let grid = UIAction(title: "Show Grid", image: UIImage(systemName: "grid"), state: canvas.gridVisible ? .on : .off) { [weak self] _ in
             guard let self else { return }
@@ -299,11 +367,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             self.updateStatusBar()
         }
         let settings = UIAction(title: "Settings", image: UIImage(systemName: "slider.horizontal.3")) { [weak self] _ in self?.showSettings() }
+        let renameDoc = UIAction(title: "Rename Document…", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.promptRenameDocument() }
+        let clearDoc = UIAction(title: "Clear Entire Document", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.confirmClearDocument() }
         let exportPage = UIAction(title: "Export Current Page (PNG)", image: UIImage(systemName: "photo")) { [weak self] _ in self?.exportCurrentPagePNG() }
         let exportPDF = UIAction(title: "Export All Pages (PDF)", image: UIImage(systemName: "doc.richtext")) { [weak self] _ in self?.exportAllPagesPDF() }
         let open = UIAction(title: "Open .drafttable…", image: UIImage(systemName: "folder")) { [weak self] _ in self?.openDocument() }
         let saveCopy = UIAction(title: "Save Copy…", image: UIImage(systemName: "square.and.arrow.down")) { [weak self] _ in self?.saveDocumentCopy() }
-        let documents = UIMenu(title: "Documents", options: .displayInline, children: [open, saveCopy])
+        let documents = UIMenu(title: "Documents", options: .displayInline, children: [renameDoc, open, saveCopy, clearDoc])
         let menu = UIMenu(title: "Document", children: [settings, grid, documents, UIMenu(title: "Export", options: .displayInline, children: [exportPage, exportPDF])])
         return UIBarButtonItem(image: UIImage(systemName: "ellipsis.circle"), menu: menu)
     }
@@ -472,13 +542,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         brushButton = railToolButton(glyph: "✎", label: "Brush", action: #selector(selectBrush))
         eraserButton = railToolButton(glyph: "⌫", label: "Eraser", action: #selector(selectEraser))
         let bucketButton = railToolButton(glyph: "🪣", label: "Bucket", action: #selector(announceBucket))
-        let shadeButton = railToolButton(glyph: "◧", label: "Shade", action: #selector(announceShade))
+        shadeButton = railToolButton(glyph: "◧", label: "Shade", action: #selector(selectShade))
         lineButton = railToolButton(glyph: "╱", label: "Line", action: #selector(selectLine))
         rectangleButton = railToolButton(glyph: "□", label: "Rect", action: #selector(selectRectangle))
         circleButton = railToolButton(glyph: "◦", label: "Circle", action: #selector(selectCircle))
         ellipseButton = railToolButton(glyph: "○", label: "Ellipse", action: #selector(selectEllipse))
-        let selectButton = railToolButton(glyph: "⬚", label: "Select", action: #selector(announceSelect))
-        let lassoButton = railToolButton(glyph: "⚪", label: "Lasso", action: #selector(announceLasso))
+        selectButton = railToolButton(glyph: "⬚", label: "Select", action: #selector(selectMarquee))
+        lassoButton = railToolButton(glyph: "⚪", label: "Lasso", action: #selector(selectLasso))
         undoButton = railToolButton(glyph: "↶", label: "Undo", action: #selector(undoCanvas))
         redoButton = railToolButton(glyph: "↷", label: "Redo", action: #selector(redoCanvas))
         clearButton = railToolButton(glyph: "🗑", label: "Clear", action: #selector(clearCanvas))
@@ -552,6 +622,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             stack.bottomAnchor.constraint(equalTo: statusBar.bottomAnchor)
         ])
         statusDocLabel = statusLabel(text: "doc · DraftingTable")
+        statusDocLabel.isUserInteractionEnabled = true
+        let docTap = UITapGestureRecognizer(target: self, action: #selector(promptRenameDocument))
+        statusDocLabel.addGestureRecognizer(docTap)
         statusToolLabel = statusLabel(text: "◇ brush")
         statusGridChip = statusChip(action: #selector(toggleGridChip))
         statusPixelChip = statusChip(action: #selector(togglePixelChip))
@@ -593,17 +666,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func updateStatusBar() {
         guard isViewLoaded, let statusToolLabel else { return }
-        let defaults = UserDefaults.standard
+        updateDocumentTitleLabel()
         statusToolLabel.text = "◇ \(canvas.activeToolDisplayName)"
         paintChip(statusGridChip, title: canvas.gridVisible ? "grid: on" : "grid: off", on: canvas.gridVisible)
-        let pixel = defaults.bool(forKey: Self.pixelGridDefaultsKey)
-        paintChip(statusPixelChip, title: pixel ? "px: on" : "px: off", on: pixel)
-        let snap = defaults.bool(forKey: Self.snapDefaultsKey)
-        paintChip(statusSnapChip, title: snap ? "snap: on" : "snap: off", on: snap)
-        let angle = defaults.bool(forKey: Self.angleSnapDefaultsKey)
-        paintChip(statusAngleChip, title: angle ? "angle: on" : "angle: off", on: angle)
-        let preview = defaults.bool(forKey: Self.brushPreviewDefaultsKey)
-        paintChip(statusPreviewChip, title: preview ? "preview: on" : "preview: off", on: preview)
+        paintChip(statusPixelChip, title: canvas.pixelGridVisible ? "px: on" : "px: off", on: canvas.pixelGridVisible)
+        paintChip(statusSnapChip, title: canvas.snapToGrid ? "snap: on" : "snap: off", on: canvas.snapToGrid)
+        paintChip(statusAngleChip, title: canvas.angleSnapEnabled ? "angle: on" : "angle: off", on: canvas.angleSnapEnabled)
+        paintChip(statusPreviewChip, title: canvas.brushPreviewEnabled ? "preview: on" : "preview: off", on: canvas.brushPreviewEnabled)
         paintChip(statusPredictChip, title: canvas.predictionEnabled ? "predict: on" : "predict: off", on: canvas.predictionEnabled)
     }
 
@@ -622,22 +691,25 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     @objc private func togglePixelChip() {
-        let next = !UserDefaults.standard.bool(forKey: Self.pixelGridDefaultsKey)
+        let next = !canvas.pixelGridVisible
         UserDefaults.standard.set(next, forKey: Self.pixelGridDefaultsKey)
-        if next { showToast("Pixel grid renders with the tile compositor (M11)") }
+        canvas.pixelGridVisible = next
         updateStatusBar()
+        HapticFeedbackService.shared.snapLock()
     }
 
     @objc private func toggleAngleChip() {
-        let next = !UserDefaults.standard.bool(forKey: Self.angleSnapDefaultsKey)
+        let next = !canvas.angleSnapEnabled
         UserDefaults.standard.set(next, forKey: Self.angleSnapDefaultsKey)
-        if next { showToast("Angle snap arms with vector snapping (M5)") }
+        canvas.angleSnapEnabled = next
         updateStatusBar()
+        HapticFeedbackService.shared.snapLock()
     }
 
     @objc private func togglePreviewChip() {
-        let next = !UserDefaults.standard.bool(forKey: Self.brushPreviewDefaultsKey)
+        let next = !canvas.brushPreviewEnabled
         UserDefaults.standard.set(next, forKey: Self.brushPreviewDefaultsKey)
+        canvas.brushPreviewEnabled = next
         updateStatusBar()
     }
 
@@ -645,6 +717,94 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         canvas.predictionEnabled.toggle()
         UserDefaults.standard.set(canvas.predictionEnabled, forKey: Self.predictionDefaultsKey)
         updateStatusBar()
+    }
+
+    private func configureSelectionActionBar() {
+        selectionActionBar = UIView()
+        selectionActionBar.translatesAutoresizingMaskIntoConstraints = false
+        selectionActionBar.backgroundColor = UIColor(red: 0.99, green: 0.98, blue: 0.95, alpha: 0.96)
+        selectionActionBar.layer.cornerRadius = 14
+        selectionActionBar.layer.borderWidth = 1.5
+        selectionActionBar.layer.borderColor = UIColor.systemBlue.withAlphaComponent(0.4).cgColor
+        selectionActionBar.layer.shadowColor = UIColor.black.cgColor
+        selectionActionBar.layer.shadowOpacity = 0.12
+        selectionActionBar.layer.shadowRadius = 8
+        selectionActionBar.layer.shadowOffset = CGSize(width: 0, height: 3)
+        selectionActionBar.isHidden = true
+
+        let stack = UIStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .horizontal
+        stack.spacing = 10
+        stack.alignment = .center
+
+        selectionCountLabel = UILabel()
+        selectionCountLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        selectionCountLabel.textColor = UIColor(red: 0.20, green: 0.18, blue: 0.15, alpha: 1)
+        selectionCountLabel.text = "0 selected"
+
+        let dupBtn = UIButton(type: .system)
+        dupBtn.setTitle("Duplicate", for: .normal)
+        dupBtn.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+        dupBtn.addTarget(self, action: #selector(duplicateSelectionAction), for: .touchUpInside)
+
+        let delBtn = UIButton(type: .system)
+        delBtn.setTitle("Delete", for: .normal)
+        delBtn.setTitleColor(.systemRed, for: .normal)
+        delBtn.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+        delBtn.addTarget(self, action: #selector(deleteSelectionAction), for: .touchUpInside)
+
+        let clearBtn = UIButton(type: .system)
+        clearBtn.setTitle("Done", for: .normal)
+        clearBtn.titleLabel?.font = .systemFont(ofSize: 12, weight: .semibold)
+        clearBtn.addTarget(self, action: #selector(clearSelectionAction), for: .touchUpInside)
+
+        stack.addArrangedSubview(selectionCountLabel)
+        stack.addArrangedSubview(dupBtn)
+        stack.addArrangedSubview(delBtn)
+        stack.addArrangedSubview(clearBtn)
+        selectionActionBar.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: selectionActionBar.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: selectionActionBar.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: selectionActionBar.topAnchor, constant: 6),
+            stack.bottomAnchor.constraint(equalTo: selectionActionBar.bottomAnchor, constant: -6)
+        ])
+    }
+
+    @objc private func duplicateSelectionAction() {
+        canvas.duplicateSelection()
+    }
+
+    @objc private func deleteSelectionAction() {
+        canvas.deleteSelection()
+    }
+
+    @objc private func clearSelectionAction() {
+        canvas.clearSelection()
+        selectionActionBar.isHidden = true
+    }
+
+    private func handlePencilSqueeze() {
+        let alert = UIAlertController(title: "Apple Pencil Pro", message: "Quick Tool Switcher", preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(title: "Brush (✎)", style: .default) { [weak self] _ in self?.selectTool(.brush) })
+        alert.addAction(UIAlertAction(title: "Eraser (⌫)", style: .default) { [weak self] _ in self?.selectTool(.eraser) })
+        alert.addAction(UIAlertAction(title: "Shade Fill (◧)", style: .default) { [weak self] _ in self?.selectTool(.shade) })
+        alert.addAction(UIAlertAction(title: "Line (╱)", style: .default) { [weak self] _ in self?.selectTool(.line) })
+        alert.addAction(UIAlertAction(title: "Rectangle (□)", style: .default) { [weak self] _ in self?.selectTool(.rectangle) })
+        alert.addAction(UIAlertAction(title: "Circle (◦)", style: .default) { [weak self] _ in self?.selectTool(.circle) })
+        alert.addAction(UIAlertAction(title: "Marquee Select (⬚)", style: .default) { [weak self] _ in self?.selectTool(.select) })
+        alert.addAction(UIAlertAction(title: "Lasso Select (⚪)", style: .default) { [weak self] _ in self?.selectTool(.lasso) })
+        alert.addAction(UIAlertAction(title: "Color Swatch", style: .default) { [weak self] _ in self?.openColorPickerDirect() })
+        alert.addAction(UIAlertAction(title: "Undo (↶)", style: .default) { [weak self] _ in self?.undoCanvas() })
+        alert.addAction(UIAlertAction(title: "Dismiss", style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            let hoverPt = hoverOverlay?.hoverPoint ?? CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+            popover.sourceRect = CGRect(origin: hoverPt, size: CGSize(width: 1, height: 1))
+        }
+        present(alert, animated: true)
     }
 
     private func configureToast() {
@@ -684,8 +844,19 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func updateToolSelection() {
         let selectedColor = UIColor.systemBlue.withAlphaComponent(0.16); let normalColor = UIColor.white.withAlphaComponent(0.82)
-        let entries: [(UIButton, DTTool)] = [(brushButton, .brush), (eraserButton, .eraser), (lineButton, .line), (rectangleButton, .rectangle), (ellipseButton, .ellipse), (circleButton, .circle)]
+        let entries: [(UIButton?, DTTool)] = [
+            (brushButton, .brush),
+            (eraserButton, .eraser),
+            (shadeButton, .shade),
+            (lineButton, .line),
+            (rectangleButton, .rectangle),
+            (ellipseButton, .ellipse),
+            (circleButton, .circle),
+            (selectButton, .select),
+            (lassoButton, .lasso)
+        ]
         entries.forEach { button, tool in
+            guard let button else { return }
             button.isSelected = selectedTool == tool
             button.backgroundColor = button.isSelected ? selectedColor : normalColor
             button.layer.borderColor = (button.isSelected ? UIColor.systemBlue : UIColor.black.withAlphaComponent(0.08)).cgColor
@@ -702,17 +873,19 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     @objc private func selectEraser() { selectTool(.eraser) }
     @objc private func selectBrush() { selectTool(.brush) }
+    @objc private func selectShade() { selectTool(.shade) }
     @objc private func selectLine() { selectTool(.line) }
     @objc private func selectRectangle() { selectTool(.rectangle) }
     @objc private func selectEllipse() { selectTool(.ellipse) }
     @objc private func selectCircle() { selectTool(.circle) }
-    @objc private func announceBucket() { showToast("Bucket fill arrives with the tile renderer (M2)") }
-    @objc private func announceShade() { showToast("Shade fill arrives with the tile renderer (M2)") }
-    @objc private func announceSelect() { showToast("Selection + transform handles land in M6") }
-    @objc private func announceLasso() { showToast("Lasso selection lands in M6") }
+    @objc private func selectMarquee() { selectTool(.select) }
+    @objc private func selectLasso() { selectTool(.lasso) }
+    @objc private func announceBucket() { showToast("Bucket fill is designed for bitmap raster layers (vector paths use Shade)") }
     private func selectTool(_ tool: DTTool) {
-        selectedTool = tool; canvas.engineBridge.tool = tool
+        selectedTool = tool
+        canvas.currentTool = tool
         UserDefaults.standard.set(Int(tool.rawValue), forKey: Self.selectedToolDefaultsKey)
+        HapticFeedbackService.shared.toolSwitched()
         updateToolSelection()
     }
     @objc private func undoCanvas() { guard canvas.engineBridge.canUndo else { return }; _ = canvas.engineBridge.undoLastStroke(); documentDidChange() }

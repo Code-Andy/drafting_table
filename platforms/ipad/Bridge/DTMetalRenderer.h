@@ -23,6 +23,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Enables the document-space square grid. Spacing is expressed in document
 /// points and is clamped by the renderer to a practical positive range.
 - (void)updateGridVisible:(BOOL)visible spacing:(CGFloat)spacing;
+- (void)updatePixelGridVisible:(BOOL)visible;
 
 @property(nonatomic, readonly) NSUInteger frameCount;
 

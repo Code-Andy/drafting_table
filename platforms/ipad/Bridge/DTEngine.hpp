@@ -18,7 +18,7 @@ namespace drafting_table::ipad {
 // no retained-stroke representation yet and intentionally have no values:
 // unknown raw values fail archive decode, so placeholders must never be
 // persisted.
-enum class DTTool : std::uint8_t { Brush = 0, Eraser = 1, Line = 2, Rectangle = 3, Ellipse = 4, Circle = 5 };
+enum class DTTool : std::uint8_t { Brush = 0, Eraser = 1, Line = 2, Rectangle = 3, Ellipse = 4, Circle = 5, Shade = 6 };
 constexpr std::uint32_t kDefaultBrushColorRGBA = 0x2B2926FFu;
 constexpr float kDefaultBrushHardness = 0.8f;
 struct Stroke {
@@ -36,6 +36,7 @@ public:
  Engine();
  DTTool tool() const; void setTool(DTTool); float brushSize() const; void setBrushSize(float); float brushOpacity() const; void setBrushOpacity(float); std::uint32_t brushColorRGBA() const; void setBrushColorRGBA(std::uint32_t); float brushHardness() const; void setBrushHardness(float);
  void beginStroke(); void appendSamples(std::span<const PencilSample> real,std::span<const PencilSample> predicted={}); bool updateEstimatedSample(std::uint64_t,const PencilSample&); void endStroke(); void cancelStroke(); void clear(); bool undoLastStroke(); bool redoLastStroke(); bool canUndo() const; bool canRedo() const;
+ bool moveStrokes(std::span<const std::size_t> indices, float dx, float dy); bool deleteStrokes(std::span<const std::size_t> indices); bool duplicateStrokes(std::span<const std::size_t> indices, float dx=0.0f, float dy=0.0f); std::size_t activeLayerStrokeCount() const;
  std::size_t pageCount() const; std::size_t activePageIndex() const; std::size_t activeLayerIndex() const; std::vector<std::string> pageNames() const; std::vector<std::string> layerNames() const;
  bool addPage(const std::string& name={}); bool selectPage(std::size_t); bool deletePage(std::size_t); bool renamePage(std::size_t,const std::string&);
  std::size_t duplicatePage(std::size_t); bool movePage(std::size_t from,std::size_t to);

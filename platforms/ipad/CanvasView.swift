@@ -26,10 +26,40 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     /// preference without polling the bridge.
     var onToolChanged: (() -> Void)?
 
+    /// Sibling overlay view for rendering hover previews, snapping, and selection bounds
+    /// without touching CAMetalLayer.
+    weak var hoverOverlay: HoverOverlayView?
+
+    /// Called on Apple Pencil Pro Squeeze gesture.
+    var onSqueeze: (() -> Void)?
+
+    /// Called when selection changes: (selectedStrokeIndices, boundingBoxInDocSpace).
+    var onSelectionChanged: (([Int], CGRect?) -> Void)?
+
+    /// Angle snapping (15-degree increments) for shapes and lines.
+    var angleSnapEnabled: Bool = false
+
+    /// Pixel grid toggle for zoomed-in editing.
+    var pixelGridVisible: Bool = false {
+        didSet {
+            guard oldValue != pixelGridVisible else { return }
+            updateGridRenderer()
+            setNeedsDisplay()
+        }
+    }
+
+    /// Brush preview cursor toggle.
+    var brushPreviewEnabled: Bool = true {
+        didSet {
+            if !brushPreviewEnabled {
+                hoverOverlay?.hideHover()
+            }
+        }
+    }
+
     /// Whether the renderer should draw a drafting grid. This state is kept
     /// here so callers can choose whether/how to persist it in their own
-    /// settings model. The renderer call is dynamic for compatibility with
-    /// older renderer binaries that simply ignore the optional grid feature.
+    /// settings model.
     var gridVisible: Bool = false {
         didSet {
             guard oldValue != gridVisible else { return }
@@ -57,6 +87,33 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     var snapToGrid: Bool = false
     var gridSpacing: CGFloat = 32
 
+    private var uiTool: DTTool = .brush
+    var currentTool: DTTool {
+        get { uiTool }
+        set {
+            uiTool = newValue
+            if newValue.rawValue <= DTTool.shade.rawValue {
+                engineBridge.tool = newValue
+            }
+            if newValue != .select && newValue != .lasso {
+                clearSelection()
+            }
+            HapticFeedbackService.shared.toolSwitched()
+            onToolChanged?()
+            setNeedsDisplay()
+        }
+    }
+
+    // Selection & Transform tracking
+    var selectedStrokeIndices: [Int] = []
+    var selectedBoundingBox: CGRect?
+    private var isSelecting = false
+    private var isMovingSelection = false
+    private var selectionDragStartDocPoint: CGPoint = .zero
+    private var selectionStartViewPoint: CGPoint = .zero
+    private var shapeStartDocPoint: CGPoint?
+    private var lastSnappedAngleIndex: Int = -1
+
     /// Document-to-view viewport transform. Translation is in view points;
     /// scale and rotation are applied around the document origin.
     private(set) var canvasScale: CGFloat = 1.0
@@ -75,7 +132,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     private var squeezeToggleConsumed = false
     private var hoverActive = false
     private var hoverPoint: CGPoint = .zero
-    private let hoverPreviewLayer = CAShapeLayer()
 
     private lazy var hoverGesture: UIHoverGestureRecognizer = {
         let gesture = UIHoverGestureRecognizer(target: self, action: #selector(handlePencilHover(_:)))
@@ -144,10 +200,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         DTLaunchBreadcrumb("canvas:rendererCreated")
         delegate = renderer
         addInteraction(UIPencilInteraction(delegate: self))
-        // Hover is temporarily not attached in v0.7.1. Adding a CAShapeLayer
-        // directly under MTKView's CAMetalLayer is part of the v0.7 launch
-        // crash surface; it will return as a sibling overlay after device
-        // validation rather than mutating the Metal layer tree.
+        addGestureRecognizer(hoverGesture)
         addGestureRecognizer(panGesture)
         addGestureRecognizer(pinchGesture)
         addGestureRecognizer(rotationGesture)
@@ -172,19 +225,20 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     deinit { displayLink?.invalidate() }
 
     private func updateGridRenderer() {
-        // Renderer and Swift shell ship as one app binary, so call the typed
-        // bridge directly. Objective-C perform(_:with:with:) cannot safely
-        // marshal scalar BOOL/CGFloat parameters.
         renderer?.updateGridVisible(gridVisible, spacing: 32)
+        renderer?.updatePixelGridVisible(pixelGridVisible)
     }
 
     private var activeToolName: String {
-        switch engineBridge.tool {
+        switch currentTool {
         case .eraser: return "eraser"
         case .line: return "line"
         case .rectangle: return "rectangle"
         case .ellipse: return "ellipse"
         case .circle: return "circle"
+        case .shade: return "shade"
+        case .select: return "select"
+        case .lasso: return "lasso"
         default: return "brush"
         }
     }
@@ -192,55 +246,70 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     /// Status-bar display name for the active tool.
     var activeToolDisplayName: String { activeToolName }
 
-    private func togglePencilTool(source: String) {
-        // The bridge currently exposes Brush/Eraser. If shape tools are added
-        // later, any non-Brush/Eraser value intentionally falls back to Brush
-        // on the first Pencil toggle.
-        switch engineBridge.tool {
-        case .brush: engineBridge.tool = .eraser
-        case .eraser: engineBridge.tool = .brush
-        default: engineBridge.tool = .brush
+    func togglePencilTool(source: String) {
+        switch currentTool {
+        case .brush: currentTool = .eraser
+        case .eraser: currentTool = .brush
+        default: currentTool = .brush
         }
         lastPencilAction = "\(source) → \(activeToolName)"
+        HapticFeedbackService.shared.toolSwitched()
         onToolChanged?()
         setNeedsDisplay()
     }
 
-    private func updateHoverPreview(at point: CGPoint) {
-        guard bounds.contains(point), window != nil else {
-            hoverActive = false
-            hoverPreviewLayer.isHidden = true
-            return
-        }
-        hoverActive = true
-        hoverPoint = point
-        // brushSize is a document-space diameter; scale it into view points.
-        // Keep the preview legible at extreme zoom levels without allowing a
-        // huge circle to cover the whole canvas.
-        let diameter = min(max(engineBridge.brushSize * canvasScale, 3), 160)
-        hoverPreviewLayer.path = UIBezierPath(ovalIn: CGRect(x: point.x - diameter * 0.5,
-                                                              y: point.y - diameter * 0.5,
-                                                              width: diameter,
-                                                              height: diameter)).cgPath
-        hoverPreviewLayer.strokeColor = engineBridge.tool == .eraser
-            ? UIColor.systemRed.withAlphaComponent(0.75).cgColor
-            : UIColor.black.withAlphaComponent(0.65).cgColor
-        hoverPreviewLayer.lineDashPattern = engineBridge.tool == .eraser
-            ? [NSNumber(value: 4), NSNumber(value: 3)]
-            : nil
-        hoverPreviewLayer.isHidden = strokeEngaged
-    }
-
-    private func hideHoverPreview() {
+    func hideHoverPreview() {
         hoverActive = false
-        hoverPreviewLayer.isHidden = true
+        hoverOverlay?.hideHover()
     }
 
     @objc private func handlePencilHover(_ gesture: UIHoverGestureRecognizer) {
+        guard brushPreviewEnabled else {
+            hideHoverPreview()
+            return
+        }
         switch gesture.state {
         case .began, .changed:
-            guard !strokeEngaged else { return }
-            updateHoverPreview(at: gesture.location(in: self))
+            guard !strokeEngaged else {
+                hideHoverPreview()
+                return
+            }
+            let location = gesture.location(in: self)
+            guard bounds.contains(location) else {
+                hideHoverPreview()
+                return
+            }
+            hoverActive = true
+            hoverPoint = location
+            let diameter = min(max(engineBridge.brushSize * canvasScale, 3), 240)
+            let color = UIColor(red: CGFloat((engineBridge.brushColorRGBA >> 24) & 0xff) / 255.0,
+                                green: CGFloat((engineBridge.brushColorRGBA >> 16) & 0xff) / 255.0,
+                                blue: CGFloat((engineBridge.brushColorRGBA >> 8) & 0xff) / 255.0,
+                                alpha: CGFloat(engineBridge.brushColorRGBA & 0xff) / 255.0)
+            hoverOverlay?.updateHover(at: location,
+                                      diameter: diameter,
+                                      color: color,
+                                      tool: currentTool,
+                                      altitude: gesture.altitudeAngle,
+                                      azimuth: gesture.azimuthAngle(in: self),
+                                      roll: gesture.rollAngle)
+            if snapToGrid, gridVisible, gridSpacing >= 1 {
+                let docLoc = documentPoint(for: location)
+                let snappedDoc = CGPoint(x: round(docLoc.x / gridSpacing) * gridSpacing,
+                                         y: round(docLoc.y / gridSpacing) * gridSpacing)
+                let snappedView = viewPoint(for: snappedDoc)
+                let dist = hypot(snappedView.x - location.x, snappedView.y - location.y)
+                if dist < 24.0 {
+                    if hoverOverlay?.snappedPoint == nil {
+                        HapticFeedbackService.shared.snapLock()
+                    }
+                    hoverOverlay?.snappedPoint = snappedView
+                } else {
+                    hoverOverlay?.snappedPoint = nil
+                }
+            } else {
+                hoverOverlay?.snappedPoint = nil
+            }
         case .ended, .cancelled, .failed:
             hideHoverPreview()
         default:
@@ -266,18 +335,35 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                             predicted: Bool,
                             coalesced: Bool = false) -> DTPencilSample {
         var location = documentPoint(for: touch.preciseLocation(in: self))
-        // Snap shape endpoints to grid intersections. Brush/eraser input is
-        // never snapped; the engine only reads first/last samples for
-        // shapes, so intermediate snapped samples are harmless.
-        if snapToGrid, gridVisible, gridSpacing >= 1 {
-            switch engineBridge.tool {
-            case .line, .rectangle, .ellipse, .circle:
+
+        // 15-degree angle snapping for shapes
+        switch currentTool {
+        case .line, .rectangle, .ellipse, .circle:
+            if angleSnapEnabled, let start = shapeStartDocPoint {
+                let dx = location.x - start.x
+                let dy = location.y - start.y
+                let dist = hypot(dx, dy)
+                if dist > 4.0 {
+                    let angle = atan2(dy, dx)
+                    let step = CGFloat.pi / 12.0 // 15 degrees
+                    let angleIndex = Int(round(angle / step))
+                    if angleIndex != lastSnappedAngleIndex {
+                        lastSnappedAngleIndex = angleIndex
+                        HapticFeedbackService.shared.snapLock()
+                    }
+                    let snappedAngle = CGFloat(angleIndex) * step
+                    location.x = start.x + dist * cos(snappedAngle)
+                    location.y = start.y + dist * sin(snappedAngle)
+                }
+            }
+            if snapToGrid, gridVisible, gridSpacing >= 1 {
                 location.x = round(location.x / gridSpacing) * gridSpacing
                 location.y = round(location.y / gridSpacing) * gridSpacing
-            default:
-                break
             }
+        default:
+            break
         }
+
         let force = touch.maximumPossibleForce > 0
             ? touch.force / touch.maximumPossibleForce
             : 1.0
@@ -340,9 +426,36 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch == nil, let touch = touches.first(where: accepts) else { return }
         activeTouch = touch
+
+        // Selection & Transform mode
+        if currentTool == .select || currentTool == .lasso {
+            let loc = touch.preciseLocation(in: self)
+            let docLoc = documentPoint(for: loc)
+            if let box = selectedBoundingBox, box.contains(docLoc) {
+                isMovingSelection = true
+                selectionDragStartDocPoint = docLoc
+            } else {
+                isMovingSelection = false
+                clearSelection()
+                isSelecting = true
+                selectionStartViewPoint = loc
+                if currentTool == .select {
+                    hoverOverlay?.isSelecting = true
+                    hoverOverlay?.selectionRect = CGRect(origin: loc, size: .zero)
+                } else {
+                    hoverOverlay?.isSelecting = true
+                    hoverOverlay?.lassoPoints = [loc]
+                }
+            }
+            return
+        }
+
+        if currentTool == .line || currentTool == .rectangle || currentTool == .ellipse || currentTool == .circle {
+            shapeStartDocPoint = documentPoint(for: touch.preciseLocation(in: self))
+            lastSnappedAngleIndex = -1
+        }
+
         if touch.type == .pencil && normalizedForce(of: touch) < activationPressure {
-            // Keep tracking this contact, but do not create an engine stroke
-            // until the user has intentionally pressed the Pencil down.
             return
         }
         strokeEngaged = true
@@ -357,12 +470,42 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let activeTouch, touches.contains(activeTouch) else { return }
+
+        // Selection & Transform mode
+        if currentTool == .select || currentTool == .lasso {
+            let loc = activeTouch.preciseLocation(in: self)
+            let docLoc = documentPoint(for: loc)
+            if isMovingSelection {
+                let dx = docLoc.x - selectionDragStartDocPoint.x
+                let dy = docLoc.y - selectionDragStartDocPoint.y
+                if abs(dx) >= 0.5 || abs(dy) >= 0.5 {
+                    let nsIndices = selectedStrokeIndices.map { NSNumber(value: $0) }
+                    _ = engineBridge.moveStrokes(at: nsIndices, dx: dx, dy: dy)
+                    selectionDragStartDocPoint = docLoc
+                    if let oldBox = selectedBoundingBox {
+                        selectedBoundingBox = oldBox.offsetBy(dx: dx, dy: dy)
+                        updateSelectionBoundsOverlay()
+                    }
+                    setNeedsDisplay()
+                }
+            } else if isSelecting {
+                if currentTool == .select {
+                    let rect = CGRect(x: min(selectionStartViewPoint.x, loc.x),
+                                      y: min(selectionStartViewPoint.y, loc.y),
+                                      width: abs(loc.x - selectionStartViewPoint.x),
+                                      height: abs(loc.y - selectionStartViewPoint.y))
+                    hoverOverlay?.selectionRect = rect
+                } else {
+                    hoverOverlay?.lassoPoints.append(loc)
+                }
+            }
+            return
+        }
+
         if activeTouch.type == .pencil {
             let latest = event?.coalescedTouches(for: activeTouch)?.last ?? activeTouch
             if strokeEngaged {
                 if normalizedForce(of: latest) < releasePressure {
-                    // Flush real samples before ending; predicted points are
-                    // intentionally discarded at lift-off.
                     appendBatch(for: activeTouch,
                                 event: event,
                                 includePredicted: false,
@@ -392,6 +535,20 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let activeTouch, touches.contains(activeTouch) else { return }
+
+        // Selection & Transform mode
+        if currentTool == .select || currentTool == .lasso {
+            if isMovingSelection {
+                isMovingSelection = false
+                onDocumentChanged?()
+            } else if isSelecting {
+                isSelecting = false
+                finishSelection()
+            }
+            self.activeTouch = nil
+            return
+        }
+
         if strokeEngaged {
             if activeTouch.type != .pencil || normalizedForce(of: activeTouch) >= releasePressure {
                 var finalSample = makeSample(activeTouch, predicted: false)
@@ -403,6 +560,8 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
             onDocumentChanged?()
         }
         strokeEngaged = false
+        shapeStartDocPoint = nil
+        lastSnappedAngleIndex = -1
         self.activeTouch = nil
         hideHoverPreview()
         setNeedsDisplay()
@@ -410,6 +569,15 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard activeTouch != nil else { return }
+        shapeStartDocPoint = nil
+        lastSnappedAngleIndex = -1
+        if currentTool == .select || currentTool == .lasso {
+            isMovingSelection = false
+            isSelecting = false
+            hoverOverlay?.clearSelectionOverlay()
+            self.activeTouch = nil
+            return
+        }
         if strokeEngaged {
             engineBridge.cancelStroke()
             onDocumentChanged?()
@@ -418,6 +586,129 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         activeTouch = nil
         hideHoverPreview()
         setNeedsDisplay()
+    }
+
+    // MARK: - Selection Operations
+
+    func clearSelection() {
+        selectedStrokeIndices.removeAll()
+        selectedBoundingBox = nil
+        hoverOverlay?.clearSelectionOverlay()
+    }
+
+    func updateSelectionBoundsOverlay() {
+        guard let box = selectedBoundingBox else {
+            hoverOverlay?.selectedBounds = nil
+            hoverOverlay?.selectedStrokeCount = 0
+            return
+        }
+        let p0 = viewPoint(for: CGPoint(x: box.minX, y: box.minY))
+        let p1 = viewPoint(for: CGPoint(x: box.maxX, y: box.maxY))
+        let viewRect = CGRect(x: min(p0.x, p1.x),
+                              y: min(p0.y, p1.y),
+                              width: max(16.0, abs(p1.x - p0.x)),
+                              height: max(16.0, abs(p1.y - p0.y)))
+        hoverOverlay?.selectedBounds = viewRect
+        hoverOverlay?.selectedStrokeCount = selectedStrokeIndices.count
+    }
+
+    func duplicateSelection() {
+        guard !selectedStrokeIndices.isEmpty else { return }
+        let currentCount = engineBridge.activeLayerStrokeCount
+        let nsIndices = selectedStrokeIndices.map { NSNumber(value: $0) }
+        if engineBridge.duplicateStrokes(at: nsIndices, dx: 16.0, dy: 16.0) {
+            HapticFeedbackService.shared.success()
+            let newIndices = Array(currentCount..<(currentCount + selectedStrokeIndices.count))
+            selectedStrokeIndices = newIndices
+            if let oldBox = selectedBoundingBox {
+                selectedBoundingBox = oldBox.offsetBy(dx: 16.0, dy: 16.0)
+                updateSelectionBoundsOverlay()
+            }
+            setNeedsDisplay()
+            onDocumentChanged?()
+        }
+    }
+
+    func deleteSelection() {
+        guard !selectedStrokeIndices.isEmpty else { return }
+        let nsIndices = selectedStrokeIndices.map { NSNumber(value: $0) }
+        if engineBridge.deleteStrokes(at: nsIndices) {
+            HapticFeedbackService.shared.undoRedo()
+            clearSelection()
+            setNeedsDisplay()
+            onDocumentChanged?()
+            onSelectionChanged?([], nil)
+        }
+    }
+
+    private func finishSelection() {
+        hoverOverlay?.isSelecting = false
+        let selectionRect = hoverOverlay?.selectionRect
+        let lassoPts = hoverOverlay?.lassoPoints ?? []
+        hoverOverlay?.selectionRect = nil
+        hoverOverlay?.lassoPoints.removeAll()
+
+        let strokes = engineBridge.renderableStrokes
+        var matchedIndices: [Int] = []
+        var unionBounds: CGRect?
+
+        if currentTool == .select, let rect = selectionRect {
+            let p0 = documentPoint(for: CGPoint(x: rect.minX, y: rect.minY))
+            let p1 = documentPoint(for: CGPoint(x: rect.maxX, y: rect.maxY))
+            let docRect = CGRect(x: min(p0.x, p1.x),
+                                 y: min(p0.y, p1.y),
+                                 width: max(1.0, abs(p1.x - p0.x)),
+                                 height: max(1.0, abs(p1.y - p0.y)))
+            for (index, stroke) in strokes.enumerated() {
+                var strokeBox: CGRect?
+                for val in stroke.points {
+                    var pt = DTRenderPoint()
+                    val.getValue(&pt)
+                    let p = CGPoint(x: CGFloat(pt.x), y: CGFloat(pt.y))
+                    strokeBox = strokeBox == nil ? CGRect(origin: p, size: .zero) : strokeBox!.union(CGRect(origin: p, size: .zero))
+                }
+                if let box = strokeBox, docRect.intersects(box) || docRect.contains(box.origin) {
+                    matchedIndices.append(index)
+                    unionBounds = unionBounds == nil ? box : unionBounds!.union(box)
+                }
+            }
+        } else if currentTool == .lasso, lassoPts.count > 2 {
+            let docLassoPts = lassoPts.map { documentPoint(for: $0) }
+            let lassoPath = UIBezierPath()
+            lassoPath.move(to: docLassoPts[0])
+            for i in 1..<docLassoPts.count {
+                lassoPath.addLine(to: docLassoPts[i])
+            }
+            lassoPath.close()
+
+            for (index, stroke) in strokes.enumerated() {
+                var strokeBox: CGRect?
+                var hit = false
+                for val in stroke.points {
+                    var pt = DTRenderPoint()
+                    val.getValue(&pt)
+                    let p = CGPoint(x: CGFloat(pt.x), y: CGFloat(pt.y))
+                    strokeBox = strokeBox == nil ? CGRect(origin: p, size: .zero) : strokeBox!.union(CGRect(origin: p, size: .zero))
+                    if lassoPath.contains(p) {
+                        hit = true
+                    }
+                }
+                if hit, let box = strokeBox {
+                    matchedIndices.append(index)
+                    unionBounds = unionBounds == nil ? box : unionBounds!.union(box)
+                }
+            }
+        }
+
+        selectedStrokeIndices = matchedIndices
+        selectedBoundingBox = unionBounds
+        if !matchedIndices.isEmpty {
+            HapticFeedbackService.shared.snapLock()
+            updateSelectionBoundsOverlay()
+        } else {
+            clearSelection()
+        }
+        onSelectionChanged?(selectedStrokeIndices, selectedBoundingBox)
     }
 
     // MARK: - Canvas transform and gestures
@@ -460,6 +751,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                                     translationX: canvasTranslation.x,
                                     translationY: canvasTranslation.y)
         if persist { persistViewTransform() }
+        updateSelectionBoundsOverlay()
         setNeedsDisplay()
     }
 
@@ -472,7 +764,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         publishViewTransform(persist: true)
     }
 
-    private func documentPoint(for viewPoint: CGPoint) -> CGPoint {
+    func documentPoint(for viewPoint: CGPoint) -> CGPoint {
         let translated = CGPoint(x: (viewPoint.x - canvasTranslation.x) / canvasScale,
                                  y: (viewPoint.y - canvasTranslation.y) / canvasScale)
         let cosine = cos(canvasRotation)
@@ -480,6 +772,15 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         // Inverse of the document-to-view rotation.
         return CGPoint(x: translated.x * cosine + translated.y * sine,
                        y: -translated.x * sine + translated.y * cosine)
+    }
+
+    func viewPoint(for docPoint: CGPoint) -> CGPoint {
+        let cosine = cos(canvasRotation)
+        let sine = sin(canvasRotation)
+        let rotated = CGPoint(x: (docPoint.x * cosine - docPoint.y * sine) * canvasScale,
+                              y: (docPoint.x * sine + docPoint.y * cosine) * canvasScale)
+        return CGPoint(x: rotated.x + canvasTranslation.x,
+                       y: rotated.y + canvasTranslation.y)
     }
 
     private func applyTransform(scale newScale: CGFloat? = nil,
@@ -602,24 +903,24 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     }
 
     func pencilInteraction(_ interaction: UIPencilInteraction,
-                           didReceiveTap tap: UIPencilInteraction.Tap) {
-        // UIPencilInteraction delivers this callback for the system-configured
-        // Pencil tap action (the default is a double tap). Shape tools are not
-        // exposed by the current bridge, so any future non Brush/Eraser value
-        // naturally falls back to Brush on the first toggle.
+                            didReceiveTap tap: UIPencilInteraction.Tap) {
+        HapticFeedbackService.shared.toolSwitched()
         togglePencilTool(source: "double tap")
     }
 
     func pencilInteraction(_ interaction: UIPencilInteraction,
-                           didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+                            didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         lastPencilAction = "squeeze \(squeeze.phase)"
-        // Squeeze emits phase updates while the user holds the Pencil. Toggle
-        // only once at the terminal phase so the tool cannot flap repeatedly.
         switch squeeze.phase {
         case .began:
-            squeezeToggleConsumed = false
+            HapticFeedbackService.shared.squeeze()
+            if let onSqueeze {
+                onSqueeze()
+            } else {
+                squeezeToggleConsumed = false
+            }
         case .ended:
-            if !squeezeToggleConsumed {
+            if onSqueeze == nil && !squeezeToggleConsumed {
                 squeezeToggleConsumed = true
                 togglePencilTool(source: "squeeze")
             }

@@ -30,6 +30,7 @@ struct DTCanvasTransformState {
     float translationY = 0.0f;
     bool gridVisible = false;
     float gridSpacing = 32.0f;
+    bool pixelGridVisible = false;
 };
 
 static DTCanvasTransformState gCanvasTransform;
@@ -202,6 +203,29 @@ static void addEllipseOutline(std::vector<DTMetalVertex>& out,
         }
 }
 
+static void addPolygonFill(std::vector<DTMetalVertex>& out,
+                           const std::vector<DTSampledPoint>& points,
+                           float opacity, vector_float4 color, float hardness) {
+    if (points.size() < 3) return;
+    vector_float2 centroid = (vector_float2){0, 0};
+    for (const auto& p : points) {
+        centroid.x += p.position.x;
+        centroid.y += p.position.y;
+    }
+    centroid.x /= static_cast<float>(points.size());
+    centroid.y /= static_cast<float>(points.size());
+
+    const float fillOpacity = opacity * (0.35f + 0.65f * hardness);
+    for (size_t i = 0; i < points.size(); ++i) {
+        const size_t next = (i + 1) % points.size();
+        addTriangleStyled(out,
+                          centroid,
+                          points[i].position,
+                          points[next].position,
+                          1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
+    }
+}
+
 struct DTSampledPoint {
     vector_float2 position;
     float pressure;
@@ -358,6 +382,11 @@ typedef struct {
     gCanvasTransform.gridSpacing = safeSpacing;
 }
 
+- (void)updatePixelGridVisible:(BOOL)visible {
+    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
+    gCanvasTransform.pixelGridVisible = visible;
+}
+
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
     (void)view; (void)size;
 }
@@ -393,6 +422,7 @@ typedef struct {
     float transformY = 0.0f;
     bool gridVisible = false;
     float gridSpacing = 32.0f;
+    bool pixelGridVisible = false;
     {
         std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
         transformScale = gCanvasTransform.scale;
@@ -401,6 +431,7 @@ typedef struct {
         transformY = gCanvasTransform.translationY;
         gridVisible = gCanvasTransform.gridVisible;
         gridSpacing = gCanvasTransform.gridSpacing;
+        pixelGridVisible = gCanvasTransform.pixelGridVisible;
     }
     DTMetalUniforms uniforms{};
     uniforms.viewportScaleRotation = (vector_float4){
@@ -453,6 +484,44 @@ typedef struct {
                 [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
                 [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
                 [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
+            }
+        }
+    }
+
+    if (pixelGridVisible && transformScale >= 3.5f) {
+        const float inverseScale = 1.0f / transformScale;
+        const float extentX = static_cast<float>(view.bounds.size.width) * inverseScale + 4.0f;
+        const float extentY = static_cast<float>(view.bounds.size.height) * inverseScale + 4.0f;
+        const int maxCols = 384;
+        const int cols = std::min(maxCols, static_cast<int>(ceilf(extentX)) + 1);
+        const int rows = std::min(maxCols, static_cast<int>(ceilf(extentY)) + 1);
+        const vector_float4 pxColor = (vector_float4){0.40f, 0.44f, 0.43f, 0.12f};
+        std::vector<DTMetalVertex> pxGrid;
+        pxGrid.reserve(static_cast<size_t>(cols + rows) * 6);
+        const float halfX = cols * 1.0f;
+        const float halfY = rows * 1.0f;
+        const float width = std::max(0.25f, 0.5f * inverseScale);
+        for (int i = -cols; i <= cols; ++i) {
+            const float x = static_cast<float>(i);
+            addSegmentStyled(pxGrid, (vector_float2){x, -halfY}, (vector_float2){x, halfY},
+                             width, 1.0f, 0.0f, pxColor, 1.0f, false);
+        }
+        for (int i = -rows; i <= rows; ++i) {
+            const float y = static_cast<float>(i);
+            addSegmentStyled(pxGrid, (vector_float2){-halfX, y}, (vector_float2){halfX, y},
+                             width, 1.0f, 0.0f, pxColor, 1.0f, false);
+        }
+        if (!pxGrid.empty()) {
+            id<MTLBuffer> pxBuffer = [view.device newBufferWithBytes:pxGrid.data()
+                                                              length:sizeof(DTMetalVertex) * pxGrid.size()
+                                                             options:MTLResourceStorageModeShared];
+            if (pxBuffer) {
+                DTMetalFragmentUniforms fragmentUniforms{};
+                fragmentUniforms.color = pxColor;
+                fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
+                [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
+                [encoder setVertexBuffer:pxBuffer offset:0 atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:pxGrid.size()];
             }
         }
     }
@@ -533,7 +602,10 @@ typedef struct {
             const float passScale = fringe ? fringeRadiusScale : 1.0f;
             const float passOpacity = fringe ? fringeOpacity : opacity;
             std::vector<DTMetalVertex> geometry;
-            geometry.reserve(points.size() * 24);
+            geometry.reserve(points.size() * 28);
+            if (tool == 6u && !fringe && points.size() >= 3) {
+                addPolygonFill(geometry, points, passOpacity, color, hardness);
+            }
             if (points.size() == 1) {
                 addRoundCapStyled(geometry, points[0].position,
                                   strokeRadius(points[0].pressure, brushSize) * passScale,
@@ -558,6 +630,25 @@ typedef struct {
                     addTriangleStyled(geometry, a1, b0, b1, p1.pressure, p1.predicted,
                                       passOpacity, eraseFlag, color, hardness);
                 }
+                if (tool == 6u && points.size() >= 3) {
+                    const DTSampledPoint& p0 = points.back();
+                    const DTSampledPoint& p1 = points.front();
+                    const vector_float2 delta = p1.position - p0.position;
+                    const float length = simd_length(delta);
+                    if (length >= 0.001f) {
+                        const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
+                        const float r0 = strokeRadius(p0.pressure, brushSize) * passScale;
+                        const float r1 = strokeRadius(p1.pressure, brushSize) * passScale;
+                        const vector_float2 a0 = p0.position + normal * r0;
+                        const vector_float2 b0 = p0.position - normal * r0;
+                        const vector_float2 a1 = p1.position + normal * r1;
+                        const vector_float2 b1 = p1.position - normal * r1;
+                        addTriangleStyled(geometry, a0, b0, a1, p0.pressure, p0.predicted,
+                                          passOpacity, eraseFlag, color, hardness);
+                        addTriangleStyled(geometry, a1, b0, b1, p1.pressure, p1.predicted,
+                                          passOpacity, eraseFlag, color, hardness);
+                    }
+                }
                 for (size_t index = 0; index < points.size(); ++index) {
                     // Round joins at the exact local width: stamps overlap
                     // into a smooth envelope with no wedge gaps on tight
@@ -567,7 +658,7 @@ typedef struct {
                     const DTSampledPoint& point = points[index];
                     const float joinRadius =
                         strokeRadius(point.pressure, brushSize) * passScale;
-                    if (index == 0 || index + 1 == points.size()) {
+                    if (tool != 6u && (index == 0 || index + 1 == points.size())) {
                         addRoundCapStyled(geometry, point.position, joinRadius,
                                           point.pressure, point.predicted, passOpacity,
                                           eraseFlag, color, hardness);

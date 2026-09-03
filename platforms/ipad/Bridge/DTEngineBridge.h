@@ -42,6 +42,9 @@ typedef NS_ENUM(uint8_t, DTTool) {
     DTToolRectangle = 3,
     DTToolEllipse = 4,
     DTToolCircle = 5,
+    DTToolShade = 6,
+    DTToolSelect = 7,
+    DTToolLasso = 8,
 };
 
 /// Immutable render snapshot carrying the stroke's style as well as its
@@ -132,6 +135,11 @@ typedef NS_ENUM(uint8_t, DTTool) {
 - (BOOL)movePageAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex NS_SWIFT_NAME(movePage(from:to:));
 - (NSUInteger)duplicateLayerAtIndex:(NSUInteger)index NS_SWIFT_NAME(duplicateLayer(at:));
 - (BOOL)moveLayerAtIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex NS_SWIFT_NAME(moveLayer(from:to:));
+
+- (NSUInteger)activeLayerStrokeCount;
+- (BOOL)moveStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy NS_SWIFT_NAME(moveStrokes(at:dx:dy:));
+- (BOOL)deleteStrokesWithIndices:(NSArray<NSNumber *> *)indices NS_SWIFT_NAME(deleteStrokes(at:));
+- (BOOL)duplicateStrokesWithIndices:(NSArray<NSNumber *> *)indices dx:(CGFloat)dx dy:(CGFloat)dy NS_SWIFT_NAME(duplicateStrokes(at:dx:dy:));
 
 - (NSData *)archiveData;
 - (BOOL)loadArchiveData:(NSData *)data;
