@@ -8,7 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(drafting_table_core STATIC
     core/src/DTCore.cpp
     core/src/DTDocument.cpp
+    core/src/DTPackageManifest.cpp
     core/src/DTPersistence.cpp
+    core/src/DTRasterTransaction.cpp
 )
 target_include_directories(drafting_table_core
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/include
@@ -82,7 +84,19 @@ if (BUILD_TESTING)
     target_link_libraries(drafting_table_ipad_engine_tests PRIVATE drafting_table_core)
     target_compile_features(drafting_table_ipad_engine_tests PRIVATE cxx_std_20)
 
-    foreach(test_target drafting_table_document_tests drafting_table_brush_tests drafting_table_metal_layout_tests drafting_table_ipad_engine_tests)
+    add_executable(drafting_table_package_manifest_tests
+        tests/core/test_package_manifest.cpp
+    )
+    target_link_libraries(drafting_table_package_manifest_tests PRIVATE drafting_table_core)
+    target_compile_features(drafting_table_package_manifest_tests PRIVATE cxx_std_20)
+
+    add_executable(drafting_table_raster_transaction_tests
+        tests/core/test_raster_transaction.cpp
+    )
+    target_link_libraries(drafting_table_raster_transaction_tests PRIVATE drafting_table_core)
+    target_compile_features(drafting_table_raster_transaction_tests PRIVATE cxx_std_20)
+
+    foreach(test_target drafting_table_document_tests drafting_table_brush_tests drafting_table_metal_layout_tests drafting_table_ipad_engine_tests drafting_table_package_manifest_tests drafting_table_raster_transaction_tests)
         if (MSVC)
             target_compile_options(${test_target} PRIVATE /W4 /permissive-)
         else()
@@ -94,4 +108,6 @@ if (BUILD_TESTING)
     add_test(NAME drafting_table_brush_tests COMMAND drafting_table_brush_tests)
     add_test(NAME drafting_table_metal_layout_tests COMMAND drafting_table_metal_layout_tests)
     add_test(NAME drafting_table_ipad_engine_tests COMMAND drafting_table_ipad_engine_tests)
+    add_test(NAME drafting_table_package_manifest_tests COMMAND drafting_table_package_manifest_tests)
+    add_test(NAME drafting_table_raster_transaction_tests COMMAND drafting_table_raster_transaction_tests)
 endif()
