@@ -96,11 +96,16 @@ struct DTCompositeUniforms {
     float2 viewportSize;
     float opacity;
     float2 tileOrigin;
+    float2 clipMin;
+    float2 clipMax;
+    uint clipEnabled;
+    float reserved;
 };
 
 struct DTTileVertexOut {
     float4 position [[position]];
     float2 uv;
+    float2 document;
 };
 
 constant float2 kTileCorners[4] = {
@@ -126,6 +131,7 @@ vertex DTTileVertexOut dt_metal_tile_vertex(
     // Sample the interior endpoints (1..256) while retaining the apron for
     // linear filtering near an edge.
     out.uv = (local + 1.0) / 258.0;
+    out.document = document;
     return out;
 }
 
@@ -134,6 +140,13 @@ fragment float4 dt_metal_tile_fragment(
     texture2d<float> tile [[texture(0)]],
     sampler tileSampler [[sampler(0)]],
     constant DTCompositeUniforms& uniforms [[buffer(0)]]) {
+    if (uniforms.clipEnabled != 0 &&
+        (in.document.x < uniforms.clipMin.x ||
+         in.document.y < uniforms.clipMin.y ||
+         in.document.x > uniforms.clipMax.x ||
+         in.document.y > uniforms.clipMax.y)) {
+        discard_fragment();
+    }
     const float4 color = tile.sample(tileSampler, in.uv);
     return color * saturate(uniforms.opacity);
 }

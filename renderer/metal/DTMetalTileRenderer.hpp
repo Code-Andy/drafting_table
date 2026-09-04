@@ -476,6 +476,11 @@ struct CompositeParameters {
     Vec2 translation{};
     Vec2 viewportSize{};
     float opacity = 1.0f;
+    // Optional document-space page clip. This avoids full-page intermediate
+    // textures while keeping edge tiles from drawing outside the paper.
+    Vec2 clipMin{};
+    Vec2 clipMax{};
+    bool clipEnabled = false;
 };
 
 enum class BackendResult : std::uint8_t {

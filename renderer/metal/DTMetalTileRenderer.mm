@@ -27,6 +27,10 @@ struct CompositeUniforms {
     vector_float2 viewportSize;
     float opacity;
     vector_float2 tileOrigin;
+    vector_float2 clipMin;
+    vector_float2 clipMax;
+    std::uint32_t clipEnabled;
+    float reserved;
 };
 
 struct VersionTextures {
@@ -805,7 +809,10 @@ BackendResult Backend::encodeCommit(void* nativeCommandBuffer,
         TileResource& tile = impl_->tiles.at(key);
         tile.inFlight = true;
         state->versions.before.tiles.push_back(impl_->activeBefore.at(key));
-        state->versions.after.tiles.push_back({tile.address, state->generation, true});
+        const bool afterExists = tile.working.colorInitialized ||
+                                 tile.working.coverageInitialized;
+        state->versions.after.tiles.push_back(
+            {tile.address, afterExists ? state->generation : 0, afterExists});
         tile.working.generation = state->generation;
         state->working.emplace(key, tile.working);
     }
@@ -837,10 +844,21 @@ std::optional<TileCommitVersions> Backend::takeCompletedCommit(
         tile.inFlight = false;
         if (success) {
             if (tile.hasCommitted) tile.history[tile.committed.generation] = tile.committed;
-            tile.committed = state->working.at(key);
-            tile.committed.generation = state->generation;
-            tile.hasCommitted = true;
-            tile.contentGeneration = state->generation;
+            const auto after = std::find_if(
+                state->versions.after.tiles.begin(), state->versions.after.tiles.end(),
+                [&](const TileVersionRef& value) { return value.tile == tile.address; });
+            const bool afterExists = after != state->versions.after.tiles.end() && after->exists;
+            if (afterExists) {
+                tile.committed = state->working.at(key);
+                tile.committed.generation = state->generation;
+                tile.hasCommitted = true;
+                tile.contentGeneration = state->generation;
+            } else {
+                tile.committed = {};
+                tile.hasCommitted = false;
+                tile.contentGeneration = 0;
+                tile.persistedGeneration = 0;
+            }
             tile.hasWorking = false;
             tile.hasPreview = false;
             // Do not leave working aliased to committed: the next
@@ -950,13 +968,19 @@ BackendResult Backend::encodeCheckpoint(void* nativeCommandBuffer,
         const auto found = impl_->tiles.find(reference.tile.key());
         VersionTextures* source = nullptr;
         if (found != impl_->tiles.end() && reference.exists) {
-            if (found->second.inFlight) return BackendResult::resourceFailure;
             source = Impl::findVersion(found->second, reference.generation);
-            // Working/preview resources are writable and therefore cannot be
-            // handed to persistence as an immutable checkpoint.  Callers must
-            // request the last completed committed/history generation.
-            if (source && impl_->activeOperation != 0 &&
-                (source == &found->second.working || source == &found->second.preview)) {
+            // The active working texture is checkpointable only after
+            // encodeCommit has frozen it and marked the transaction pending.
+            // The blit is then ordered after all paint commands in the same
+            // command buffer, while later writes remain prohibited.
+            const bool frozenWorking = source == &found->second.working &&
+                found->second.inFlight && impl_->activeCommitPending &&
+                impl_->activeOperation != 0 &&
+                found->second.working.generation == reference.generation;
+            if (found->second.inFlight && !frozenWorking) {
+                return BackendResult::resourceFailure;
+            }
+            if (source && source == &found->second.preview) {
                 return BackendResult::resourceFailure;
             }
         }
@@ -1102,7 +1126,11 @@ BackendResult Backend::encodeComposite(void* nativeCommandBuffer,
                                {parameters.translation.x, parameters.translation.y},
                                {parameters.viewportSize.x, parameters.viewportSize.y},
                                std::clamp(parameters.opacity, 0.0f, 1.0f),
-                               {0.0f, 0.0f}};
+                               {0.0f, 0.0f},
+                               {parameters.clipMin.x, parameters.clipMin.y},
+                               {parameters.clipMax.x, parameters.clipMax.y},
+                               parameters.clipEnabled ? 1u : 0u,
+                               0.0f};
     for (const TileAddress address : visibleTiles) {
         const auto found = impl_->tiles.find(address.key());
         if (found == impl_->tiles.end()) continue;
