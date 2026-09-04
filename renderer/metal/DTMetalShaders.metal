@@ -82,9 +82,11 @@ fragment float4 dt_metal_dab_color(DTDabVertexOut in [[stage_in]]) {
 
 fragment float4 dt_metal_dab_coverage(DTDabVertexOut in [[stage_in]]) {
     const float coverage = dt_dab_coverage(in);
-    // The R8 pipeline reads only red.  Its MAX blend operation makes coverage
-    // independent of the order or multiplicity of overlapping dabs.
-    return float4(coverage, 0.0, 0.0, 1.0);
+    // The R8 pipeline reads only red.  Source-over/destination-out blend
+    // factors use the same scalar for source color and source alpha.
+    // Destination-out therefore removes only the covered amount instead of
+    // clearing the entire mask.
+    return float4(coverage, 0.0, 0.0, coverage);
 }
 
 struct DTCompositeUniforms {
