@@ -313,6 +313,10 @@ TileVersionRef RasterTransactionCoordinator::restoreTarget(
     target.versionID = versionID;
     target.contentGeneration = generation;
     target.persistedGeneration = 0;
+    // A restore is a new renderer generation.  Even when the source payload
+    // was durable, its object/header identity belongs to the old version; the
+    // I/O service must checkpoint this restored version independently.
+    target.payloadID.clear();
     return target;
 }
 
@@ -574,12 +578,14 @@ bool RasterTransactionCoordinator::acknowledgePersistence(
     }
     const auto index = operationIndices_.find(operationID);
     if (index == operationIndices_.end()) return fail("unknown operation ID");
-    auto& record = operations_[index->second];
+    const auto& record = operations_[index->second];
     if (record.token.generation != generation) {
         return fail("persistence generation does not match operation");
     }
 
     std::unordered_set<std::size_t> matched;
+    std::vector<std::pair<std::size_t, std::string>> updates;
+    updates.reserve(bindings.size());
     for (const auto& binding : bindings) {
         if (!binding.pageID.valid() || !binding.layerID.valid() ||
             binding.versionID == 0 || binding.payloadID.empty()) {
@@ -598,11 +604,29 @@ bool RasterTransactionCoordinator::acknowledgePersistence(
         if (match == record.tileSwaps.size() || !matched.insert(match).second) {
             return fail("persisted tile binding does not match the operation");
         }
-        auto& after = record.tileSwaps[match].after;
+        const auto& after = record.tileSwaps[match].after;
         if (!after.payloadID.empty() && after.payloadID != binding.payloadID) {
             return fail("persisted tile binding changes an existing payload ID");
         }
-        after.payloadID = binding.payloadID;
+        updates.emplace_back(match, binding.payloadID);
+    }
+
+    // Validate completeness before mutating the operation record.  This is
+    // important when a provider returns a partial callback: no subset may be
+    // published as durable if a later binding turns out to be stale.
+    for (std::size_t i = 0; i < record.tileSwaps.size(); ++i) {
+        const auto& after = record.tileSwaps[i].after;
+        if (after.hasVersion() && after.payloadID.empty() &&
+            matched.find(i) == matched.end()) {
+            return fail("persistence acknowledgement is missing a tile payload ID");
+        }
+    }
+
+    if (!updates.empty()) {
+        auto& mutableRecord = operations_[index->second];
+        for (const auto& [match, payloadID] : updates) {
+            mutableRecord.tileSwaps[match].after.payloadID = payloadID;
+        }
     }
     return acknowledgePersistence(operationID, generation);
 }

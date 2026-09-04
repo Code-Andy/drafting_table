@@ -36,8 +36,9 @@ void testDocumentIdentityAndSnapshot() {
     page->activeLayer()->setTileVersion(version({1, 0}, 3, 1, "tile-b"));
     page->activeLayer()->setTileVersion(version({-1, 0}, 2, 1, "tile-a"));
     page->addLayer(dt::LayerType::Vector, "vectors");
-    CHECK(document.renderMetadataSnapshot().layers.size() == 2);
-    const auto& refs = document.renderMetadataSnapshot().layers[0].tileVersions;
+    const auto snapshot = document.renderMetadataSnapshot();
+    CHECK(snapshot.layers.size() == 2);
+    const auto& refs = snapshot.layers[0].tileVersions;
     CHECK(refs.size() == 2 && refs[0].address.x == -1 && refs[1].address.x == 1);
 
     CHECK(page->moveLayer(1, 0));
@@ -72,7 +73,7 @@ void testRasterUndoRedoAndPersistence() {
     CHECK(undo.plan->token.generation == 2);
     CHECK(undo.plan->tileSwaps.size() == 1);
     CHECK(undo.plan->tileSwaps[0].after.versionID != after.versionID);
-    CHECK(undo.plan->tileSwaps[0].after.payloadID == "payload-a");
+    CHECK(undo.plan->tileSwaps[0].after.payloadID.empty());
     CHECK(coordinator.completeRestore(*undo.plan));
     CHECK(coordinator.currentGeneration() == 2 && coordinator.canRedo());
     CHECK(coordinator.currentTileVersion(page, layer, address) == nullptr);
@@ -80,12 +81,49 @@ void testRasterUndoRedoAndPersistence() {
     const auto redo = coordinator.requestRedo();
     CHECK(redo.status == dt::UndoStatus::Applied && redo.plan.has_value());
     CHECK(redo.plan->token.generation == 3);
+    CHECK(redo.plan->tileSwaps[0].after.payloadID.empty());
     CHECK(coordinator.completeRestore(*redo.plan));
     CHECK(coordinator.currentGeneration() == 3 && coordinator.canUndo());
     CHECK(coordinator.currentTileVersion(page, layer, address) != nullptr);
 
     CHECK(coordinator.acknowledgePersistence(token->operationID,
                                              token->generation));
+    CHECK(coordinator.isPersistenceAcknowledged(token->operationID));
+}
+
+void testPartialPersistenceAckIsAtomic() {
+    const dt::PageID page{91};
+    const dt::LayerID layer{92};
+    const dt::TileAddress firstAddress{0, 0};
+    const dt::TileAddress secondAddress{1, 0};
+    dt::RasterTransactionCoordinator coordinator;
+    const auto token = coordinator.reserveRasterOperation();
+    CHECK(token.has_value());
+    const dt::TileVersionRef first =
+        version(firstAddress, 201, token->generation, "");
+    const dt::TileVersionRef second =
+        version(secondAddress, 202, token->generation, "");
+    const dt::RasterVersionSwap swaps[] = {
+        {page, layer, dt::TileVersionRef{firstAddress}, first},
+        {page, layer, dt::TileVersionRef{secondAddress}, second},
+    };
+    CHECK(coordinator.commitRasterOperation(*token, std::span(swaps)));
+    const dt::PersistedTileBinding valid{page, layer, firstAddress, 201,
+                                         "payload-first"};
+    const dt::PersistedTileBinding invalid{page, layer, {99, 99}, 202,
+                                           "payload-second"};
+    const dt::PersistedTileBinding partial[] = {valid, invalid};
+    CHECK(!coordinator.acknowledgePersistence(*token, std::span(partial)));
+    CHECK(!coordinator.isPersistenceAcknowledged(token->operationID));
+    CHECK(coordinator.currentTileVersion(page, layer, firstAddress)
+              ->payloadID.empty());
+    CHECK(coordinator.currentTileVersion(page, layer, secondAddress)
+              ->payloadID.empty());
+
+    const dt::PersistedTileBinding secondBinding{page, layer, secondAddress,
+                                                 202, "payload-second"};
+    const dt::PersistedTileBinding complete[] = {valid, secondBinding};
+    CHECK(coordinator.acknowledgePersistence(*token, std::span(complete)));
     CHECK(coordinator.isPersistenceAcknowledged(token->operationID));
 }
 
@@ -126,6 +164,7 @@ void testQueuedUndoAndMetadataHistory() {
 int main() {
     testDocumentIdentityAndSnapshot();
     testRasterUndoRedoAndPersistence();
+    testPartialPersistenceAckIsAtomic();
     testQueuedUndoAndMetadataHistory();
     if (failures != 0) {
         std::cerr << failures << " assertion(s) failed\n";
