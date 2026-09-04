@@ -65,3 +65,47 @@ fragment float4 dt_fragment(DTVertexOut in [[stage_in]],
     color.a *= alpha;
     return float4(color.rgb * color.a, color.a);
 }
+
+// Lightweight paper/grid pass used by the tile renderer. Artwork itself is
+// composited by renderer/metal/DTMetalShaders.metal.
+struct DTOverlayVertex {
+    float2 documentPosition;
+    float4 premultipliedColor;
+};
+
+struct DTOverlayUniforms {
+    float2 viewportSize;
+    float scale;
+    float rotation;
+    float2 translation;
+    float2 reserved;
+};
+
+struct DTOverlayVertexOut {
+    float4 position [[position]];
+    float4 color;
+};
+
+vertex DTOverlayVertexOut dt_overlay_vertex(
+    const device DTOverlayVertex* vertices [[buffer(0)]],
+    constant DTOverlayUniforms& uniforms [[buffer(1)]],
+    uint vertexID [[vertex_id]]) {
+    const DTOverlayVertex input = vertices[vertexID];
+    const float c = cos(uniforms.rotation);
+    const float s = sin(uniforms.rotation);
+    const float2 rotated = float2(
+        c * input.documentPosition.x - s * input.documentPosition.y,
+        s * input.documentPosition.x + c * input.documentPosition.y);
+    const float2 view = rotated * uniforms.scale + uniforms.translation;
+    const float2 viewport = max(uniforms.viewportSize, float2(1.0));
+    DTOverlayVertexOut out;
+    out.position = float4(view.x / viewport.x * 2.0 - 1.0,
+                          1.0 - view.y / viewport.y * 2.0,
+                          0.0, 1.0);
+    out.color = input.premultipliedColor;
+    return out;
+}
+
+fragment float4 dt_overlay_fragment(DTOverlayVertexOut in [[stage_in]]) {
+    return in.color;
+}

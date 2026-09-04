@@ -4,9 +4,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// Minimal Metal renderer. It intentionally renders the engine's polyline
-/// snapshot directly; tile baking and document persistence can be introduced
-/// behind DTEngineBridge without changing UIKit input handling.
+/// Sparse tile renderer and MTKView facade. UIKit continues to submit input
+/// through DTEngineBridge; this object owns the one serial Metal command queue,
+/// per-layer tile backends, live prediction, commits, and async checkpoints.
 @interface DTMetalRenderer : NSObject <MTKViewDelegate>
 
 - (instancetype)initWithView:(MTKView *)view engine:(DTEngineBridge *)engine;

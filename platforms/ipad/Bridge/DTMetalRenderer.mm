@@ -1,29 +1,107 @@
 #import "DTMetalRenderer.h"
+#import "DTRendererContract.h"
 
+#import <Metal/Metal.h>
 #import <simd/simd.h>
+
+#include "BrushEmitter.hpp"
+#include "DTMetalTileRenderer.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
-#include <mutex>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
-// Immediate retained-snapshot renderer. Eraser strokes are warm-paper geometry
-// replayed in document order until the sparse tile backend supports
-// destination-out blending.
-typedef struct {
-    vector_float2 position;
-    float pressure;
-    float predicted;
-    float opacity;
-    float eraser;
-} DTMetalVertex;
+using drafting_table::PencilSample;
+using drafting_table::SampleFlags;
+using drafting_table::TileAddress;
+using drafting_table::Vec2;
+using drafting_table::metal::Backend;
+using drafting_table::metal::BackendResult;
+using drafting_table::metal::CheckpointTicket;
+using drafting_table::metal::DabBlendMode;
+using drafting_table::metal::DabInstance;
+using drafting_table::metal::PremultipliedColor;
+using drafting_table::metal::TileDabBatch;
+using drafting_table::metal::TileVersionRef;
+using drafting_table::renderer::BrushEmitter;
+using drafting_table::renderer::BrushSettings;
+using drafting_table::renderer::Dab;
 
 namespace {
-constexpr float kPi = 3.14159265358979323846f;
 
-// Keep the transform behind one small lock so a frame always sees one coherent
-// scale/rotation/translation snapshot rather than a mixture of gesture states.
-struct DTCanvasTransformState {
-    std::mutex mutex;
+constexpr NSUInteger kMaxResidentTilesPerLayer = 512;
+constexpr NSUInteger kTileBytes = drafting_table::metal::kTileInteriorRGBABytes;
+const void *kRenderQueueSpecific = &kRenderQueueSpecific;
+
+struct DTOverlayVertex {
+    vector_float2 documentPosition;
+    vector_float4 premultipliedColor;
+};
+
+struct DTOverlayUniforms {
+    vector_float2 viewportSize;
+    float scale;
+    float rotation;
+    vector_float2 translation;
+    vector_float2 reserved;
+};
+
+struct LayerMetadataValue {
+    uint64_t layerID = 0;
+    bool visible = true;
+    float opacity = 1.0f;
+};
+
+struct MetadataValue {
+    uint64_t pageID = 0;
+    uint64_t generation = 0;
+    uint64_t activeLayerID = 0;
+    float pageWidth = 1536.0f;
+    float pageHeight = 2048.0f;
+    std::vector<LayerMetadataValue> layers;
+};
+
+struct LayerGPUState {
+    std::unique_ptr<Backend> backend;
+    std::unordered_set<std::int64_t> resident;
+};
+
+struct ActiveStroke {
+    DTStrokeOperationDescriptor descriptor{};
+    BrushEmitter emitter{};
+    std::unordered_set<std::int64_t> touched;
+    bool transactionBegun = false;
+
+    ActiveStroke(DTStrokeOperationDescriptor value, float pageWidth, float pageHeight)
+        : descriptor(value) {
+        BrushSettings settings;
+        const float radius = std::max(0.25f, value.brushSize * 0.5f);
+        settings.minRadius = std::max(0.15f, radius * 0.20f);
+        settings.maxRadius = radius;
+        settings.spacingFraction = 0.18f;
+        settings.minimumSpacing = 0.40f;
+        emitter.setSettings(settings);
+        drafting_table::renderer::StrokeBounds clip;
+        clip.valid = true;
+        clip.min = {0.0f, 0.0f};
+        clip.max = {std::max(1.0f, pageWidth), std::max(1.0f, pageHeight)};
+        emitter.emitter().setClipBounds(clip);
+    }
+};
+
+struct RendererState {
+    MetadataValue metadata;
+    std::unordered_map<uint64_t, LayerGPUState> layers;
+    std::optional<ActiveStroke> stroke;
+    uint64_t nextVersionID = 1;
     float scale = 1.0f;
     float rotation = 0.0f;
     float translationX = 0.0f;
@@ -32,846 +110,865 @@ struct DTCanvasTransformState {
     float gridSpacing = 32.0f;
     bool pixelGridVisible = false;
     bool centerMode = false;
-    float paperWidth = 1536.0f;
-    float paperHeight = 2048.0f;
+    std::atomic<NSUInteger> frameCount{0};
 };
 
-static DTCanvasTransformState gCanvasTransform;
+struct PreparedBatches {
+    std::unordered_map<std::int64_t, std::vector<DabInstance>> instances;
+    std::vector<TileAddress> addresses;
+    std::vector<TileDabBatch> batches;
 
-static float finiteOr(float value, float fallback) {
-    return std::isfinite(value) ? value : fallback;
-}
-
-static float clamp01(float value) { return fmaxf(0.0f, fminf(1.0f, value)); }
-
-static vector_float4 colorFromRGBA(uint32_t rgba) {
-    return (vector_float4){
-        ((rgba >> 24) & 0xffu) / 255.0f,
-        ((rgba >> 16) & 0xffu) / 255.0f,
-        ((rgba >> 8) & 0xffu) / 255.0f,
-        (rgba & 0xffu) / 255.0f
-    };
-}
-
-static float strokeRadius(float pressure, float brushSize) {
-    // brushSize is nominal diameter in points; force provides a smooth,
-    // pressure-aware width while preserving a visible feather-light mark.
-    const float size = brushSize > 0.0f ? brushSize : 5.4f;
-    const float diameter = size * (0.20f + 0.80f * sqrtf(clamp01(pressure)));
-    return fmaxf(0.45f, diameter * 0.5f);
-}
-
-static void addTriangle(std::vector<DTMetalVertex>& out,
-                        vector_float2 a, vector_float2 b, vector_float2 c,
-                        float pressure, float predicted,
-                        float opacity, float eraser) {
-    out.push_back({a, pressure, predicted, opacity, eraser});
-    out.push_back({b, pressure, predicted, opacity, eraser});
-    out.push_back({c, pressure, predicted, opacity, eraser});
-}
-
-static void addTriangleStyled(std::vector<DTMetalVertex>& out,
-                              vector_float2 a, vector_float2 b, vector_float2 c,
-                              float pressure, float predicted, float opacity,
-                              float eraser, vector_float4 color, float hardness) {
-    (void)color; (void)hardness;
-    addTriangle(out, a, b, c, pressure, predicted, opacity, eraser);
-}
-
-static void addRoundCap(std::vector<DTMetalVertex>& out,
-                        vector_float2 center, float radius,
-                        float pressure, float predicted,
-                        float opacity, float eraser) {
-    constexpr int kSlices = 14;
-    for (int i = 0; i < kSlices; ++i) {
-        const float a0 = (2.0f * kPi * static_cast<float>(i)) / kSlices;
-        const float a1 = (2.0f * kPi * static_cast<float>(i + 1)) / kSlices;
-        const vector_float2 p0 = center + (vector_float2){cosf(a0) * radius, sinf(a0) * radius};
-        const vector_float2 p1 = center + (vector_float2){cosf(a1) * radius, sinf(a1) * radius};
-        addTriangle(out, center, p0, p1, pressure, predicted, opacity, eraser);
-    }
-}
-
-static void addRoundCapStyled(std::vector<DTMetalVertex>& out,
-                              vector_float2 center, float radius,
-                              float pressure, float predicted, float opacity,
-                              float eraser, vector_float4 color, float hardness) {
-    constexpr int kSlices = 8;
-    for (int i = 0; i < kSlices; ++i) {
-        const float a0 = (2.0f * kPi * static_cast<float>(i)) / kSlices;
-        const float a1 = (2.0f * kPi * static_cast<float>(i + 1)) / kSlices;
-        const vector_float2 p0 = center + (vector_float2){cosf(a0) * radius, sinf(a0) * radius};
-        const vector_float2 p1 = center + (vector_float2){cosf(a1) * radius, sinf(a1) * radius};
-        addTriangleStyled(out, center, p0, p1, pressure, predicted, opacity,
-                          eraser, color, hardness);
-    }
-}
-
-// Round join stamped at every interior point with that point's exact local
-// radius. Overlapping stamps at the true local width form a smooth envelope
-// (like dab stamping): segment quads alone leave wedge gaps on tight
-// curves, while sparse oversized fans bead into dots. Six slices keep the
-// vertex cost bounded; the strip covers everything but the outer wedge.
-static void addJoinFan(std::vector<DTMetalVertex>& out,
-                       vector_float2 center, float radius,
-                       float pressure, float predicted, float opacity,
-                       float eraser, vector_float4 color, float hardness) {
-    constexpr int kSlices = 6;
-    for (int i = 0; i < kSlices; ++i) {
-        const float a0 = (2.0f * kPi * static_cast<float>(i)) / kSlices;
-        const float a1 = (2.0f * kPi * static_cast<float>(i + 1)) / kSlices;
-        const vector_float2 p0 = center + (vector_float2){cosf(a0) * radius, sinf(a0) * radius};
-        const vector_float2 p1 = center + (vector_float2){cosf(a1) * radius, sinf(a1) * radius};
-        addTriangleStyled(out, center, p0, p1, pressure, predicted, opacity,
-                          eraser, color, hardness);
-    }
-}
-
-static void addSegmentStyled(std::vector<DTMetalVertex>& out,
-                             vector_float2 p0, vector_float2 p1, float radius,
-                             float opacity, float eraser, vector_float4 color,
-                             float hardness, bool caps = true) {
-    const vector_float2 delta = p1 - p0;
-    const float length = simd_length(delta);
-    if (length < 0.001f) return;
-    const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
-    const vector_float2 a0 = p0 + normal * radius;
-    const vector_float2 b0 = p0 - normal * radius;
-    const vector_float2 a1 = p1 + normal * radius;
-    const vector_float2 b1 = p1 - normal * radius;
-    addTriangleStyled(out, a0, b0, a1, 1.0f, 0.0f, opacity, eraser, color, hardness);
-    addTriangleStyled(out, a1, b0, b1, 1.0f, 0.0f, opacity, eraser, color, hardness);
-    if (caps) {
-        addRoundCapStyled(out, p0, radius, 1.0f, 0.0f, opacity, eraser, color, hardness);
-        addRoundCapStyled(out, p1, radius, 1.0f, 0.0f, opacity, eraser, color, hardness);
-    }
-}
-
-static void addQuad(std::vector<DTMetalVertex>& out,
-                    vector_float2 minP, vector_float2 maxP,
-                    vector_float4 color, float opacity) {
-    const vector_float2 a = minP;
-    const vector_float2 b = (vector_float2){maxP.x, minP.y};
-    const vector_float2 c = maxP;
-    const vector_float2 d = (vector_float2){minP.x, maxP.y};
-    addTriangleStyled(out, a, b, c, 1.0f, 0.0f, opacity, 0.0f, color, 1.0f);
-    addTriangleStyled(out, a, c, d, 1.0f, 0.0f, opacity, 0.0f, color, 1.0f);
-}
-
-static void addEllipseOutline(std::vector<DTMetalVertex>& out,
-                              vector_float2 center, vector_float2 radii,
-                              float radius, float opacity, vector_float4 color,
-                              float hardness);
-
-static void addShapeOutline(std::vector<DTMetalVertex>& out,
-                            uint32_t tool, vector_float2 first, vector_float2 last,
-                            float radius, float opacity, vector_float4 color,
-                            float hardness, bool centerModeActive) {
-    if (tool == 2u) { // line
-        addSegmentStyled(out, first, last, radius, opacity, 0.0f, color, hardness);
-        return;
-    }
-    if (tool == 3u) { // rectangle
-        const vector_float2 a = first;
-        const vector_float2 b = (vector_float2){last.x, first.y};
-        const vector_float2 c = last;
-        const vector_float2 d = (vector_float2){first.x, last.y};
-        addSegmentStyled(out, a, b, radius, opacity, 0.0f, color, hardness, false);
-        addSegmentStyled(out, b, c, radius, opacity, 0.0f, color, hardness, false);
-        addSegmentStyled(out, c, d, radius, opacity, 0.0f, color, hardness, false);
-        addSegmentStyled(out, d, a, radius, opacity, 0.0f, color, hardness, false);
-        addRoundCapStyled(out, a, radius, 1.0f, 0.0f, opacity, 0.0f, color, hardness);
-        addRoundCapStyled(out, c, radius, 1.0f, 0.0f, opacity, 0.0f, color, hardness);
-        return;
-    }
-    if (tool == 4u) { // ellipse
-        const vector_float2 center = centerModeActive ? first : ((first + last) * 0.5f);
-        const vector_float2 radii = centerModeActive
-            ? (vector_float2){fmaxf(0.5f, fabsf(last.x - first.x)), fmaxf(0.5f, fabsf(last.y - first.y))}
-            : (vector_float2){fmaxf(0.5f, fabsf(last.x - first.x) * 0.5f), fmaxf(0.5f, fabsf(last.y - first.y) * 0.5f)};
-        addEllipseOutline(out, center, radii, radius, opacity, color, hardness);
-        return;
-    }
-    if (tool == 5u) { // circle: corner-drag defines bounding square, center-drag defines radius from center
-        const vector_float2 center = centerModeActive ? first : ((first + last) * 0.5f);
-        const float circleRadius = centerModeActive
-            ? fmaxf(0.5f, hypotf(last.x - first.x, last.y - first.y))
-            : fmaxf(0.5f, fmaxf(fabsf(last.x - first.x), fabsf(last.y - first.y)) * 0.5f);
-        addEllipseOutline(out, center, (vector_float2){circleRadius, circleRadius},
-                          radius, opacity, color, hardness);
-        return;
-    }
-}
-
-static void addEllipseOutline(std::vector<DTMetalVertex>& out,
-                              vector_float2 center, vector_float2 radii,
-                              float radius, float opacity, vector_float4 color,
-                              float hardness) {
-        constexpr int kSegments = 64;
-        for (int i = 0; i < kSegments; ++i) {
-            const float t0 = (2.0f * kPi * i) / kSegments;
-            const float t1 = (2.0f * kPi * (i + 1)) / kSegments;
-            const vector_float2 p0 = center + (vector_float2){cosf(t0) * radii.x, sinf(t0) * radii.y};
-            const vector_float2 p1 = center + (vector_float2){cosf(t1) * radii.x, sinf(t1) * radii.y};
-            addSegmentStyled(out, p0, p1, radius, opacity, 0.0f, color, hardness, false);
+    void finalize() {
+        addresses.clear();
+        batches.clear();
+        addresses.reserve(instances.size());
+        batches.reserve(instances.size());
+        for (auto& entry : instances) {
+            const TileAddress address = TileAddress::fromKey(entry.first);
+            addresses.push_back(address);
+            batches.push_back({address, std::span<const DabInstance>(entry.second)});
         }
-}
-
-struct DTSampledPoint {
-    vector_float2 position;
-    float pressure;
-    float predicted;
+    }
 };
 
-static inline float cross2d(vector_float2 a, vector_float2 b, vector_float2 c) {
-    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+struct RestoreItemValue {
+    uint64_t layerID = 0;
+    TileAddress tile{};
+    bool sourceExists = false;
+    uint64_t sourceGeneration = 0;
+    bool targetExists = false;
+    uint64_t targetVersionID = 0;
+};
+
+struct RestoreLayerWork {
+    uint64_t layerID = 0;
+    std::vector<RestoreItemValue> items;
+    std::vector<CheckpointTicket> tickets;
+};
+
+static NSError *DTMakeRendererError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:DTRendererErrorDomain
+                               code:code
+                           userInfo:@{NSLocalizedDescriptionKey: message ?: @"Metal renderer error"}];
 }
 
-static inline bool isPointInTriangle(vector_float2 p, vector_float2 a, vector_float2 b, vector_float2 c) {
-    const float cp1 = cross2d(a, b, p);
-    const float cp2 = cross2d(b, c, p);
-    const float cp3 = cross2d(c, a, p);
-    const bool hasNeg = (cp1 < -0.0001f) || (cp2 < -0.0001f) || (cp3 < -0.0001f);
-    const bool hasPos = (cp1 > 0.0001f) || (cp2 > 0.0001f) || (cp3 > 0.0001f);
-    return !(hasNeg && hasPos);
+static float DTClamp01(float value) {
+    return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
 }
 
-static void addPolygonFill(std::vector<DTMetalVertex>& out,
-                           const std::vector<DTSampledPoint>& points,
-                           float opacity, vector_float4 color, float hardness) {
-    if (points.size() < 3) return;
-    const float fillOpacity = opacity * (0.35f + 0.65f * hardness);
+static PremultipliedColor DTPremultipliedColor(uint32_t rgba, bool eraser) {
+    if (eraser) return {0.0f, 0.0f, 0.0f, 1.0f};
+    const float alpha = ((rgba & 0xffu) / 255.0f);
+    const float red = ((rgba >> 24) & 0xffu) / 255.0f;
+    const float green = ((rgba >> 16) & 0xffu) / 255.0f;
+    const float blue = ((rgba >> 8) & 0xffu) / 255.0f;
+    return {red * alpha, green * alpha, blue * alpha, alpha};
+}
 
-    // Deduplicate consecutive points
-    std::vector<vector_float2> poly;
-    poly.reserve(points.size());
-    for (const auto& pt : points) {
-        if (poly.empty() || simd_length(poly.back() - pt.position) > 0.1f) {
-            poly.push_back(pt.position);
+static PencilSample DTCoreSample(DTPencilSample sample) {
+    PencilSample result;
+    result.x = sample.x;
+    result.y = sample.y;
+    result.pressure = sample.pressure;
+    result.altitude = sample.altitude;
+    result.azimuth = sample.azimuth;
+    result.roll = sample.roll;
+    result.hoverDistance = sample.hoverDistance;
+    result.timestamp = sample.timestamp;
+    result.id = sample.sampleID;
+    result.estimationUpdateIndex = sample.estimationUpdateIndex;
+    result.flags = static_cast<SampleFlags>(sample.flags);
+    return result;
+}
+
+static PreparedBatches DTPrepareBatches(std::span<const Dab> dabs,
+                                        DTStrokeOperationDescriptor descriptor) {
+    PreparedBatches prepared;
+    const bool eraser = descriptor.tool == DTToolEraser;
+    const PremultipliedColor color = DTPremultipliedColor(descriptor.brushColorRGBA,
+                                                          eraser);
+    for (const Dab& dab : dabs) {
+        drafting_table::renderer::StrokeBounds bounds;
+        bounds.include(dab);
+        const auto tiles = drafting_table::renderer::touchedTiles(bounds);
+        for (const TileAddress tile : tiles) {
+            const Vec2 local = drafting_table::metal::TileLayout::localPoint(
+                tile, dab.footprint.center);
+            prepared.instances[tile.key()].emplace_back(
+                local,
+                Vec2{dab.footprint.radiusX, dab.footprint.radiusY},
+                dab.footprint.rotationRadians,
+                DTClamp01(descriptor.brushOpacity),
+                DTClamp01(descriptor.brushHardness),
+                color);
         }
     }
-    if (poly.size() >= 3 && simd_length(poly.front() - poly.back()) < 0.1f) {
-        poly.pop_back();
-    }
-    if (poly.size() < 3) return;
+    prepared.finalize();
+    return prepared;
+}
 
-    // Ensure CCW orientation via signed area
-    float area = 0.0f;
-    for (size_t i = 0; i < poly.size(); ++i) {
-        const size_t next = (i + 1) % poly.size();
-        area += poly[i].x * poly[next].y - poly[next].x * poly[i].y;
-    }
-    if (fabsf(area) < 0.001f) return;
-    if (area < 0) {
-        std::reverse(poly.begin(), poly.end());
-    }
+static void DTAppendQuad(std::vector<DTOverlayVertex>& vertices,
+                         float x0, float y0, float x1, float y1,
+                         vector_float4 color) {
+    vertices.push_back({{x0, y0}, color});
+    vertices.push_back({{x1, y0}, color});
+    vertices.push_back({{x0, y1}, color});
+    vertices.push_back({{x0, y1}, color});
+    vertices.push_back({{x1, y0}, color});
+    vertices.push_back({{x1, y1}, color});
+}
 
-    // Ear-clipping triangulation for general (convex or concave) polygons
-    std::vector<int> indices(poly.size());
-    for (size_t i = 0; i < poly.size(); ++i) indices[i] = static_cast<int>(i);
-
-    size_t count = indices.size();
-    size_t iterations = 0;
-    const size_t maxIterations = count * count * 2;
-    size_t curr = 0;
-
-    while (count > 3 && iterations < maxIterations) {
-        iterations++;
-        const int prevIdx = indices[(curr + count - 1) % count];
-        const int currIdx = indices[curr % count];
-        const int nextIdx = indices[(curr + 1) % count];
-
-        const vector_float2 a = poly[prevIdx];
-        const vector_float2 b = poly[currIdx];
-        const vector_float2 c = poly[nextIdx];
-
-        if (cross2d(a, b, c) > 0.0001f) {
-            bool isEar = true;
-            for (size_t i = 0; i < count; ++i) {
-                const int testIdx = indices[i];
-                if (testIdx == prevIdx || testIdx == currIdx || testIdx == nextIdx) continue;
-                if (isPointInTriangle(poly[testIdx], a, b, c)) {
-                    isEar = false;
-                    break;
-                }
-            }
-            if (isEar) {
-                addTriangleStyled(out, a, b, c, 1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
-                indices.erase(indices.begin() + (curr % count));
-                count--;
-                continue;
-            }
-        }
-        curr = (curr + 1) % count;
-    }
-
-    if (count == 3) {
-        const int i0 = indices[0], i1 = indices[1], i2 = indices[2];
-        addTriangleStyled(out, poly[i0], poly[i1], poly[i2], 1.0f, 0.0f, fillOpacity, 0.0f, color, hardness);
+static void DTAppendLine(std::vector<DTOverlayVertex>& vertices,
+                         float x0, float y0, float x1, float y1,
+                         float width, vector_float4 color) {
+    if (std::fabs(x1 - x0) < std::fabs(y1 - y0)) {
+        DTAppendQuad(vertices, x0 - width * 0.5f, y0,
+                     x0 + width * 0.5f, y1, color);
+    } else {
+        DTAppendQuad(vertices, x0, y0 - width * 0.5f,
+                     x1, y0 + width * 0.5f, color);
     }
 }
 
-static DTSampledPoint catmullRom(const DTSampledPoint& p0,
-                                 const DTSampledPoint& p1,
-                                 const DTSampledPoint& p2,
-                                 const DTSampledPoint& p3, float t) {
-    const float t2 = t * t;
-    const float t3 = t2 * t;
-    const vector_float2 position = 0.5f * ((2.0f * p1.position) +
-        (-p0.position + p2.position) * t +
-        (2.0f * p0.position - 5.0f * p1.position + 4.0f * p2.position - p3.position) * t2 +
-        (-p0.position + 3.0f * p1.position - 3.0f * p2.position + p3.position) * t3);
-    const float pressure = clamp01(0.5f * ((2.0f * p1.pressure) +
-        (-p0.pressure + p2.pressure) * t +
-        (2.0f * p0.pressure - 5.0f * p1.pressure + 4.0f * p2.pressure - p3.pressure) * t2 +
-        (-p0.pressure + 3.0f * p1.pressure - 3.0f * p2.pressure + p3.pressure) * t3));
-    // Prediction is a confidence value, allowing a soft real-to-tail seam.
-    const float predicted = clamp01(p1.predicted + (p2.predicted - p1.predicted) * t);
-    return {position, pressure, predicted};
-}
-
-static std::vector<DTSampledPoint> smoothedPoints(
-    const std::vector<DTSampledPoint>& input) {
-    if (input.size() < 3) return input;
-    std::vector<DTSampledPoint> output;
-    output.reserve(input.size() * 3);
-    for (size_t i = 0; i + 1 < input.size(); ++i) {
-        const DTSampledPoint& p0 = input[i == 0 ? i : i - 1];
-        const DTSampledPoint& p1 = input[i];
-        const DTSampledPoint& p2 = input[i + 1];
-        const DTSampledPoint& p3 = input[(i + 2 < input.size()) ? i + 2 : i + 1];
-        const float length = simd_length(p2.position - p1.position);
-        const int subdivisions = std::max(1, std::min(12, static_cast<int>(ceilf(length / 3.0f))));
-        for (int step = 0; step < subdivisions; ++step) {
-            const float t = static_cast<float>(step) / static_cast<float>(subdivisions);
-            output.push_back(catmullRom(p0, p1, p2, p3, t));
-        }
+static MetadataValue DTMetadataValue(DTRenderMetadataDescriptor *descriptor) {
+    MetadataValue result;
+    if (!descriptor) return result;
+    result.pageID = descriptor.pageID;
+    result.generation = descriptor.generation;
+    result.activeLayerID = descriptor.activeLayerID;
+    result.pageWidth = std::max(1.0f, descriptor.pageWidth);
+    result.pageHeight = std::max(1.0f, descriptor.pageHeight);
+    result.layers.reserve(descriptor.layers.count);
+    for (DTLayerRenderDescriptor *layer in descriptor.layers) {
+        result.layers.push_back({layer.layerID, (bool)layer.visible,
+                                 DTClamp01(layer.opacity)});
     }
-    output.push_back(input.back());
-    return output;
+    return result;
 }
 
-static std::vector<DTSampledPoint> boundedInputPoints(
-    const std::vector<DTSampledPoint>& input) {
-    return input;
+static bool DTTileVisible(TileAddress tile,
+                          float scale,
+                          float rotation,
+                          Vec2 translation,
+                          Vec2 viewport) {
+    if (scale <= 0.0f || viewport.x <= 0.0f || viewport.y <= 0.0f) return true;
+    const float c = std::cos(rotation);
+    const float s = std::sin(rotation);
+    const Vec2 corners[4] = {{0, 0}, {viewport.x, 0},
+                             {0, viewport.y}, {viewport.x, viewport.y}};
+    Vec2 minimum{INFINITY, INFINITY};
+    Vec2 maximum{-INFINITY, -INFINITY};
+    for (Vec2 corner : corners) {
+        const Vec2 rotated{(corner.x - translation.x) / scale,
+                           (corner.y - translation.y) / scale};
+        const Vec2 document{c * rotated.x + s * rotated.y,
+                            -s * rotated.x + c * rotated.y};
+        minimum.x = std::min(minimum.x, document.x);
+        minimum.y = std::min(minimum.y, document.y);
+        maximum.x = std::max(maximum.x, document.x);
+        maximum.y = std::max(maximum.y, document.y);
+    }
+    const Vec2 origin = tile.origin();
+    const float extent = (float)drafting_table::metal::kTileSize;
+    return origin.x + extent >= minimum.x && origin.x <= maximum.x &&
+           origin.y + extent >= minimum.y && origin.y <= maximum.y;
 }
 
-// This layout intentionally contains only float4 values. float4 alignment is
-// identical in C++/simd and Metal, making the uniform safe for setVertexBytes
-// without relying on compiler-specific padding between scalar fields.
-typedef struct {
-    vector_float4 viewportScaleRotation;
-    vector_float4 translation;
-} DTMetalUniforms;
+} // namespace
 
-// Use only aligned float4 members across the Objective-C++/Metal boundary.
-// The earlier per-vertex float4+scalar layout corrupted the simulator heap
-// during pipeline setup. Color/hardness are constant for one draw call.
-typedef struct {
-    vector_float4 color;
-    vector_float4 style;
-} DTMetalFragmentUniforms;
+@interface DTMetalRenderer () <DTRasterRenderSink> {
+    dispatch_queue_t _renderQueue;
+    std::unique_ptr<RendererState> _state;
 }
-
-@interface DTMetalRenderer ()
 @property(nonatomic, weak) MTKView *view;
 @property(nonatomic, weak) DTEngineBridge *engine;
 @property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
-@property(nonatomic, strong) id<MTLRenderPipelineState> pipeline;
-@property(nonatomic, readwrite) NSUInteger frameCount;
+@property(nonatomic, strong) id<MTLRenderPipelineState> overlayPipeline;
 @end
 
 @implementation DTMetalRenderer
+
+- (NSUInteger)frameCount {
+    return _state ? _state->frameCount.load(std::memory_order_relaxed) : 0;
+}
 
 - (instancetype)initWithView:(MTKView *)view engine:(DTEngineBridge *)engine {
     self = [super init];
     if (!self) return nil;
     _view = view;
     _engine = engine;
-    view.clearColor = MTLClearColorMake(0.102, 0.090, 0.078, 1.0);
-    id<MTLDevice> device = view.device;
-    if (!device) return self;
-    _commandQueue = [device newCommandQueue];
+    _renderQueue = dispatch_queue_create("com.local.draftingtable.renderer", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_set_specific(_renderQueue, kRenderQueueSpecific,
+                                (__bridge void *)self, nullptr);
+    _state = std::make_unique<RendererState>();
 
-    NSError *libraryError = nil;
-    id<MTLLibrary> library = [device newDefaultLibrary];
-    if (!library) return self;
-    id<MTLFunction> vertex = [library newFunctionWithName:@"dt_vertex"];
-    id<MTLFunction> fragment = [library newFunctionWithName:@"dt_fragment"];
-    if (!vertex || !fragment) return self;
-    MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
-    descriptor.vertexFunction = vertex;
-    descriptor.fragmentFunction = fragment;
-    descriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat;
-    descriptor.colorAttachments[0].blendingEnabled = YES;
-    descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-    descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-    descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    _pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&libraryError];
-    if (libraryError) NSLog(@"DraftingTable Metal pipeline: %@", libraryError);
+    view.clearColor = MTLClearColorMake(0.102, 0.090, 0.078, 1.0);
+    view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    view.framebufferOnly = NO;
+    view.paused = YES;
+    view.enableSetNeedsDisplay = YES;
+    view.preferredFramesPerSecond = UIScreen.mainScreen.maximumFramesPerSecond;
+
+    id<MTLDevice> device = view.device;
+    if (device) {
+        _commandQueue = [device newCommandQueue];
+        id<MTLLibrary> library = [device newDefaultLibrary];
+        id<MTLFunction> vertex = [library newFunctionWithName:@"dt_overlay_vertex"];
+        id<MTLFunction> fragment = [library newFunctionWithName:@"dt_overlay_fragment"];
+        if (vertex && fragment) {
+            MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+            descriptor.vertexFunction = vertex;
+            descriptor.fragmentFunction = fragment;
+            descriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat;
+            descriptor.colorAttachments[0].blendingEnabled = YES;
+            descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+            descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+            descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            NSError *error = nil;
+            _overlayPipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            if (!_overlayPipeline) NSLog(@"DraftingTable overlay pipeline: %@", error);
+        }
+    }
+    view.delegate = self;
+    [engine dt_installRenderSink:self];
+    [self enqueueMetadataSnapshot:[engine dt_renderMetadataSnapshot]];
     return self;
+}
+
+- (LayerGPUState *)dt_layerForID:(uint64_t)layerID create:(BOOL)create {
+    if (!layerID || !_state || !self.view.device) return nullptr;
+    auto found = _state->layers.find(layerID);
+    if (found != _state->layers.end()) return &found->second;
+    if (!create) return nullptr;
+    std::string error;
+    auto backend = Backend::create((__bridge void *)self.view.device,
+                                   {kMaxResidentTilesPerLayer}, &error);
+    if (!backend) {
+        NSLog(@"DraftingTable tile backend: %s", error.c_str());
+        return nullptr;
+    }
+    LayerGPUState layer;
+    layer.backend = std::move(backend);
+    return &_state->layers.emplace(layerID, std::move(layer)).first->second;
+}
+
+- (void)dt_requestFrame {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self.view setNeedsDisplay]; });
 }
 
 - (void)updateCanvasScale:(CGFloat)scale
                  rotation:(CGFloat)rotation
              translationX:(CGFloat)x
              translationY:(CGFloat)y {
-    // A zero/negative/NaN scale would invert or collapse the canvas. Keep a
-    // small positive minimum and a practical upper bound for gesture input;
-    // invalid values fall back to identity rather than poisoning the frame.
-    const float requestedScale = static_cast<float>(scale);
-    const float safeScale = std::isfinite(requestedScale)
-        ? std::max(0.01f, std::min(100.0f, requestedScale))
-        : 1.0f;
-    const float safeRotation = finiteOr(static_cast<float>(rotation), 0.0f);
-    const float safeX = finiteOr(static_cast<float>(x), 0.0f);
-    const float safeY = finiteOr(static_cast<float>(y), 0.0f);
-    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
-    gCanvasTransform.scale = safeScale;
-    gCanvasTransform.rotation = safeRotation;
-    gCanvasTransform.translationX = safeX;
-    gCanvasTransform.translationY = safeY;
+    dispatch_async(_renderQueue, ^{
+        self->_state->scale = std::max(0.01f, (float)scale);
+        self->_state->rotation = std::isfinite((double)rotation) ? (float)rotation : 0.0f;
+        self->_state->translationX = std::isfinite((double)x) ? (float)x : 0.0f;
+        self->_state->translationY = std::isfinite((double)y) ? (float)y : 0.0f;
+    });
 }
 
 - (void)updateGridVisible:(BOOL)visible spacing:(CGFloat)spacing {
-    const float requestedSpacing = static_cast<float>(spacing);
-    const float safeSpacing = std::isfinite(requestedSpacing)
-        ? std::max(4.0f, std::min(2048.0f, requestedSpacing)) : 32.0f;
-    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
-    gCanvasTransform.gridVisible = visible;
-    gCanvasTransform.gridSpacing = safeSpacing;
+    dispatch_async(_renderQueue, ^{
+        self->_state->gridVisible = visible;
+        self->_state->gridSpacing = std::clamp((float)spacing, 2.0f, 512.0f);
+    });
 }
 
 - (void)updatePixelGridVisible:(BOOL)visible {
-    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
-    gCanvasTransform.pixelGridVisible = visible;
+    dispatch_async(_renderQueue, ^{ self->_state->pixelGridVisible = visible; });
 }
 
 - (void)updateCenterMode:(BOOL)centerMode {
-    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
-    gCanvasTransform.centerMode = centerMode;
+    dispatch_async(_renderQueue, ^{ self->_state->centerMode = centerMode; });
 }
 
 - (void)updatePaperWidth:(CGFloat)width height:(CGFloat)height {
-    const float safeW = std::isfinite(static_cast<float>(width)) ? std::max(128.0f, static_cast<float>(width)) : 1536.0f;
-    const float safeH = std::isfinite(static_cast<float>(height)) ? std::max(128.0f, static_cast<float>(height)) : 2048.0f;
-    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
-    gCanvasTransform.paperWidth = safeW;
-    gCanvasTransform.paperHeight = safeH;
+    dispatch_async(_renderQueue, ^{
+        self->_state->metadata.pageWidth = std::max(1.0f, (float)width);
+        self->_state->metadata.pageHeight = std::max(1.0f, (float)height);
+    });
 }
 
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
-    (void)view; (void)size;
+- (void)enqueueMetadataSnapshot:(DTRenderMetadataDescriptor *)metadata {
+    MetadataValue value = DTMetadataValue(metadata);
+    dispatch_async(_renderQueue, ^{
+        self->_state->metadata = value;
+        for (const auto& layer : value.layers) [self dt_layerForID:layer.layerID create:YES];
+        [self dt_requestFrame];
+    });
+}
+
+- (void)enqueueBeginStroke:(DTStrokeOperationDescriptor)operation {
+    dispatch_async(_renderQueue, ^{
+        if (self->_state->stroke) return;
+        if (operation.tool != DTToolBrush && operation.tool != DTToolEraser) return;
+        self->_state->stroke.emplace(operation,
+                                     self->_state->metadata.pageWidth,
+                                     self->_state->metadata.pageHeight);
+    });
+}
+
+- (void)enqueueSampleBatch:(DTSampleBatchDescriptor *)batch {
+    NSData *owned = [batch.sampleBytes copy];
+    const uint64_t operationID = batch.operationID;
+    const NSUInteger realCount = batch.realCount;
+    dispatch_async(_renderQueue, ^{
+        if (!self->_state->stroke ||
+            self->_state->stroke->descriptor.operationID != operationID) return;
+        if (owned.length % sizeof(DTPencilSample) != 0) return;
+        const NSUInteger count = owned.length / sizeof(DTPencilSample);
+        if (realCount > count) return;
+
+        std::vector<DTPencilSample> bridgeSamples(count);
+        if (count) std::memcpy(bridgeSamples.data(), owned.bytes, owned.length);
+        std::vector<PencilSample> real;
+        std::vector<PencilSample> predicted;
+        real.reserve(realCount);
+        predicted.reserve(count - realCount);
+        for (NSUInteger index = 0; index < count; ++index) {
+            PencilSample sample = DTCoreSample(bridgeSamples[index]);
+            if (index < realCount) real.push_back(sample);
+            else predicted.push_back(sample);
+        }
+
+        ActiveStroke& stroke = *self->_state->stroke;
+        LayerGPUState *layer = [self dt_layerForID:stroke.descriptor.layerID create:YES];
+        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+        if (!layer || !commandBuffer) return;
+        if (!stroke.transactionBegun) {
+            if (layer->backend->beginTransaction((__bridge void *)commandBuffer,
+                                                  operationID) != BackendResult::ok) return;
+            stroke.transactionBegun = true;
+        }
+        (void)layer->backend->discardPrediction((__bridge void *)commandBuffer);
+
+        std::vector<Dab> emitted;
+        stroke.emitter.setSink([&](const Dab& dab) { emitted.push_back(dab); });
+        stroke.emitter.append(real, predicted);
+        stroke.emitter.setSink({});
+        std::vector<Dab> realDabs;
+        std::vector<Dab> predictedDabs;
+        for (const Dab& dab : emitted) {
+            (dab.predicted ? predictedDabs : realDabs).push_back(dab);
+        }
+
+        PreparedBatches realBatches = DTPrepareBatches(realDabs, stroke.descriptor);
+        if (!realBatches.batches.empty()) {
+            const DabBlendMode mode = stroke.descriptor.tool == DTToolEraser
+                ? DabBlendMode::DestinationOut : DabBlendMode::SourceOver;
+            if (layer->backend->encodeDabs((__bridge void *)commandBuffer,
+                                            realBatches.batches, mode) != BackendResult::ok) {
+                layer->backend->cancelTransaction(operationID);
+                self->_state->stroke.reset();
+                return;
+            }
+            for (TileAddress address : realBatches.addresses) {
+                stroke.touched.insert(address.key());
+                layer->resident.insert(address.key());
+            }
+        }
+
+        PreparedBatches predictedBatches = DTPrepareBatches(predictedDabs, stroke.descriptor);
+        const DabBlendMode mode = stroke.descriptor.tool == DTToolEraser
+            ? DabBlendMode::DestinationOut : DabBlendMode::SourceOver;
+        if (layer->backend->encodePredictedDabs((__bridge void *)commandBuffer,
+                                                 predictedBatches.batches,
+                                                 mode) != BackendResult::ok) {
+            layer->backend->cancelTransaction(operationID);
+            self->_state->stroke.reset();
+            return;
+        }
+        for (TileAddress address : predictedBatches.addresses) layer->resident.insert(address.key());
+        [commandBuffer commit];
+        [self dt_requestFrame];
+    });
+}
+
+- (void)enqueueEstimatedSample:(DTPencilSample)sample
+                         index:(uint64_t)estimationUpdateIndex
+                     operation:(DTOperationIdentifier)operationID {
+    // Estimated-value corrections are retained by UIKit/core for a later
+    // rebake path. v0.1 never mutates an already committed GPU generation.
+    (void)sample;
+    (void)estimationUpdateIndex;
+    (void)operationID;
+}
+
+- (void)enqueueEndStroke:(DTOperationIdentifier)operationID
+               completion:(DTRasterCommitCompletion)completion
+                checkpoint:(DTCheckpointCompletion)checkpoint {
+    DTRasterCommitCompletion commitBlock = [completion copy];
+    DTCheckpointCompletion checkpointBlock = [checkpoint copy];
+    dispatch_async(_renderQueue, ^{
+        if (!self->_state->stroke ||
+            self->_state->stroke->descriptor.operationID != operationID ||
+            !self->_state->stroke->transactionBegun ||
+            self->_state->stroke->touched.empty()) {
+            if (self->_state->stroke && self->_state->stroke->transactionBegun) {
+                LayerGPUState *activeLayer = [self dt_layerForID:
+                    self->_state->stroke->descriptor.layerID create:NO];
+                if (activeLayer) activeLayer->backend->cancelTransaction(operationID);
+            }
+            NSError *error = DTMakeRendererError(10, @"Stroke produced no raster tiles");
+            if (commitBlock) commitBlock(nil, error);
+            if (checkpointBlock) checkpointBlock(nil, error);
+            self->_state->stroke.reset();
+            return;
+        }
+        ActiveStroke stroke = std::move(*self->_state->stroke);
+        self->_state->stroke.reset();
+        LayerGPUState *layer = [self dt_layerForID:stroke.descriptor.layerID create:NO];
+        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+        if (!layer || !commandBuffer) {
+            NSError *error = DTMakeRendererError(11, @"Missing raster layer backend");
+            if (commitBlock) commitBlock(nil, error);
+            if (checkpointBlock) checkpointBlock(nil, error);
+            return;
+        }
+        const uint64_t generation = stroke.descriptor.generation;
+        if (self->_state->nextVersionID == 0 ||
+            self->_state->nextVersionID == UINT64_MAX ||
+            stroke.touched.size() > UINT64_MAX - self->_state->nextVersionID) {
+            layer->backend->cancelTransaction(operationID);
+            NSError *error = DTMakeRendererError(12, @"Tile version ID space is exhausted");
+            if (commitBlock) commitBlock(nil, error);
+            if (checkpointBlock) checkpointBlock(nil, error);
+            return;
+        }
+        std::vector<TileVersionRef> afterRefs;
+        std::unordered_map<std::int64_t, uint64_t> versionIDs;
+        afterRefs.reserve(stroke.touched.size());
+        for (std::int64_t key : stroke.touched) {
+            versionIDs.emplace(key, self->_state->nextVersionID++);
+            afterRefs.push_back({TileAddress::fromKey(key), generation, true});
+        }
+        layer->backend->discardPrediction((__bridge void *)commandBuffer);
+        layer->backend->encodeApronResolve((__bridge void *)commandBuffer);
+        if (layer->backend->encodeCommit((__bridge void *)commandBuffer,
+                                          operationID, generation) != BackendResult::ok) {
+            layer->backend->cancelTransaction(operationID);
+            NSError *error = DTMakeRendererError(12, @"Unable to encode raster commit");
+            if (commitBlock) commitBlock(nil, error);
+            if (checkpointBlock) checkpointBlock(nil, error);
+            return;
+        }
+        std::vector<CheckpointTicket> tickets;
+        NSError *checkpointEncodingError = nil;
+        if (layer->backend->encodeCheckpoint((__bridge void *)commandBuffer,
+                                              afterRefs, tickets) != BackendResult::ok) {
+            checkpointEncodingError = DTMakeRendererError(
+                13, @"Raster commit succeeded but its persistence checkpoint could not be encoded");
+            tickets.clear();
+        }
+        __weak DTMetalRenderer *weakSelf = self;
+        [commandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> completed) {
+            DTMetalRenderer *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            dispatch_async(strongSelf->_renderQueue, ^{
+                LayerGPUState *finishedLayer = [strongSelf dt_layerForID:stroke.descriptor.layerID create:NO];
+                auto versions = finishedLayer ? finishedLayer->backend->takeCompletedCommit(operationID)
+                                              : std::nullopt;
+                if (!versions || !versions->succeeded) {
+                    NSError *error = DTMakeRendererError(14, @"Metal rejected raster commit");
+                    if (commitBlock) commitBlock(nil, error);
+                    if (checkpointBlock) checkpointBlock(nil, error);
+                    return;
+                }
+                NSMutableArray<DTTileCommitDescriptor *> *commitTiles = [NSMutableArray array];
+                for (const TileVersionRef& after : versions->after.tiles) {
+                    const auto before = std::find_if(
+                        versions->before.tiles.begin(), versions->before.tiles.end(),
+                        [&](const TileVersionRef& value) { return value.tile == after.tile; });
+                    const BOOL beforeExists = before != versions->before.tiles.end() && before->exists;
+                    const uint64_t beforeGeneration = beforeExists ? before->generation : 0;
+                    [commitTiles addObject:[[DTTileCommitDescriptor alloc]
+                        initWithLayerID:stroke.descriptor.layerID
+                        coordinate:(DTTileCoordinate){after.tile.x, after.tile.y}
+                        beforeExists:beforeExists
+                        beforeGeneration:beforeGeneration
+                        afterExists:after.exists
+                        afterGeneration:after.exists ? generation : 0
+                        afterVersionID:after.exists ? versionIDs.at(after.tile.key()) : 0]];
+                }
+                DTRasterCommitDescriptor *commit = [[DTRasterCommitDescriptor alloc]
+                    initWithOperationID:operationID generation:generation
+                    pageID:stroke.descriptor.pageID tiles:commitTiles];
+
+                NSMutableArray<DTTileCheckpointPayload *> *payloads = [NSMutableArray array];
+                NSError *checkpointError = checkpointEncodingError;
+                for (NSUInteger index = 0; index < tickets.size(); ++index) {
+                    std::vector<uint8_t> bytes(kTileBytes);
+                    if (finishedLayer->backend->readCheckpoint(tickets[index], bytes) != BackendResult::ok) {
+                        checkpointError = DTMakeRendererError(15, @"Tile checkpoint was not readable after completion");
+                        break;
+                    }
+                    NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+                    const TileAddress address = tickets[index].tile;
+                    [payloads addObject:[[DTTileCheckpointPayload alloc]
+                        initWithPageID:stroke.descriptor.pageID
+                        layerID:stroke.descriptor.layerID tileX:address.x tileY:address.y
+                        exists:YES versionID:versionIDs.at(address.key()) generation:generation
+                        premultipliedRGBA8:data]];
+                    finishedLayer->backend->releaseCheckpoint(tickets[index]);
+                }
+                if (commitBlock) commitBlock(commit, nil);
+                if (checkpointBlock) {
+                    if (checkpointError) checkpointBlock(nil, checkpointError);
+                    else checkpointBlock([[DTCheckpointPayloadBatch alloc]
+                        initWithOperationID:operationID generation:generation tiles:payloads], nil);
+                }
+                [strongSelf dt_requestFrame];
+            });
+        }];
+        [commandBuffer commit];
+    });
+}
+
+- (void)enqueueCancelStroke:(DTOperationIdentifier)operationID
+                  completion:(DTRenderCommandCompletion)completion {
+    DTRenderCommandCompletion block = [completion copy];
+    dispatch_async(_renderQueue, ^{
+        NSError *error = nil;
+        if (self->_state->stroke && self->_state->stroke->descriptor.operationID == operationID) {
+            LayerGPUState *layer = [self dt_layerForID:self->_state->stroke->descriptor.layerID create:NO];
+            if (layer && self->_state->stroke->transactionBegun &&
+                layer->backend->cancelTransaction(operationID) != BackendResult::ok) {
+                error = DTMakeRendererError(20, @"Unable to cancel raster transaction");
+            }
+            self->_state->stroke.reset();
+        }
+        if (block) block(error);
+        [self dt_requestFrame];
+    });
+}
+
+- (void)enqueueRestore:(DTRestoreOperationDescriptor *)restore
+             completion:(DTRasterCommitCompletion)completion
+              checkpoint:(DTCheckpointCompletion)checkpoint {
+    const uint64_t operationID = restore.operationID;
+    const uint64_t generation = restore.generation;
+    const uint64_t pageID = restore.pageID;
+    std::vector<RestoreItemValue> values;
+    values.reserve(restore.tiles.count);
+    for (DTTileRestoreDescriptor *tile in restore.tiles) {
+        values.push_back({tile.layerID,
+                          {tile.coordinate.x, tile.coordinate.y},
+                          (bool)tile.sourceExists, tile.sourceGeneration,
+                          (bool)tile.targetExists, tile.targetVersionID});
+    }
+    DTRasterCommitCompletion commitBlock = [completion copy];
+    DTCheckpointCompletion checkpointBlock = [checkpoint copy];
+    dispatch_async(_renderQueue, ^{
+        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+        if (!commandBuffer || values.empty()) {
+            NSError *error = DTMakeRendererError(30, @"Undo restore has no tiles");
+            if (commitBlock) commitBlock(nil, error);
+            if (checkpointBlock) checkpointBlock(nil, error);
+            return;
+        }
+        std::unordered_map<uint64_t, RestoreLayerWork> grouped;
+        for (const auto& value : values) {
+            if (value.targetExists && value.targetVersionID < UINT64_MAX) {
+                self->_state->nextVersionID = std::max(
+                    self->_state->nextVersionID, value.targetVersionID + 1);
+            }
+            auto& work = grouped[value.layerID];
+            work.layerID = value.layerID;
+            work.items.push_back(value);
+        }
+        NSError *encodingError = nil;
+        for (auto& entry : grouped) {
+            LayerGPUState *layer = [self dt_layerForID:entry.first create:YES];
+            if (!layer) { encodingError = DTMakeRendererError(31, @"Undo layer is unavailable"); break; }
+            std::vector<TileAddress> addresses;
+            drafting_table::metal::TileVersionSet sources;
+            sources.operationId = operationID;
+            for (const auto& item : entry.second.items) {
+                addresses.push_back(item.tile);
+                sources.tiles.push_back({item.tile, item.sourceGeneration, item.sourceExists});
+            }
+            if (layer->backend->beginTransaction((__bridge void *)commandBuffer,
+                                                  operationID, addresses) != BackendResult::ok ||
+                layer->backend->encodeRestoreVersions((__bridge void *)commandBuffer,
+                                                       sources) != BackendResult::ok ||
+                layer->backend->encodeApronResolve((__bridge void *)commandBuffer) != BackendResult::ok ||
+                layer->backend->encodeCommit((__bridge void *)commandBuffer,
+                                              operationID, generation) != BackendResult::ok) {
+                layer->backend->cancelTransaction(operationID);
+                encodingError = DTMakeRendererError(32, @"Unable to encode undo restore");
+                break;
+            }
+            std::vector<TileVersionRef> materialized;
+            for (const auto& item : entry.second.items) {
+                if (item.targetExists) materialized.push_back({item.tile, generation, true});
+            }
+            if (!materialized.empty() &&
+                layer->backend->encodeCheckpoint((__bridge void *)commandBuffer,
+                                                  materialized,
+                                                  entry.second.tickets) != BackendResult::ok) {
+                encodingError = DTMakeRendererError(33, @"Unable to checkpoint undo restore");
+                break;
+            }
+        }
+        if (encodingError) {
+            for (auto& entry : grouped) if (LayerGPUState *layer = [self dt_layerForID:entry.first create:NO]) layer->backend->cancelTransaction(operationID);
+            if (commitBlock) commitBlock(nil, encodingError);
+            if (checkpointBlock) checkpointBlock(nil, encodingError);
+            return;
+        }
+        __weak DTMetalRenderer *weakSelf = self;
+        [commandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> completed) {
+            DTMetalRenderer *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            dispatch_async(strongSelf->_renderQueue, ^{
+                NSMutableArray<DTTileCommitDescriptor *> *commitTiles = [NSMutableArray array];
+                NSMutableArray<DTTileCheckpointPayload *> *payloads = [NSMutableArray array];
+                NSError *error = nil;
+                for (auto& entry : grouped) {
+                    LayerGPUState *layer = [strongSelf dt_layerForID:entry.first create:NO];
+                    auto result = layer ? layer->backend->takeCompletedCommit(operationID) : std::nullopt;
+                    if (!result || !result->succeeded) { error = DTMakeRendererError(34, @"Metal undo restore failed"); break; }
+                    for (const auto& item : entry.second.items) {
+                        const auto before = std::find_if(result->before.tiles.begin(), result->before.tiles.end(), [&](const TileVersionRef& ref){ return ref.tile == item.tile; });
+                        const BOOL beforeExists = before != result->before.tiles.end() && before->exists;
+                        [commitTiles addObject:[[DTTileCommitDescriptor alloc]
+                            initWithLayerID:item.layerID
+                            coordinate:(DTTileCoordinate){item.tile.x, item.tile.y}
+                            beforeExists:beforeExists
+                            beforeGeneration:beforeExists ? before->generation : 0
+                            afterExists:item.targetExists
+                            afterGeneration:item.targetExists ? generation : 0
+                            afterVersionID:item.targetExists ? item.targetVersionID : 0]];
+                        if (item.targetExists) layer->resident.insert(item.tile.key());
+                        else layer->resident.erase(item.tile.key());
+                    }
+                    NSUInteger ticketIndex = 0;
+                    for (const auto& item : entry.second.items) {
+                        if (!item.targetExists) {
+                            [payloads addObject:[[DTTileCheckpointPayload alloc]
+                                initWithPageID:pageID layerID:item.layerID
+                                tileX:item.tile.x tileY:item.tile.y exists:NO
+                                versionID:0 generation:generation
+                                premultipliedRGBA8:[NSData data]]];
+                            continue;
+                        }
+                        if (ticketIndex >= entry.second.tickets.size()) { error = DTMakeRendererError(35, @"Undo checkpoint ticket mismatch"); break; }
+                        const CheckpointTicket ticket = entry.second.tickets[ticketIndex++];
+                        std::vector<uint8_t> bytes(kTileBytes);
+                        if (layer->backend->readCheckpoint(ticket, bytes) != BackendResult::ok) { error = DTMakeRendererError(36, @"Undo checkpoint is unreadable"); break; }
+                        NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+                        [payloads addObject:[[DTTileCheckpointPayload alloc]
+                            initWithPageID:pageID layerID:item.layerID
+                            tileX:item.tile.x tileY:item.tile.y exists:YES
+                            versionID:item.targetVersionID generation:generation
+                            premultipliedRGBA8:data]];
+                        layer->backend->releaseCheckpoint(ticket);
+                    }
+                    if (error) break;
+                }
+                if (error) {
+                    if (commitBlock) commitBlock(nil, error);
+                    if (checkpointBlock) checkpointBlock(nil, error);
+                    return;
+                }
+                if (commitBlock) commitBlock([[DTRasterCommitDescriptor alloc]
+                    initWithOperationID:operationID generation:generation
+                    pageID:pageID tiles:commitTiles], nil);
+                if (checkpointBlock) checkpointBlock([[DTCheckpointPayloadBatch alloc]
+                    initWithOperationID:operationID generation:generation tiles:payloads], nil);
+                [strongSelf dt_requestFrame];
+            });
+        }];
+        [commandBuffer commit];
+    });
+}
+
+- (void)enqueueDocumentLoad:(DTDocumentLoadDescriptor *)load
+                  completion:(DTRenderCommandCompletion)completion {
+    DTRenderMetadataDescriptor *metadata = load.metadata;
+    NSArray<DTTileUploadDescriptor *> *uploads = [load.tiles copy];
+    DTRenderCommandCompletion block = [completion copy];
+    dispatch_async(_renderQueue, ^{
+        self->_state->stroke.reset();
+        self->_state->layers.clear();
+        self->_state->nextVersionID = 1;
+        self->_state->metadata = DTMetadataValue(metadata);
+        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+        NSError *error = nil;
+        for (const auto& layerMetadata : self->_state->metadata.layers) {
+            if (![self dt_layerForID:layerMetadata.layerID create:YES]) {
+                error = DTMakeRendererError(40, @"Unable to create package layer backend");
+                break;
+            }
+        }
+        if (!commandBuffer) error = DTMakeRendererError(41, @"Unable to create package upload command buffer");
+        if (!error) {
+            for (DTTileUploadDescriptor *upload in uploads) {
+                if (upload.versionID < UINT64_MAX) {
+                    self->_state->nextVersionID = std::max(
+                        self->_state->nextVersionID, upload.versionID + 1);
+                }
+                LayerGPUState *layer = [self dt_layerForID:upload.layerID create:NO];
+                NSData *bytes = upload.premultipliedRGBA8;
+                if (!layer || bytes.length != kTileBytes ||
+                    layer->backend->uploadPersistedTileBytes(
+                        (__bridge void *)commandBuffer,
+                        {upload.coordinate.x, upload.coordinate.y}, upload.generation,
+                        std::span<const uint8_t>((const uint8_t *)bytes.bytes,
+                                                 bytes.length)) != BackendResult::ok) {
+                    error = DTMakeRendererError(42, @"Package tile upload failed");
+                    break;
+                }
+                layer->resident.insert(TileAddress{upload.coordinate.x, upload.coordinate.y}.key());
+            }
+        }
+        if (error) { if (block) block(error); return; }
+        __weak DTMetalRenderer *weakSelf = self;
+        [commandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> completed) {
+            DTMetalRenderer *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            dispatch_async(strongSelf->_renderQueue, ^{
+                NSError *validationError = nil;
+                for (DTTileUploadDescriptor *upload in uploads) {
+                    LayerGPUState *layer = [strongSelf dt_layerForID:upload.layerID create:NO];
+                    auto state = layer ? layer->backend->tileState({upload.coordinate.x, upload.coordinate.y}) : std::nullopt;
+                    if (!state || state->contentGeneration != upload.generation) {
+                        validationError = DTMakeRendererError(43, @"Package tile upload did not complete");
+                        break;
+                    }
+                }
+                if (block) block(validationError);
+                [strongSelf dt_requestFrame];
+            });
+        }];
+        [commandBuffer commit];
+    });
+}
+
+- (void)enqueueReleaseVersions:(NSArray<DTTileVersionDescriptor *> *)versions {
+    NSArray<DTTileVersionDescriptor *> *owned = [versions copy];
+    dispatch_async(_renderQueue, ^{
+        std::unordered_map<uint64_t, std::vector<TileVersionRef>> grouped;
+        for (DTTileVersionDescriptor *version in owned) {
+            if (version.exists) grouped[version.layerID].push_back(
+                {{version.coordinate.x, version.coordinate.y}, version.generation, true});
+        }
+        for (auto& entry : grouped) {
+            if (LayerGPUState *layer = [self dt_layerForID:entry.first create:NO]) {
+                layer->backend->releaseHistoricalVersions(entry.second);
+            }
+        }
+    });
 }
 
 - (void)drawInMTKView:(MTKView *)view {
-    @autoreleasepool {
-    self.frameCount += 1;
-    // v0.7.2: never block launch on a zero-size first layout and never let
-    // one pathological retained document exhaust the device heap in a single
-    // frame. Zero-size views can occur during scene connection; oversized
-    // geometry previously ran at display refresh until the watchdog killed
-    // the app after the beige launch screen.
-    if (view.bounds.size.width < 1.0 || view.bounds.size.height < 1.0) return;
     id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!drawable || !self.commandQueue) return;
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
-    if (!pass) return;
-    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.102, 0.090, 0.078, 1.0);
-    id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
-    if (!commandBuffer) return;
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
-    if (!encoder) return;
-    if (!self.pipeline) {
-        [encoder endEncoding];
+    if (!drawable || !pass || !self.commandQueue) return;
+    dispatch_block_t encodeFrame = ^{
+        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+        if (!commandBuffer) return;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = view.clearColor;
+
+        const CGSize drawableSize = view.drawableSize;
+        const float displayScale = view.bounds.size.width > 0
+            ? (float)(drawableSize.width / view.bounds.size.width) : 1.0f;
+        const float renderScale = self->_state->scale * displayScale;
+        const float width = self->_state->metadata.pageWidth;
+        const float height = self->_state->metadata.pageHeight;
+
+        std::vector<DTOverlayVertex> overlay;
+        DTAppendQuad(overlay, 0.0f, 0.0f, width, height,
+                     (vector_float4){0.965f, 0.941f, 0.875f, 1.0f});
+        if (self->_state->gridVisible) {
+            const float spacing = std::max(2.0f, self->_state->gridSpacing);
+            const float lineWidth = std::max(0.35f, 0.75f / std::max(self->_state->scale, 0.01f));
+            const vector_float4 grid = {0.16f * 0.22f, 0.20f * 0.22f,
+                                        0.22f * 0.22f, 0.22f};
+            NSUInteger count = 0;
+            for (float x = 0.0f; x <= width && count < 1024; x += spacing, ++count)
+                DTAppendLine(overlay, x, 0.0f, x, height, lineWidth, grid);
+            count = 0;
+            for (float y = 0.0f; y <= height && count < 1024; y += spacing, ++count)
+                DTAppendLine(overlay, 0.0f, y, width, y, lineWidth, grid);
+        }
+        if (self->_state->centerMode) {
+            const float lineWidth = std::max(0.5f, 1.0f / std::max(self->_state->scale, 0.01f));
+            const vector_float4 center = {0.32f, 0.10f, 0.08f, 0.42f};
+            DTAppendLine(overlay, width * 0.5f, 0.0f, width * 0.5f, height,
+                         lineWidth, center);
+            DTAppendLine(overlay, 0.0f, height * 0.5f, width, height * 0.5f,
+                         lineWidth, center);
+        }
+
+        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (encoder) {
+            if (self.overlayPipeline && !overlay.empty()) {
+                id<MTLBuffer> buffer = [view.device newBufferWithBytes:overlay.data()
+                                                                length:overlay.size() * sizeof(DTOverlayVertex)
+                                                               options:MTLResourceStorageModeShared];
+                DTOverlayUniforms uniforms{{(float)drawableSize.width, (float)drawableSize.height},
+                                           renderScale, self->_state->rotation,
+                                           {self->_state->translationX * displayScale,
+                                            self->_state->translationY * displayScale},
+                                           {0.0f, 0.0f}};
+                [encoder setRenderPipelineState:self.overlayPipeline];
+                [encoder setVertexBuffer:buffer offset:0 atIndex:0];
+                [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                             vertexCount:overlay.size()];
+            }
+            [encoder endEncoding];
+        }
+
+        for (const LayerMetadataValue& metadata : self->_state->metadata.layers) {
+            if (!metadata.visible || metadata.opacity <= 0.0f) continue;
+            LayerGPUState *layer = [self dt_layerForID:metadata.layerID create:NO];
+            if (!layer || layer->resident.empty()) continue;
+            std::vector<TileAddress> visible;
+            visible.reserve(layer->resident.size());
+            const Vec2 viewport{(float)drawableSize.width, (float)drawableSize.height};
+            const Vec2 translation{self->_state->translationX * displayScale,
+                                   self->_state->translationY * displayScale};
+            for (std::int64_t key : layer->resident) {
+                const TileAddress address = TileAddress::fromKey(key);
+                if (DTTileVisible(address, renderScale, self->_state->rotation,
+                                  translation, viewport)) {
+                    visible.push_back(address);
+                }
+            }
+            if (visible.empty()) continue;
+            drafting_table::metal::CompositeParameters parameters;
+            parameters.scale = renderScale;
+            parameters.rotationRadians = self->_state->rotation;
+            parameters.translation = translation;
+            parameters.viewportSize = viewport;
+            parameters.opacity = metadata.opacity;
+            parameters.clipMin = {0.0f, 0.0f};
+            parameters.clipMax = {width, height};
+            parameters.clipEnabled = true;
+            layer->backend->encodeComposite((__bridge void *)commandBuffer,
+                                             (__bridge void *)drawable.texture,
+                                             visible, parameters);
+        }
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];
-        return;
-    }
-    [encoder setRenderPipelineState:self.pipeline];
-    float transformScale = 1.0f;
-    float transformRotation = 0.0f;
-    float transformX = 0.0f;
-    float transformY = 0.0f;
-    bool gridVisible = false;
-    float gridSpacing = 32.0f;
-    bool pixelGridVisible = false;
-    float paperWidth = 1536.0f;
-    float paperHeight = 2048.0f;
-    {
-        std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
-        transformScale = gCanvasTransform.scale;
-        transformRotation = gCanvasTransform.rotation;
-        transformX = gCanvasTransform.translationX;
-        transformY = gCanvasTransform.translationY;
-        gridVisible = gCanvasTransform.gridVisible;
-        gridSpacing = gCanvasTransform.gridSpacing;
-        pixelGridVisible = gCanvasTransform.pixelGridVisible;
-        paperWidth = gCanvasTransform.paperWidth;
-        paperHeight = gCanvasTransform.paperHeight;
-    }
-    DTMetalUniforms uniforms{};
-    uniforms.viewportScaleRotation = (vector_float4){
-        (float)view.bounds.size.width,
-        (float)view.bounds.size.height,
-        transformScale,
-        transformRotation
+        self->_state->frameCount.fetch_add(1, std::memory_order_relaxed);
     };
-    uniforms.translation = (vector_float4){
-        transformX,
-        transformY,
-        0.0f,
-        0.0f
-    };
-    [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-
-    // Render the paper sheet with shadow and border in document space before strokes.
-    {
-        std::vector<DTMetalVertex> paperGeometry;
-        paperGeometry.reserve(30);
-        // Soft drop shadow beneath paper sheet
-        const vector_float4 shadowColor = (vector_float4){0.04f, 0.03f, 0.02f, 0.40f};
-        addQuad(paperGeometry, (vector_float2){-3.0f, 4.0f}, (vector_float2){paperWidth + 8.0f, paperHeight + 10.0f},
-                shadowColor, 0.40f);
-        // Paper sheet surface
-        const vector_float4 paperColor = (vector_float4){0.965f, 0.945f, 0.900f, 1.0f};
-        addQuad(paperGeometry, (vector_float2){0.0f, 0.0f}, (vector_float2){paperWidth, paperHeight},
-                paperColor, 1.0f);
-        // Subtle paper border outline
-        const vector_float4 borderColor = (vector_float4){0.851f, 0.812f, 0.722f, 0.85f};
-        const float borderWidth = std::max(0.6f, 1.0f / std::max(0.01f, transformScale));
-        addSegmentStyled(paperGeometry, (vector_float2){0.0f, 0.0f}, (vector_float2){paperWidth, 0.0f}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
-        addSegmentStyled(paperGeometry, (vector_float2){paperWidth, 0.0f}, (vector_float2){paperWidth, paperHeight}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
-        addSegmentStyled(paperGeometry, (vector_float2){paperWidth, paperHeight}, (vector_float2){0.0f, paperHeight}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
-        addSegmentStyled(paperGeometry, (vector_float2){0.0f, paperHeight}, (vector_float2){0.0f, 0.0f}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
-
-        if (!paperGeometry.empty()) {
-            id<MTLBuffer> paperBuffer = [view.device newBufferWithBytes:paperGeometry.data()
-                                                                  length:sizeof(DTMetalVertex) * paperGeometry.size()
-                                                                 options:MTLResourceStorageModeShared];
-            if (paperBuffer) {
-                DTMetalFragmentUniforms fragmentUniforms{};
-                fragmentUniforms.color = paperColor;
-                fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
-                [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                [encoder setVertexBuffer:paperBuffer offset:0 atIndex:0];
-                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:paperGeometry.size()];
-            }
-        }
+    if (dispatch_get_specific(kRenderQueueSpecific) == (__bridge void *)self) {
+        encodeFrame();
+    } else {
+        dispatch_sync(_renderQueue, encodeFrame);
     }
+}
 
-    NSArray<DTRenderStroke *> *strokes = nil;
-    @try {
-        strokes = [self.engine renderableStrokes];
-    } @catch (NSException *exception) {
-        NSLog(@"DraftingTable snapshot failed: %@", exception);
-        strokes = @[];
-    }
-    // Per-frame ceiling scaled for modern Metal workloads.
-    // The active in-progress stroke is always guaranteed to render so the pen never drops input.
-    size_t frameVertexBudget = 5000000;
-    size_t frameVerticesUsed = 0;
-    const size_t totalStrokeCount = strokes.count;
-    for (size_t sIdx = 0; sIdx < totalStrokeCount; ++sIdx) {
-        DTRenderStroke *stroke = strokes[sIdx];
-        const BOOL isLastStroke = (sIdx + 1 == totalStrokeCount);
-        if (frameVerticesUsed >= frameVertexBudget && !isLastStroke) break;
-        NSArray<NSValue *> *strokeValues = stroke.points;
-        if (strokeValues.count == 0) continue;
-        const uint32_t tool = static_cast<uint32_t>(stroke.tool);
-        const BOOL eraser = tool == 1u;
-        const float opacity = clamp01(stroke.brushOpacity);
-        const float brushSize = std::max(0.5f, static_cast<float>(stroke.brushSize));
-        const float hardness = clamp01(static_cast<float>(stroke.brushHardness));
-        const vector_float4 strokeColor = colorFromRGBA(static_cast<uint32_t>(stroke.brushColorRGBA));
-        std::vector<DTSampledPoint> points;
-        points.reserve(strokeValues.count);
-        for (NSValue *value in strokeValues) {
-            DTRenderPoint point = {0, 0, 1, 0};
-            [value getValue:&point size:sizeof(point)];
-            points.push_back({(vector_float2){point.x, point.y},
-                              clamp01(fmaxf(0.1f, point.pressure)),
-                              point.predicted ? 1.0f : 0.0f});
-        }
-        const float eraseFlag = eraser ? 1.0f : 0.0f;
-        // Shape tools use first/last real samples, excluding predicted tail
-        // points so a transient prediction never reaches the retained result.
-        if (tool >= 2u && tool <= 5u) {
-            size_t firstReal = 0;
-            while (firstReal + 1 < points.size() && points[firstReal].predicted > 0.5f) ++firstReal;
-            size_t lastReal = points.size() - 1;
-            while (lastReal > firstReal && points[lastReal].predicted > 0.5f) --lastReal;
-            const float radius = fmaxf(0.5f, brushSize * 0.5f);
-            const bool centerModeActive = isLastStroke && self.engine.isStrokeInProgress && gCanvasTransform.centerMode;
-            std::vector<DTMetalVertex> geometry;
-            addShapeOutline(geometry, tool, points[firstReal].position, points[lastReal].position,
-                            radius, opacity * (0.22f + 0.78f * hardness), strokeColor, hardness, centerModeActive);
-            if (!geometry.empty()) {
-                if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
-                    const size_t remaining = frameVertexBudget - frameVerticesUsed;
-                    geometry.resize((remaining / 3) * 3);
-                }
-                id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
-                                                                      length:sizeof(DTMetalVertex) * geometry.size()
-                                                                     options:MTLResourceStorageModeShared];
-                if (buffer && !geometry.empty()) {
-                    DTMetalFragmentUniforms fragmentUniforms{};
-                    fragmentUniforms.color = strokeColor;
-                    fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
-                    [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                    [encoder setVertexBuffer:buffer offset:0 atIndex:0];
-                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
-                    frameVerticesUsed += geometry.size();
-                }
-            }
-            continue;
-        }
-
-        if (tool == 7u) { // bucket: solid polygon fill
-            if (points.size() >= 3) {
-                std::vector<DTMetalVertex> geometry;
-                geometry.reserve(points.size() * 3);
-                addPolygonFill(geometry, points, opacity, strokeColor, hardness);
-                if (!geometry.empty()) {
-                    if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
-                        const size_t remaining = frameVertexBudget - frameVerticesUsed;
-                        if (remaining >= 3) {
-                            geometry.resize((remaining / 3) * 3);
-                        } else {
-                            break;
-                        }
-                    }
-                    id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
-                                                                    length:sizeof(DTMetalVertex) * geometry.size()
-                                                                   options:MTLResourceStorageModeShared];
-                    if (buffer) {
-                        DTMetalFragmentUniforms fragmentUniforms{};
-                        fragmentUniforms.color = strokeColor;
-                        fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
-                        [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                        [encoder setVertexBuffer:buffer offset:0 atIndex:0];
-                        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
-                        frameVerticesUsed += geometry.size();
-                    }
-                }
-            }
-            continue;
-        }
-
-        points = smoothedPoints(boundedInputPoints(points));
-        const vector_float4 color = eraser
-            ? (vector_float4){0.965f, 0.945f, 0.900f, 1.0f} : strokeColor;
-        // A low-hardness fringe plus a full-opacity core gives the control a
-        // visible effect while retaining the existing smooth curve geometry.
-        const float fringeRadiusScale = 1.08f + 0.24f * (1.0f - hardness);
-        const float fringeOpacity = opacity * (0.12f + 0.30f * (1.0f - hardness));
-        for (int pass = 0; pass < (eraser ? 1 : 2); ++pass) {
-            if (frameVerticesUsed >= frameVertexBudget && !isLastStroke) break;
-            const bool fringe = pass == 0 && !eraser;
-            const float passScale = fringe ? fringeRadiusScale : 1.0f;
-            const float passOpacity = fringe ? fringeOpacity : opacity;
-            std::vector<DTMetalVertex> geometry;
-            geometry.reserve(points.size() * 28);
-            if (tool == 6u && !fringe && points.size() >= 3) {
-                addPolygonFill(geometry, points, passOpacity, color, hardness);
-            }
-            if (points.size() == 1) {
-                addRoundCapStyled(geometry, points[0].position,
-                                  strokeRadius(points[0].pressure, brushSize) * passScale,
-                                  points[0].pressure, points[0].predicted, passOpacity,
-                                  eraseFlag, color, hardness);
-            } else {
-                for (size_t index = 1; index < points.size(); ++index) {
-                    const DTSampledPoint& p0 = points[index - 1];
-                    const DTSampledPoint& p1 = points[index];
-                    const vector_float2 delta = p1.position - p0.position;
-                    const float length = simd_length(delta);
-                    if (length < 0.001f) continue;
-                    const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
-                    const float r0 = strokeRadius(p0.pressure, brushSize) * passScale;
-                    const float r1 = strokeRadius(p1.pressure, brushSize) * passScale;
-                    const vector_float2 a0 = p0.position + normal * r0;
-                    const vector_float2 b0 = p0.position - normal * r0;
-                    const vector_float2 a1 = p1.position + normal * r1;
-                    const vector_float2 b1 = p1.position - normal * r1;
-                    addTriangleStyled(geometry, a0, b0, a1, p0.pressure, p0.predicted,
-                                      passOpacity, eraseFlag, color, hardness);
-                    addTriangleStyled(geometry, a1, b0, b1, p1.pressure, p1.predicted,
-                                      passOpacity, eraseFlag, color, hardness);
-                }
-                if (tool == 6u && points.size() >= 3) {
-                    const DTSampledPoint& p0 = points.back();
-                    const DTSampledPoint& p1 = points.front();
-                    const vector_float2 delta = p1.position - p0.position;
-                    const float length = simd_length(delta);
-                    if (length >= 0.001f) {
-                        const vector_float2 normal = (vector_float2){-delta.y / length, delta.x / length};
-                        const float r0 = strokeRadius(p0.pressure, brushSize) * passScale;
-                        const float r1 = strokeRadius(p1.pressure, brushSize) * passScale;
-                        const vector_float2 a0 = p0.position + normal * r0;
-                        const vector_float2 b0 = p0.position - normal * r0;
-                        const vector_float2 a1 = p1.position + normal * r1;
-                        const vector_float2 b1 = p1.position - normal * r1;
-                        addTriangleStyled(geometry, a0, b0, a1, p0.pressure, p0.predicted,
-                                          passOpacity, eraseFlag, color, hardness);
-                        addTriangleStyled(geometry, a1, b0, b1, p1.pressure, p1.predicted,
-                                          passOpacity, eraseFlag, color, hardness);
-                    }
-                }
-                for (size_t index = 0; index < points.size(); ++index) {
-                    // Round joins at the exact local width: stamps overlap
-                    // into a smooth envelope with no wedge gaps on tight
-                    // curves and no beading (v0.9.0 dots came from sparse
-                    // oversized fans). Ends keep full caps; single-point
-                    // strokes render as a dot above.
-                    const DTSampledPoint& point = points[index];
-                    const float joinRadius =
-                        strokeRadius(point.pressure, brushSize) * passScale;
-                    if (tool != 6u && (index == 0 || index + 1 == points.size())) {
-                        addRoundCapStyled(geometry, point.position, joinRadius,
-                                          point.pressure, point.predicted, passOpacity,
-                                          eraseFlag, color, hardness);
-                    } else {
-                        addJoinFan(geometry, point.position, joinRadius,
-                                   point.pressure, point.predicted, passOpacity,
-                                   eraseFlag, color, hardness);
-                    }
-                }
-            }
-            if (geometry.empty()) continue;
-            if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
-                const size_t remaining = frameVertexBudget - frameVerticesUsed;
-                if (remaining < 3) break;
-                geometry.resize((remaining / 3) * 3);
-            }
-            if (geometry.empty()) continue;
-            id<MTLBuffer> buffer = [view.device newBufferWithBytes:geometry.data()
-                                                              length:sizeof(DTMetalVertex) * geometry.size()
-                                                             options:MTLResourceStorageModeShared];
-            if (buffer) {
-                DTMetalFragmentUniforms fragmentUniforms{};
-                fragmentUniforms.color = color;
-                fragmentUniforms.style = (vector_float4){hardness, 0, 0, 0};
-                [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                [encoder setVertexBuffer:buffer offset:0 atIndex:0];
-                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:geometry.size()];
-                frameVerticesUsed += geometry.size();
-            }
-        }
-    }
-
-    // Draw document grid AFTER all strokes, strictly bounded to the paper sheet [0, paperWidth] x [0, paperHeight].
-    // Because grid is drawn after strokes, eraser strokes (which restore paper surface) never erase or cut the grid.
-    if (gridVisible) {
-        const float invScale = 1.0f / std::max(0.01f, transformScale);
-        const float viewDiag = hypotf(static_cast<float>(view.bounds.size.width),
-                                      static_cast<float>(view.bounds.size.height)) * invScale * 0.5f + gridSpacing * 2.0f;
-        const float cosR = cosf(transformRotation);
-        const float sinR = sinf(transformRotation);
-        const float viewCenterX = static_cast<float>(view.bounds.size.width) * 0.5f;
-        const float viewCenterY = static_cast<float>(view.bounds.size.height) * 0.5f;
-        const float transX = (viewCenterX - transformX) * invScale;
-        const float transY = (viewCenterY - transformY) * invScale;
-        const float docCenterX = transX * cosR + transY * sinR;
-        const float docCenterY = -transX * sinR + transY * cosR;
-
-        const float visMinX = std::max(0.0f, docCenterX - viewDiag);
-        const float visMaxX = std::min(paperWidth, docCenterX + viewDiag);
-        const float visMinY = std::max(0.0f, docCenterY - viewDiag);
-        const float visMaxY = std::min(paperHeight, docCenterY + viewDiag);
-
-        if (visMinX <= visMaxX && visMinY <= visMaxY) {
-            const vector_float4 gridColor = (vector_float4){0.52f, 0.56f, 0.55f, 0.28f};
-            const float width = std::max(0.35f, 0.75f * invScale);
-            std::vector<DTMetalVertex> grid;
-            const float startX = std::max(0.0f, floorf(visMinX / gridSpacing) * gridSpacing);
-            const float endX = std::min(paperWidth, ceilf(visMaxX / gridSpacing) * gridSpacing);
-            const float startY = std::max(0.0f, floorf(visMinY / gridSpacing) * gridSpacing);
-            const float endY = std::min(paperHeight, ceilf(visMaxY / gridSpacing) * gridSpacing);
-
-            for (float x = startX; x <= endX + 0.1f; x += gridSpacing) {
-                addSegmentStyled(grid, (vector_float2){x, 0.0f}, (vector_float2){x, paperHeight},
-                                 width, 1.0f, 0.0f, gridColor, 1.0f, false);
-            }
-            for (float y = startY; y <= endY + 0.1f; y += gridSpacing) {
-                addSegmentStyled(grid, (vector_float2){0.0f, y}, (vector_float2){paperWidth, y},
-                                 width, 1.0f, 0.0f, gridColor, 1.0f, false);
-            }
-            if (!grid.empty()) {
-                id<MTLBuffer> gridBuffer = [view.device newBufferWithBytes:grid.data()
-                                                                      length:sizeof(DTMetalVertex) * grid.size()
-                                                                     options:MTLResourceStorageModeShared];
-                if (gridBuffer) {
-                    DTMetalFragmentUniforms fragmentUniforms{};
-                    fragmentUniforms.color = gridColor;
-                    fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
-                    [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                    [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
-                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
-                }
-            }
-        }
-    }
-
-    if (pixelGridVisible && transformScale >= 3.5f) {
-        const float invScale = 1.0f / transformScale;
-        const float viewDiag = hypotf(static_cast<float>(view.bounds.size.width),
-                                      static_cast<float>(view.bounds.size.height)) * invScale * 0.5f + 4.0f;
-        const float cosR = cosf(transformRotation);
-        const float sinR = sinf(transformRotation);
-        const float viewCenterX = static_cast<float>(view.bounds.size.width) * 0.5f;
-        const float viewCenterY = static_cast<float>(view.bounds.size.height) * 0.5f;
-        const float transX = (viewCenterX - transformX) * invScale;
-        const float transY = (viewCenterY - transformY) * invScale;
-        const float docCenterX = transX * cosR + transY * sinR;
-        const float docCenterY = -transX * sinR + transY * cosR;
-
-        const float visMinX = std::max(0.0f, docCenterX - viewDiag);
-        const float visMaxX = std::min(paperWidth, docCenterX + viewDiag);
-        const float visMinY = std::max(0.0f, docCenterY - viewDiag);
-        const float visMaxY = std::min(paperHeight, docCenterY + viewDiag);
-
-        if (visMinX <= visMaxX && visMinY <= visMaxY) {
-            const vector_float4 pxColor = (vector_float4){0.40f, 0.44f, 0.43f, 0.16f};
-            const float width = std::max(0.25f, 0.5f * invScale);
-            std::vector<DTMetalVertex> pxGrid;
-            const float startX = std::max(0.0f, floorf(visMinX));
-            const float endX = std::min(paperWidth, ceilf(visMaxX));
-            const float startY = std::max(0.0f, floorf(visMinY));
-            const float endY = std::min(paperHeight, ceilf(visMaxY));
-
-            for (float x = startX; x <= endX + 0.1f; x += 1.0f) {
-                addSegmentStyled(pxGrid, (vector_float2){x, 0.0f}, (vector_float2){x, paperHeight},
-                                 width, 1.0f, 0.0f, pxColor, 1.0f, false);
-            }
-            for (float y = startY; y <= endY + 0.1f; y += 1.0f) {
-                addSegmentStyled(pxGrid, (vector_float2){0.0f, y}, (vector_float2){paperWidth, y},
-                                 width, 1.0f, 0.0f, pxColor, 1.0f, false);
-            }
-            if (!pxGrid.empty()) {
-                id<MTLBuffer> pxBuffer = [view.device newBufferWithBytes:pxGrid.data()
-                                                                  length:sizeof(DTMetalVertex) * pxGrid.size()
-                                                                 options:MTLResourceStorageModeShared];
-                if (pxBuffer) {
-                    DTMetalFragmentUniforms fragmentUniforms{};
-                    fragmentUniforms.color = pxColor;
-                    fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
-                    [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                    [encoder setVertexBuffer:pxBuffer offset:0 atIndex:0];
-                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:pxGrid.size()];
-                }
-            }
-        }
-    }
-
-    [encoder endEncoding];
-    [commandBuffer presentDrawable:drawable];
-    [commandBuffer commit];
-    }
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
+    (void)size;
+    [view setNeedsDisplay];
 }
 
 @end
