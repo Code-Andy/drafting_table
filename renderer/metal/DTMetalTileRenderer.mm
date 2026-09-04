@@ -198,7 +198,7 @@ struct Backend::Impl {
 
     bool buildDabPipeline(MTLPixelFormat format,
                           DabBlendMode mode,
-                          id<MTLRenderPipelineState>* output) {
+                          id<MTLRenderPipelineState> __strong *output) {
         if (!output) return false;
         id<MTLFunction> vertex = [library newFunctionWithName:@"dt_metal_dab_vertex"];
         NSString* fragmentName = format == MTLPixelFormatR8Unorm
