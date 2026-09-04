@@ -394,9 +394,9 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
 }
 
 - (void)dt_drainStrokeQueueLocked {
-    if(_transactions->hasInFlightOperation()||_strokeQueue.count==0||!_renderSink)return;
+    if(_strokeQueue.count==0||!_renderSink)return;
     DTPendingStrokeRequest*r=_strokeQueue.firstObject;
-    if(!r.submitted){auto token=_transactions->reserveRasterOperation();if(!token)return;r.operation={token->operationID,token->generation,r.pageID,r.layerID,r.tool,r.brushSize,r.brushOpacity,r.brushHardness,r.brushColorRGBA};r.submitted=YES;[_renderSink enqueueBeginStroke:r.operation];for(DTPendingSampleBatch*b in r.batches)[_renderSink enqueueSampleBatch:[[DTSampleBatchDescriptor alloc] initWithOperationID:token->operationID sampleBytes:b.bytes realCount:b.realCount]];[r.batches removeAllObjects];}
+    if(!r.submitted){if(_transactions->hasInFlightOperation())return;auto token=_transactions->reserveRasterOperation();if(!token)return;r.operation={token->operationID,token->generation,r.pageID,r.layerID,r.tool,r.brushSize,r.brushOpacity,r.brushHardness,r.brushColorRGBA};r.submitted=YES;[_renderSink enqueueBeginStroke:r.operation];for(DTPendingSampleBatch*b in r.batches)[_renderSink enqueueSampleBatch:[[DTSampleBatchDescriptor alloc] initWithOperationID:token->operationID sampleBytes:b.bytes realCount:b.realCount]];[r.batches removeAllObjects];}
     if(r.ended&&!r.endSent)[self dt_sendEndForRequestLocked:r];
 }
 - (void)dt_sendEndForRequestLocked:(DTPendingStrokeRequest *)r {
