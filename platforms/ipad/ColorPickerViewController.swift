@@ -36,21 +36,26 @@ final class ColorPickerViewController: UIViewController {
     private var value: CGFloat = 0
     private var previousColor: UIColor = .black
     private let square = HSVSquareView()
-    private let hueSlider = UISlider()
+    private let hueSlider = HueSliderView()
     private let hexField = UITextField()
-    private let rgbLabel = UILabel()
+    private let redField = UITextField()
+    private let greenField = UITextField()
+    private let blueField = UITextField()
+    private let hValue = UILabel()
+    private let sValue = UILabel()
+    private let vValue = UILabel()
     private let previewSwatch = UIView()
-    private let previousSwatch = UIView()
     private var recentsRow: UIStackView!
     private var slotsRow: UIStackView!
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "Color"
-        view.backgroundColor = UIColor(red: 0.985, green: 0.975, blue: 0.945, alpha: 1)
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            systemItem: .done,
-            primaryAction: UIAction { [weak self] _ in self?.commitAndDismiss() })
+        title = nil
+        view.backgroundColor = DraftingTheme.paper
+        // The Android picker is an in-content paper dialog. Hide the UIKit
+        // navigation chrome so the content header and paper buttons remain
+        // the only title/action treatment.
+        navigationController?.setNavigationBarHidden(true, animated: false)
         previousColor = Self.uiColor(from: initialColorRGBA)
         adopt(color: previousColor)
         buildLayout()
@@ -86,52 +91,81 @@ final class ColorPickerViewController: UIViewController {
         }
         square.accessibilityLabel = "Saturation and brightness"
         square.isAccessibilityElement = true
-        hueSlider.minimumValue = 0
-        hueSlider.maximumValue = 1
-        hueSlider.value = Float(hue)
+        hueSlider.hue = hue
         hueSlider.accessibilityLabel = "Hue"
-        hueSlider.addTarget(self, action: #selector(hueChanged(_:)), for: .valueChanged)
-        hexField.placeholder = "#RRGGBB"
-        hexField.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
-        hexField.borderStyle = .roundedRect
-        hexField.autocapitalizationType = .allCharacters
-        hexField.autocorrectionType = .no
-        hexField.returnKeyType = .done
-        hexField.delegate = self
-        hexField.accessibilityLabel = "Hex color"
-        rgbLabel.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        rgbLabel.textColor = .secondaryLabel
-        for swatch in [previewSwatch, previousSwatch] {
-            swatch.layer.cornerRadius = 10
+        hueSlider.onHueChanged = { [weak self] h in
+            self?.hue = h
+            self?.colorDidChange(recordRecent: false)
+        }
+        configureHexField()
+        configureRGBField(redField, label: "Red", tag: 0)
+        configureRGBField(greenField, label: "Green", tag: 1)
+        configureRGBField(blueField, label: "Blue", tag: 2)
+        for swatch in [previewSwatch] {
+            swatch.layer.cornerRadius = 0
             swatch.layer.borderWidth = 1
-            swatch.layer.borderColor = UIColor.black.withAlphaComponent(0.15).cgColor
-            swatch.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            swatch.layer.borderColor = DraftingTheme.rule.cgColor
+            swatch.heightAnchor.constraint(equalToConstant: 36).isActive = true
         }
         previewSwatch.accessibilityLabel = "Current color"
-        previousSwatch.accessibilityLabel = "Previous color"
-        let previousTap = UITapGestureRecognizer(target: self, action: #selector(previousTapped))
-        previousSwatch.addGestureRecognizer(previousTap)
-        previousSwatch.isUserInteractionEnabled = true
-        let swatches = UIStackView(arrangedSubviews: [previewSwatch, previousSwatch])
-        swatches.axis = .horizontal
-        swatches.spacing = 10
-        swatches.distribution = .fillEqually
         let eyedropper = UIButton(type: .system)
         eyedropper.setTitle("◉  Eyedropper", for: .normal)
-        eyedropper.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        eyedropper.titleLabel?.font = DraftingTheme.mono(size: 12, weight: .semibold)
+        eyedropper.setTitleColor(DraftingTheme.ink, for: .normal)
+        eyedropper.tintColor = DraftingTheme.ink
+        eyedropper.contentHorizontalAlignment = .leading
+        eyedropper.contentEdgeInsets = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
         eyedropper.addTarget(self, action: #selector(eyedropperTapped), for: .touchUpInside)
+        let titleRow = UIStackView(arrangedSubviews: [
+            sectionTitle("PICKER"),
+            sectionCaption("HSV · square + hue")
+        ])
+        titleRow.axis = .horizontal
+        titleRow.alignment = .firstBaseline
+        titleRow.spacing = 8
+        titleRow.distribution = .fill
+
+        let hsvRow = UIStackView(arrangedSubviews: [
+            readoutCell(label: "H", value: hValue),
+            readoutCell(label: "S", value: sValue),
+            readoutCell(label: "V", value: vValue)
+        ])
+        hsvRow.axis = .horizontal
+        hsvRow.spacing = 6
+        hsvRow.distribution = .fillEqually
+
+        let rgbRow = UIStackView(arrangedSubviews: [
+            inputCell(label: "R", field: redField),
+            inputCell(label: "G", field: greenField),
+            inputCell(label: "B", field: blueField)
+        ])
+        rgbRow.axis = .horizontal
+        rgbRow.spacing = 6
+        rgbRow.distribution = .fillEqually
+
+        let buttons = UIStackView(arrangedSubviews: [
+            paperButton(title: "Cancel", color: DraftingTheme.ink, action: #selector(cancelAndDismiss)),
+            paperButton(title: "Done", color: DraftingTheme.hot, action: #selector(doneAndDismiss))
+        ])
+        buttons.axis = .horizontal
+        buttons.alignment = .center
+        buttons.distribution = .fill
+        buttons.spacing = 4
+
         let stack = UIStackView(arrangedSubviews: [
-            sectionTitle("COLOR"),
-            square, hueSlider, swatches, hexField, rgbLabel, eyedropper,
+            titleRow, square, hueSlider, hsvRow, labeledRow(label: "HEX", content: hexField),
+            rgbRow, sectionCaption("PREVIEW"), previewSwatch, eyedropper,
             sectionTitle("PALETTE"), paletteGrid(),
             sectionTitle("RECENT"), recentsRowPlaceholder(),
-            sectionTitle("MY SLOTS — LONG-PRESS TO SET"), slotsRowPlaceholder()
+            sectionTitle("MY SLOTS"), slotsRowPlaceholder(), buttons
         ])
         stack.axis = .vertical
-        stack.spacing = 12
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         let scroll = UIScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.backgroundColor = DraftingTheme.paper
+        scroll.alwaysBounceVertical = true
         scroll.addSubview(stack)
         view.addSubview(scroll)
         NSLayoutConstraint.activate([
@@ -139,49 +173,163 @@ final class ColorPickerViewController: UIViewController {
             scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 20),
-            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -28),
-            stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -48),
-            square.heightAnchor.constraint(equalTo: square.widthAnchor)
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -18),
+            stack.widthAnchor.constraint(equalToConstant: 240),
+            square.widthAnchor.constraint(equalToConstant: 240),
+            square.heightAnchor.constraint(equalToConstant: 240),
+            hueSlider.widthAnchor.constraint(equalToConstant: 240),
+            hueSlider.heightAnchor.constraint(equalToConstant: 16),
+            previewSwatch.widthAnchor.constraint(equalToConstant: 240),
+            buttons.heightAnchor.constraint(greaterThanOrEqualToConstant: 44)
         ])
+    }
+
+    private func configureHexField() {
+        hexField.placeholder = "#RRGGBB"
+        hexField.font = DraftingTheme.mono(size: 12, weight: .semibold)
+        hexField.textColor = DraftingTheme.ink
+        hexField.tintColor = DraftingTheme.hot
+        hexField.backgroundColor = DraftingTheme.paper
+        hexField.layer.cornerRadius = 0
+        hexField.layer.borderWidth = 1
+        hexField.layer.borderColor = DraftingTheme.rule.cgColor
+        hexField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        hexField.setContentCompressionResistancePriority(.required, for: .horizontal)
+        hexField.contentVerticalAlignment = .center
+        hexField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 1))
+        hexField.leftViewMode = .always
+        hexField.autocapitalizationType = .allCharacters
+        hexField.autocorrectionType = .no
+        hexField.returnKeyType = .done
+        hexField.delegate = self
+        hexField.accessibilityLabel = "Hex color"
+        hexField.addTarget(self, action: #selector(hexEditingEnded), for: .editingDidEnd)
+        hexField.addTarget(self, action: #selector(hexEditingEnded), for: .editingDidEndOnExit)
+    }
+
+    private func configureRGBField(_ field: UITextField, label: String, tag: Int) {
+        field.tag = tag
+        field.font = DraftingTheme.mono(size: 12, weight: .semibold)
+        field.textColor = DraftingTheme.ink
+        field.tintColor = DraftingTheme.hot
+        field.backgroundColor = DraftingTheme.paper
+        field.layer.cornerRadius = 0
+        field.layer.borderWidth = 1
+        field.layer.borderColor = DraftingTheme.rule.cgColor
+        field.keyboardType = .numberPad
+        field.returnKeyType = .done
+        field.textAlignment = .left
+        field.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 1))
+        field.leftViewMode = .always
+        field.accessibilityLabel = label
+        field.addTarget(self, action: #selector(rgbEditingEnded(_:)), for: .editingDidEnd)
+    }
+
+    private func sectionCaption(_ text: String) -> UILabel {
+        let label = UILabel()
+        label.text = text
+        label.font = DraftingTheme.mono(size: 9)
+        label.textColor = DraftingTheme.inkSoft
+        label.textAlignment = .right
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        return label
+    }
+
+    private func labeledRow(label: String, content: UIView) -> UIView {
+        let row = UIStackView(arrangedSubviews: [sectionCaption(label), content])
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 8
+        return row
+    }
+
+    private func readoutCell(label: String, value: UILabel) -> UIView {
+        let title = UILabel()
+        title.text = label
+        title.font = DraftingTheme.mono(size: 9)
+        title.textColor = DraftingTheme.inkSoft
+        value.font = DraftingTheme.mono(size: 12, weight: .semibold)
+        value.textColor = DraftingTheme.ink
+        let cell = UIStackView(arrangedSubviews: [title, value])
+        cell.axis = .vertical
+        cell.spacing = 2
+        cell.alignment = .leading
+        cell.isLayoutMarginsRelativeArrangement = true
+        cell.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8)
+        cell.backgroundColor = DraftingTheme.paperDeep
+        cell.layer.borderWidth = 1
+        cell.layer.borderColor = DraftingTheme.rule.cgColor
+        return cell
+    }
+
+    private func inputCell(label: String, field: UITextField) -> UIView {
+        let title = UILabel()
+        title.text = label
+        title.font = DraftingTheme.mono(size: 9)
+        title.textColor = DraftingTheme.inkSoft
+        let cell = UIStackView(arrangedSubviews: [title, field])
+        cell.axis = .vertical
+        cell.spacing = 2
+        return cell
+    }
+
+    private func paperButton(title: String, color: UIColor, action: Selector) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle(title, for: .normal)
+        button.setTitleColor(color, for: .normal)
+        button.titleLabel?.font = DraftingTheme.mono(size: 12, weight: .semibold)
+        button.contentEdgeInsets = UIEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+        button.backgroundColor = DraftingTheme.paper
+        button.layer.cornerRadius = 0
+        button.layer.borderWidth = 1
+        button.layer.borderColor = DraftingTheme.rule.cgColor
+        button.addTarget(self, action: action, for: .touchUpInside)
+        return button
     }
 
     private func recentsRowPlaceholder() -> UIView {
         recentsRow = UIStackView()
         recentsRow.axis = .horizontal
-        recentsRow.spacing = 8
+        recentsRow.spacing = 2
         return recentsRow
     }
 
     private func slotsRowPlaceholder() -> UIView {
         slotsRow = UIStackView()
         slotsRow.axis = .horizontal
-        slotsRow.spacing = 8
+        slotsRow.spacing = 2
         return slotsRow
     }
 
     private func sectionTitle(_ text: String) -> UILabel {
         let label = UILabel()
         label.text = text
-        label.font = .systemFont(ofSize: 12, weight: .bold)
-        label.textColor = .secondaryLabel
+        label.font = DraftingTheme.mono(size: 10, weight: .semibold)
+        label.textColor = DraftingTheme.ink
+        label.backgroundColor = DraftingTheme.paperDeep
+        label.layer.borderWidth = 1
+        label.layer.borderColor = DraftingTheme.rule.cgColor
+        label.textAlignment = .left
+        label.contentMode = .center
+        label.heightAnchor.constraint(equalToConstant: 28).isActive = true
         return label
     }
 
     private func paletteGrid() -> UIView {
         let grid = UIStackView()
         grid.axis = .vertical
-        grid.spacing = 6
+        grid.spacing = 2
         for row in 0..<4 {
             let rowStack = UIStackView()
             rowStack.axis = .horizontal
-            rowStack.spacing = 6
-            rowStack.distribution = .fillEqually
+            rowStack.spacing = 2
+            rowStack.distribution = .fill
             for col in 0..<8 {
                 let rgb = Self.defaultPalette[row * 8 + col]
-                let button = swatchButton(color: Self.uiColor(rgb: rgb), size: 32)
+                let button = swatchButton(color: Self.uiColor(rgb: rgb), size: 16)
                 button.addTarget(self, action: #selector(paletteTapped(_:)), for: .touchUpInside)
                 button.tag = Int(rgb)
                 rowStack.addArrangedSubview(button)
@@ -194,9 +342,9 @@ final class ColorPickerViewController: UIViewController {
     private func swatchButton(color: UIColor, size: CGFloat) -> UIButton {
         let button = UIButton(type: .custom)
         button.backgroundColor = color
-        button.layer.cornerRadius = 8
+        button.layer.cornerRadius = 0
         button.layer.borderWidth = 1
-        button.layer.borderColor = UIColor.black.withAlphaComponent(0.15).cgColor
+        button.layer.borderColor = DraftingTheme.rule.cgColor
         button.heightAnchor.constraint(equalToConstant: size).isActive = true
         button.widthAnchor.constraint(equalTo: button.heightAnchor).isActive = true
         button.accessibilityLabel = "Color swatch"
@@ -207,11 +355,16 @@ final class ColorPickerViewController: UIViewController {
         square.hue = hue
         square.selectedSaturation = saturation
         square.selectedValue = value
-        hueSlider.value = Float(hue)
+        hueSlider.hue = hue
         previewSwatch.backgroundColor = currentUIColor
-        previousSwatch.backgroundColor = previousColor
-        hexField.text = Self.hexString(from: currentUIColor)
-        rgbLabel.text = Self.rgbString(from: currentUIColor)
+        hValue.text = String(format: "%3.0f°", hue * 360)
+        sValue.text = String(format: "%3.0f%%", saturation * 100)
+        vValue.text = String(format: "%3.0f%%", value * 100)
+        let rgb = Self.rgbComponents(from: currentUIColor)
+        if !hexField.isFirstResponder { hexField.text = Self.hexString(from: currentUIColor) }
+        if !redField.isFirstResponder { redField.text = String(rgb.0) }
+        if !greenField.isFirstResponder { greenField.text = String(rgb.1) }
+        if !blueField.isFirstResponder { blueField.text = String(rgb.2) }
         refreshRecentsRow()
         refreshSlotsRow()
     }
@@ -222,29 +375,47 @@ final class ColorPickerViewController: UIViewController {
         onColorChanged?(currentPacked)
     }
 
-    @objc private func hueChanged(_ sender: UISlider) {
-        hue = CGFloat(sender.value)
-        colorDidChange(recordRecent: false)
-    }
-
     @objc private func paletteTapped(_ sender: UIButton) {
-        adopt(color: Self.uiColor(rgb: UInt32(bitPattern: Int32(sender.tag))))
+        adopt(color: Self.uiColor(rgb: UInt32(sender.tag)))
         colorDidChange(recordRecent: true)
-    }
-
-    @objc private func previousTapped() {
-        adopt(color: previousColor)
-        colorDidChange(recordRecent: false)
     }
 
     @objc private func eyedropperTapped() {
         onEyedropperRequested?()
     }
 
-    private func commitAndDismiss() {
+    @objc private func cancelAndDismiss() {
+        dismiss(animated: true)
+    }
+
+    @objc private func doneAndDismiss() {
         recordRecentColor(currentPacked)
         onColorPicked?(currentPacked)
         dismiss(animated: true)
+    }
+
+    @objc private func hexEditingEnded() {
+        guard let text = hexField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { refreshAll(); return }
+        var value = text.uppercased()
+        if value.hasPrefix("#") { value.removeFirst() }
+        guard value.count == 6, let rgb = UInt32(value, radix: 16) else {
+            hexField.text = Self.hexString(from: currentUIColor)
+            return
+        }
+        adopt(color: Self.uiColor(rgb: rgb))
+        colorDidChange(recordRecent: true)
+    }
+
+    @objc private func rgbEditingEnded(_ sender: UITextField) {
+        let values = [redField, greenField, blueField].compactMap { Int($0.text ?? "") }
+        guard values.count == 3, values.allSatisfy({ (0...255).contains($0) }) else {
+            refreshAll()
+            return
+        }
+        let rgb = (UInt32(values[0]) << 16) | (UInt32(values[1]) << 8) | UInt32(values[2])
+        adopt(color: Self.uiColor(rgb: rgb))
+        colorDidChange(recordRecent: true)
     }
 
     private func refreshRecentsRow() {
@@ -252,14 +423,14 @@ final class ColorPickerViewController: UIViewController {
         let recents = storedInts(key: Self.recentsKey)
         if recents.isEmpty {
             let hint = UILabel()
-            hint.text = "Recently used colors appear here."
-            hint.font = .systemFont(ofSize: 13)
-            hint.textColor = .secondaryLabel
+            hint.text = "— none yet —"
+            hint.font = DraftingTheme.mono(size: 10)
+            hint.textColor = DraftingTheme.inkFaint
             recentsRow.addArrangedSubview(hint)
             return
         }
         for rgb in recents.prefix(Self.maximumRecents) {
-            let button = swatchButton(color: Self.uiColor(rgb: UInt32(rgb)), size: 30)
+            let button = swatchButton(color: Self.uiColor(rgb: UInt32(rgb)), size: 18)
             button.tag = rgb
             button.addTarget(self, action: #selector(paletteTapped(_:)), for: .touchUpInside)
             recentsRow.addArrangedSubview(button)
@@ -275,19 +446,20 @@ final class ColorPickerViewController: UIViewController {
             let stored = index < slots.count ? slots[index] : -1
             let button: UIButton
             if stored >= 0 {
-                button = swatchButton(color: Self.uiColor(rgb: UInt32(stored)), size: 30)
+                button = swatchButton(color: Self.uiColor(rgb: UInt32(stored)), size: 28)
                 button.tag = stored
                 button.addTarget(self, action: #selector(paletteTapped(_:)), for: .touchUpInside)
             } else {
                 button = UIButton(type: .system)
                 button.setTitle("+", for: .normal)
-                button.titleLabel?.font = .systemFont(ofSize: 20, weight: .medium)
-                button.setTitleColor(.secondaryLabel, for: .normal)
-                button.layer.cornerRadius = 8
+                button.titleLabel?.font = DraftingTheme.mono(size: 16, weight: .regular)
+                button.setTitleColor(DraftingTheme.inkSoft, for: .normal)
+                button.backgroundColor = DraftingTheme.paperDeep
+                button.layer.cornerRadius = 0
                 button.layer.borderWidth = 1
-                button.layer.borderColor = UIColor.black.withAlphaComponent(0.15).cgColor
-                button.heightAnchor.constraint(equalToConstant: 30).isActive = true
-                button.widthAnchor.constraint(equalToConstant: 30).isActive = true
+                button.layer.borderColor = DraftingTheme.rule.cgColor
+                button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+                button.widthAnchor.constraint(equalToConstant: 28).isActive = true
             }
             button.accessibilityLabel = "My color slot \(index + 1)"
             button.accessibilityIdentifier = "slot-\(index)"
@@ -353,19 +525,20 @@ final class ColorPickerViewController: UIViewController {
         guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return "R –  G –  B –" }
         return String(format: "R %3d  G %3d  B %3d", Int(r * 255 + 0.5), Int(g * 255 + 0.5), Int(b * 255 + 0.5))
     }
+
+    static func rgbComponents(from color: UIColor) -> (Int, Int, Int) {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
+        guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return (0, 0, 0) }
+        return (Int(r * 255 + 0.5), Int(g * 255 + 0.5), Int(b * 255 + 0.5))
+    }
 }
 
 extension ColorPickerViewController: UITextFieldDelegate {
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
-        guard let text = textField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else { textField.resignFirstResponder(); return true }
-        var hex = text.uppercased()
-        if hex.hasPrefix("#") { hex.removeFirst() }
-        if hex.count == 6, let rgb = UInt32(hex, radix: 16) {
-            adopt(color: Self.uiColor(rgb: rgb))
-            colorDidChange(recordRecent: true)
+        if textField === hexField {
+            hexEditingEnded()
         } else {
-            hexField.text = Self.hexString(from: currentUIColor)
+            rgbEditingEnded(textField)
         }
         textField.resignFirstResponder()
         return true
@@ -384,9 +557,9 @@ private final class HSVSquareView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
-        layer.cornerRadius = 10
+        layer.cornerRadius = 0
         layer.borderWidth = 1
-        layer.borderColor = UIColor.black.withAlphaComponent(0.15).cgColor
+        layer.borderColor = DraftingTheme.rule.cgColor
         clipsToBounds = true
         isUserInteractionEnabled = true
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handleTouch(_:)))
@@ -447,5 +620,66 @@ private final class HSVSquareView: UIView {
         context.setStrokeColor(UIColor.black.withAlphaComponent(0.4).cgColor)
         context.setLineWidth(1)
         context.strokeEllipse(in: CGRect(x: marker.x - 9, y: marker.y - 9, width: 18, height: 18))
+    }
+}
+
+/// The upstream picker uses a 240×16 horizontal hue strip with a full
+/// spectrum gradient and a small white/ink marker. Keeping it as a UIControl
+/// avoids the default iOS slider track/thumb geometry that otherwise makes
+/// this dialog look like a system form instead of the paper picker.
+private final class HueSliderView: UIControl {
+    var hue: CGFloat = 0 { didSet { setNeedsDisplay() } }
+    var onHueChanged: ((CGFloat) -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = true
+        accessibilityTraits = [.adjustable]
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    private func update(at point: CGPoint) {
+        guard bounds.width > 0 else { return }
+        hue = min(max(point.x / bounds.width, 0), 1)
+        accessibilityValue = String(format: "%.0f°", hue * 360)
+        onHueChanged?(hue)
+        sendActions(for: .valueChanged)
+        setNeedsDisplay()
+    }
+
+    override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        update(at: touch.location(in: self))
+        return true
+    }
+
+    override func continueTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        update(at: touch.location(in: self))
+        return true
+    }
+
+    override func endTracking(_ touch: UITouch?, with event: UIEvent?) {
+        if let touch { update(at: touch.location(in: self)) }
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext(), rect.width > 0, rect.height > 0 else { return }
+        let stops: [CGFloat] = [0, 1.0 / 6, 2.0 / 6, 3.0 / 6, 4.0 / 6, 5.0 / 6, 1]
+        let colors: [CGColor] = stops.map { UIColor(hue: $0, saturation: 1, brightness: 1, alpha: 1).cgColor }
+        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                         colors: colors as CFArray, locations: stops) else { return }
+        context.drawLinearGradient(gradient, start: CGPoint(x: rect.minX, y: rect.midY),
+                                   end: CGPoint(x: rect.maxX, y: rect.midY), options: [])
+        context.setStrokeColor(DraftingTheme.rule.cgColor)
+        context.setLineWidth(1)
+        context.stroke(rect.insetBy(dx: 0.5, dy: 0.5))
+
+        let x = rect.minX + min(max(hue, 0), 1) * rect.width
+        let marker = CGRect(x: x - 2, y: rect.minY - 2, width: 4, height: rect.height + 4)
+        context.setFillColor(UIColor.white.cgColor)
+        context.fill(marker)
+        context.setStrokeColor(DraftingTheme.ink.cgColor)
+        context.setLineWidth(1)
+        context.stroke(marker.insetBy(dx: 0.5, dy: 0.5))
     }
 }

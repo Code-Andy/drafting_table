@@ -40,8 +40,18 @@ final class DrawingSettingsViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "Settings"
-        view.backgroundColor = UIColor(red: 0.985, green: 0.975, blue: 0.945, alpha: 1)
+        title = "SETTINGS"
+        view.backgroundColor = DraftingTheme.paper
+        let navAppearance = UINavigationBarAppearance()
+        navAppearance.configureWithOpaqueBackground()
+        navAppearance.backgroundColor = DraftingTheme.paperDeep
+        navAppearance.shadowColor = DraftingTheme.rule
+        navAppearance.titleTextAttributes = [
+            .font: DraftingTheme.mono(size: 11, weight: .semibold),
+            .foregroundColor: DraftingTheme.ink
+        ]
+        navigationController?.navigationBar.standardAppearance = navAppearance
+        navigationController?.navigationBar.scrollEdgeAppearance = navAppearance
         navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .done,
                                                               primaryAction: UIAction { [weak self] _ in
             self?.dismiss(animated: true)
@@ -59,16 +69,16 @@ final class DrawingSettingsViewController: UIViewController {
                                      fallback: Self.defaultBrushColorRGBA)
 
         configureSlider(activationSlider, min: 0, max: 20, value: activation,
-                        label: "Pen activation", hint: "Higher values ignore lighter contact and screen-protector noise.",
+                        label: "activate", hint: "Higher values ignore lighter contact and screen-protector noise.",
                         action: #selector(activationChanged(_:)))
         configureSlider(sizeSlider, min: 1, max: 40, value: size,
-                        label: "Brush size", hint: "Brush diameter in points.",
+                        label: "size", hint: "Brush diameter in points.",
                         action: #selector(sizeChanged(_:)))
         configureSlider(opacitySlider, min: 5, max: 100, value: opacity,
-                        label: "Brush opacity", hint: "Opacity of new brush strokes.",
+                        label: "α", hint: "Opacity of new brush strokes.",
                         action: #selector(opacityChanged(_:)))
         configureSlider(hardnessSlider, min: 0, max: 100, value: hardness,
-                        label: "Brush hardness", hint: "Controls edge softness for new brush strokes.",
+                        label: "hard", hint: "Controls edge softness for new brush strokes.",
                         action: #selector(hardnessChanged(_:)))
         colorWell.selectedColor = Self.uiColor(from: colorRGBA)
         colorWell.supportsAlpha = true
@@ -94,18 +104,22 @@ final class DrawingSettingsViewController: UIViewController {
 
         let stack = UIStackView(arrangedSubviews: [
             sectionTitle("PENCIL & BRUSH"),
-            settingRow(title: "Brush size", detail: "Set the diameter of new brush strokes.", slider: sizeSlider, value: sizeValue),
-            settingRow(title: "Brush opacity", detail: "Set the opacity of new brush strokes.", slider: opacitySlider, value: opacityValue),
-            settingRow(title: "Brush hardness", detail: "Soft edges blend more naturally; hard edges stay crisp.", slider: hardnessSlider, value: hardnessValue),
+            settingRow(title: "size", detail: "Set the diameter of new brush strokes.", slider: sizeSlider, value: sizeValue),
+            settingRow(title: "α", detail: "Set the opacity of new brush strokes.", slider: opacitySlider, value: opacityValue),
+            settingRow(title: "hard", detail: "Soft edges blend naturally; hard edges stay crisp.", slider: hardnessSlider, value: hardnessValue),
+            settingRow(title: "activate", detail: "Ignore lighter contact and screen-protector noise.", slider: activationSlider, value: activationValue),
             colorRow(),
             sectionTitle("CANVAS & INTERACTION"),
-            switchRow(title: "Grid", detail: "Show a drafting grid over the page.", control: gridSwitch),
+            switchRow(title: "grid", detail: "Show a drafting grid over the page.", control: gridSwitch),
+            switchRow(title: "center mode", detail: "Draw circles and ellipses from their center.", control: centerModeSwitch),
             sectionTitle("DIAGNOSTICS & DEBUG"),
-            switchRow(title: "Metal Diagnostics Overlay", detail: "Show FPS, render latency, Pencil hover coords, and touch count.", control: diagnosticsSwitch),
+            switchRow(title: "diagnostics", detail: "Show FPS, latency, hover coordinates, and touch count.", control: diagnosticsSwitch),
+            sectionTitle("EXPORT"),
+            switchRow(title: "transparent PNG", detail: "Keep transparent pixels when exporting.", control: transparentExportSwitch),
             infoLabel()
         ])
         stack.axis = .vertical
-        stack.spacing = 18
+        stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let scroll = UIScrollView()
@@ -118,11 +132,11 @@ final class DrawingSettingsViewController: UIViewController {
             scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -28),
-            stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -48)
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -18),
+            stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -36)
         ])
     }
 
@@ -146,45 +160,55 @@ final class DrawingSettingsViewController: UIViewController {
         slider.addTarget(self, action: action, for: .valueChanged)
         slider.accessibilityLabel = label
         slider.accessibilityHint = hint
+        slider.minimumTrackTintColor = DraftingTheme.hot
+        slider.maximumTrackTintColor = DraftingTheme.rule
+        slider.thumbTintColor = DraftingTheme.ink
     }
 
     private func settingRow(title: String, detail: String, slider: UISlider, value: UILabel) -> UIView {
         let titleLabel = UILabel()
         titleLabel.text = title
-        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-        titleLabel.textColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
-        let detailLabel = UILabel()
-        detailLabel.text = detail
-        detailLabel.font = .systemFont(ofSize: 13)
-        detailLabel.textColor = .secondaryLabel
-        detailLabel.numberOfLines = 0
-        value.font = .monospacedDigitSystemFont(ofSize: 15, weight: .medium)
-        value.textColor = .secondaryLabel
+        titleLabel.font = DraftingTheme.mono(size: 11)
+        titleLabel.textColor = DraftingTheme.inkSoft
+        titleLabel.accessibilityLabel = title
+        titleLabel.accessibilityHint = detail
+        value.font = DraftingTheme.mono(size: 11, weight: .semibold)
+        value.textColor = DraftingTheme.ink
         value.textAlignment = .right
-        let header = UIStackView(arrangedSubviews: [titleLabel, value])
-        header.axis = .horizontal
-        header.alignment = .firstBaseline
-        let stack = UIStackView(arrangedSubviews: [header, detailLabel, slider])
-        stack.axis = .vertical
-        stack.spacing = 5
-        return stack
+        let row = UIStackView(arrangedSubviews: [titleLabel, slider, value])
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 8
+        row.isLayoutMarginsRelativeArrangement = true
+        row.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
+        titleLabel.widthAnchor.constraint(equalToConstant: 54).isActive = true
+        value.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        row.heightAnchor.constraint(greaterThanOrEqualToConstant: 32).isActive = true
+        return row
     }
 
     private func sectionTitle(_ text: String) -> UILabel {
         let label = UILabel()
         label.text = text
-        label.font = .systemFont(ofSize: 12, weight: .bold)
-        label.textColor = .secondaryLabel
+        label.font = DraftingTheme.mono(size: 10, weight: .semibold)
+        label.textColor = DraftingTheme.ink
+        label.backgroundColor = DraftingTheme.paperDeep
+        label.layer.borderWidth = 1
+        label.layer.borderColor = DraftingTheme.rule.cgColor
+        label.textAlignment = .left
+        label.heightAnchor.constraint(equalToConstant: 28).isActive = true
         return label
     }
 
     private func infoLabel() -> UILabel {
         let label = UILabel()
-        label.text = "Lower activation responds to a lighter touch. Brush settings apply to new strokes."
-        label.font = .systemFont(ofSize: 13)
-        label.textColor = .secondaryLabel
+        label.text = "activate: higher values ignore lighter touch. Settings apply to new strokes."
+        label.font = DraftingTheme.mono(size: 9)
+        label.textColor = DraftingTheme.inkFaint
         label.numberOfLines = 0
         label.accessibilityLabel = label.text
+        label.isAccessibilityElement = true
+        label.heightAnchor.constraint(greaterThanOrEqualToConstant: 32).isActive = true
         return label
     }
 
@@ -259,24 +283,31 @@ final class DrawingSettingsViewController: UIViewController {
 
     private func colorRow() -> UIView {
         let label = UILabel()
-        label.text = "Brush color"
-        label.font = .systemFont(ofSize: 17, weight: .semibold)
-        label.textColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
-        let detail = UILabel()
-        detail.text = "Color used for new brush and shape strokes."
-        detail.font = .systemFont(ofSize: 13)
-        detail.textColor = .secondaryLabel
-        detail.numberOfLines = 0
+        label.text = "color"
+        label.font = DraftingTheme.mono(size: 11)
+        label.textColor = DraftingTheme.inkSoft
+        label.widthAnchor.constraint(equalToConstant: 54).isActive = true
+        colorWell.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        colorWell.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let paletteButton = UIButton(type: .system)
-        paletteButton.setTitle(" Palette, recents & my slots", for: .normal)
-        paletteButton.setImage(UIImage(systemName: "paintpalette"), for: .normal)
-        paletteButton.tintColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
-        paletteButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        paletteButton.setTitle("palette…", for: .normal)
+        paletteButton.tintColor = DraftingTheme.ink
+        paletteButton.setTitleColor(DraftingTheme.ink, for: .normal)
+        paletteButton.titleLabel?.font = DraftingTheme.mono(size: 11, weight: .semibold)
         paletteButton.contentHorizontalAlignment = .leading
+        paletteButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        paletteButton.backgroundColor = DraftingTheme.paper
+        paletteButton.layer.borderWidth = 1
+        paletteButton.layer.borderColor = DraftingTheme.rule.cgColor
         paletteButton.accessibilityLabel = "Open color palette"
         paletteButton.addTarget(self, action: #selector(openPalette), for: .touchUpInside)
-        let row = UIStackView(arrangedSubviews: [label, detail, colorWell, paletteButton])
-        row.axis = .vertical; row.spacing = 5
+        let row = UIStackView(arrangedSubviews: [label, colorWell, paletteButton, UIView()])
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 8
+        row.isLayoutMarginsRelativeArrangement = true
+        row.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
+        row.heightAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
         return row
     }
 
@@ -304,11 +335,20 @@ final class DrawingSettingsViewController: UIViewController {
     }
 
     private func switchRow(title: String, detail: String, control: UISwitch) -> UIView {
-        let titleLabel = UILabel(); titleLabel.text = title; titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-        titleLabel.textColor = UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1)
-        let header = UIStackView(arrangedSubviews: [titleLabel, UIView(), control]); header.axis = .horizontal; header.alignment = .center
-        let detailLabel = UILabel(); detailLabel.text = detail; detailLabel.font = .systemFont(ofSize: 13); detailLabel.textColor = .secondaryLabel; detailLabel.numberOfLines = 0
-        let row = UIStackView(arrangedSubviews: [header, detailLabel]); row.axis = .vertical; row.spacing = 5
+        let titleLabel = UILabel()
+        titleLabel.text = title
+        titleLabel.font = DraftingTheme.mono(size: 11)
+        titleLabel.textColor = DraftingTheme.inkSoft
+        titleLabel.accessibilityLabel = title
+        titleLabel.accessibilityHint = detail
+        control.onTintColor = DraftingTheme.hot
+        control.tintColor = DraftingTheme.inkFaint
+        let row = UIStackView(arrangedSubviews: [titleLabel, UIView(), control])
+        row.axis = .horizontal
+        row.alignment = .center
+        row.isLayoutMarginsRelativeArrangement = true
+        row.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
+        row.heightAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
         return row
     }
 

@@ -17,8 +17,11 @@ final class AppMenuWindowView: UIView {
 
     var onAction: ((Action) -> Void)?
 
-    private let windowWidth: CGFloat = 320.0
-    private let windowHeight: CGFloat = 220.0
+    // Concept A's Android PopupWindow sizes itself to the menu content. Keep
+    // a generous single-line width so the longest archive/export labels never
+    // wrap, while the 9pt vertical row padding still keeps the menu compact.
+    private let windowWidth: CGFloat = 336.0
+    private let windowHeight: CGFloat = 430.0
 
     private let mainContainer = UIView()
     private let exportContainer = UIView()
@@ -37,37 +40,36 @@ final class AppMenuWindowView: UIView {
     }
 
     private func setupWindow() {
-        backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.98)
-        layer.cornerRadius = 14
-        layer.borderWidth = 1.5
+        backgroundColor = DraftingTheme.paper
+        layer.cornerRadius = 0
+        layer.borderWidth = 1
         layer.borderColor = DraftingTheme.rule.cgColor
-        layer.shadowColor = UIColor.black.cgColor
-        layer.shadowOpacity = 0.20
-        layer.shadowRadius = 14
-        layer.shadowOffset = CGSize(width: 0, height: 4)
-        clipsToBounds = false
+        layer.shadowOpacity = 0
+        clipsToBounds = true
 
         // Header
         let header = UIView()
         header.translatesAutoresizingMaskIntoConstraints = false
         addSubview(header)
 
-        headerTitleLabel.text = "Drafting Table"
-        headerTitleLabel.font = .systemFont(ofSize: 13, weight: .bold)
+        headerTitleLabel.text = "DRAFTING TABLE"
+        headerTitleLabel.font = DraftingTheme.mono(size: 11, weight: .semibold)
+        headerTitleLabel.adjustsFontSizeToFitWidth = true
+        headerTitleLabel.minimumScaleFactor = 0.85
         headerTitleLabel.textColor = DraftingTheme.ink
         headerTitleLabel.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(headerTitleLabel)
 
         let closeBtn = UIButton(type: .system)
-        let closeCfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .bold)
-        closeBtn.setImage(UIImage(systemName: "xmark", withConfiguration: closeCfg), for: .normal)
+        closeBtn.setImage(DraftingIcon.image(named: "close", fallback: "xmark",
+                                             configuration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)), for: .normal)
         closeBtn.tintColor = DraftingTheme.inkSoft
         closeBtn.translatesAutoresizingMaskIntoConstraints = false
         closeBtn.addAction(UIAction { [weak self] _ in self?.dismiss(animated: true) }, for: .touchUpInside)
         header.addSubview(closeBtn)
 
-        let backCfg = UIImage.SymbolConfiguration(pointSize: 12, weight: .bold)
-        backButton.setImage(UIImage(systemName: "chevron.backward", withConfiguration: backCfg), for: .normal)
+        backButton.setImage(DraftingIcon.image(named: "back", fallback: "chevron.backward",
+                                               configuration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)), for: .normal)
         backButton.tintColor = DraftingTheme.ink
         backButton.translatesAutoresizingMaskIntoConstraints = false
         backButton.isHidden = true
@@ -95,10 +97,10 @@ final class AppMenuWindowView: UIView {
         setupExportActions()
 
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            header.heightAnchor.constraint(equalToConstant: 32),
+            header.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            header.heightAnchor.constraint(equalToConstant: 24),
 
             backButton.leadingAnchor.constraint(equalTo: header.leadingAnchor),
             backButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
@@ -112,15 +114,15 @@ final class AppMenuWindowView: UIView {
             closeBtn.widthAnchor.constraint(equalToConstant: 26),
             closeBtn.heightAnchor.constraint(equalToConstant: 26),
 
-            rule.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
+            rule.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
             rule.leadingAnchor.constraint(equalTo: leadingAnchor),
             rule.trailingAnchor.constraint(equalTo: trailingAnchor),
             rule.heightAnchor.constraint(equalToConstant: 1),
 
-            mainContainer.topAnchor.constraint(equalTo: rule.bottomAnchor, constant: 6),
-            mainContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            mainContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            mainContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            mainContainer.topAnchor.constraint(equalTo: rule.bottomAnchor),
+            mainContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            mainContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            mainContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             exportContainer.topAnchor.constraint(equalTo: rule.bottomAnchor, constant: 6),
             exportContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
@@ -132,8 +134,8 @@ final class AppMenuWindowView: UIView {
     private func setupMainActions() {
         let stack = UIStackView()
         stack.axis = .vertical
-        stack.distribution = .fillEqually
-        stack.spacing = 3
+        stack.distribution = .fill
+        stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         mainContainer.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -143,23 +145,46 @@ final class AppMenuWindowView: UIView {
             stack.bottomAnchor.constraint(equalTo: mainContainer.bottomAnchor)
         ])
 
-        stack.addArrangedSubview(menuRow(title: "Open Drafting Table Package...", icon: "folder", action: .notebooksGallery))
-        stack.addArrangedSubview(menuRow(title: "Drawing Settings...", icon: "gearshape.fill", action: .settings))
-        stack.addArrangedSubview(menuRow(title: "Reset Canvas View", icon: "arrow.down.right.and.arrow.up.left", action: .resetView))
+        // Keep this list in the same order as the upstream overflow menu. The
+        // v0.1 renderer only implements open/rename/settings/reset; the other
+        // rows remain visible as disabled ink so the preview makes its scope
+        // explicit while still routing taps to the controller's toast contract.
+        let items: [(String, String, Action, Bool)] = [
+            ("Open .drafttable…", "docs", .notebooksGallery, true),
+            ("Rename current…", "more", .renameDocument, true),
+            ("Import image…", "color", .importPhoto, false),
+            ("Export canvas as PNG…", "docs", .exportPNG, false),
+            ("Export document as PDF…", "docs", .exportPDF, false),
+            ("Backup all documents…", "docs", .saveArchive, false),
+            ("Drawing settings…", "settings", .settings, true),
+            ("Reset canvas view", "reset_view", .resetView, true),
+            ("Clear entire document", "clear", .clearDocument, false)
+        ]
+        for (index, item) in items.enumerated() {
+            stack.addArrangedSubview(menuRow(title: item.0, icon: item.1,
+                                             action: item.2, enabled: item.3))
+            if index < items.count - 1 {
+                let divider = UIView()
+                divider.backgroundColor = DraftingTheme.rule
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(divider)
+                divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            }
+        }
     }
 
     private func setupExportActions() {
         let stack = UIStackView()
         stack.axis = .vertical
         stack.distribution = .fillEqually
-        stack.spacing = 4
+        stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         exportContainer.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: exportContainer.topAnchor, constant: 6),
+            stack.topAnchor.constraint(equalTo: exportContainer.topAnchor),
             stack.leadingAnchor.constraint(equalTo: exportContainer.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: exportContainer.trailingAnchor),
-            stack.heightAnchor.constraint(equalToConstant: 160)
+            stack.bottomAnchor.constraint(equalTo: exportContainer.bottomAnchor)
         ])
 
         stack.addArrangedSubview(menuRow(title: "Export Current Page (PNG)", icon: "photo", action: .exportPNG))
@@ -168,7 +193,7 @@ final class AppMenuWindowView: UIView {
     }
 
     private func showExportMode() {
-        headerTitleLabel.text = "Export & Share"
+        headerTitleLabel.text = "EXPORT"
         headerLeadingWithoutBack?.isActive = false
         headerLeadingWithBack?.isActive = true
         backButton.isHidden = false
@@ -180,7 +205,7 @@ final class AppMenuWindowView: UIView {
     }
 
     private func showMainMenuMode() {
-        headerTitleLabel.text = "Drafting Table"
+        headerTitleLabel.text = "DRAFTING TABLE"
         headerLeadingWithBack?.isActive = false
         headerLeadingWithoutBack?.isActive = true
         backButton.isHidden = true
@@ -191,28 +216,35 @@ final class AppMenuWindowView: UIView {
         }
     }
 
-    private func menuRow(title: String, icon: String, isDestructive: Bool = false, action: Action? = nil, customAction: (() -> Void)? = nil) -> UIButton {
+    private func menuRow(title: String, icon: String, isDestructive: Bool = false,
+                         action: Action? = nil, enabled: Bool = true,
+                         customAction: (() -> Void)? = nil) -> UIButton {
         let button = UIButton(type: .system)
-        var cfg = UIButton.Configuration.plain()
-        cfg.image = UIImage(systemName: icon)
-        var titleAttr = AttributedString(title)
-        titleAttr.font = .systemFont(ofSize: 12.5, weight: .semibold)
-        cfg.attributedTitle = titleAttr
-        cfg.imagePadding = 8
-        let primaryColor = isDestructive ? DraftingTheme.hot : DraftingTheme.ink
-        cfg.baseForegroundColor = primaryColor
-        cfg.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10)
-        button.configuration = cfg
-        button.titleLabel?.numberOfLines = 2
+        let primaryColor = isDestructive ? DraftingTheme.hot :
+            (enabled ? DraftingTheme.ink : DraftingTheme.inkDisabled)
+        button.setImage(DraftingIcon.image(named: icon), for: .normal)
+        button.setTitle(title, for: .normal)
+        button.setTitleColor(primaryColor, for: .normal)
+        button.tintColor = primaryColor
+        button.titleLabel?.font = DraftingTheme.mono(size: 13)
+        button.titleLabel?.numberOfLines = 1
         button.titleLabel?.lineBreakMode = .byTruncatingTail
+        button.titleLabel?.adjustsFontSizeToFitWidth = true
+        button.titleLabel?.minimumScaleFactor = 0.82
+        button.imageView?.contentMode = .scaleAspectFit
+        button.imageView?.tintColor = primaryColor
+        button.semanticContentAttribute = .forceLeftToRight
+        button.imageEdgeInsets = UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 8)
+        button.titleEdgeInsets = UIEdgeInsets(top: 0, left: 8, bottom: 0, right: 14)
+        button.contentEdgeInsets = UIEdgeInsets(top: 9, left: 0, bottom: 9, right: 0)
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 38).isActive = true
         button.contentHorizontalAlignment = .leading
-        button.backgroundColor = isDestructive ? DraftingTheme.hot.withAlphaComponent(0.08) : UIColor.white.withAlphaComponent(0.72)
-        button.layer.cornerRadius = 8
-        button.layer.borderWidth = 1
-        button.layer.borderColor = isDestructive ? DraftingTheme.hot.withAlphaComponent(0.25).cgColor : DraftingTheme.rule.withAlphaComponent(0.6).cgColor
+        button.backgroundColor = enabled ? DraftingTheme.paper : DraftingTheme.paper.withAlphaComponent(0.82)
+        button.accessibilityTraits = enabled ? [.button] : [.button, .notEnabled]
+        button.accessibilityHint = enabled ? nil : "Unavailable in the v0.1 preview"
 
         button.addAction(UIAction { [weak self] _ in
-            HapticFeedbackService.shared.toolSwitched()
+            if enabled { HapticFeedbackService.shared.toolSwitched() }
             if let customAction {
                 customAction()
             } else if let action {
