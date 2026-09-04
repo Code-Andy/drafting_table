@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json.schemastore.org/design-tokens.json",
+  "version": "concept-a-v4.1",
+  "source": {
+    "repository": "https://github.com/bgkatz/drafting_table",
+    "commit": "9a668cde44f5194db51df64a355a15af55f126a6",
+    "androidColors": "app/src/main/res/values/colors.xml#L8-L19",
+    "androidMainActivity": "app/src/main/java/com/bk/drawing/MainActivity.kt#L34-L45,L238-L250,L352-L452,L560-L710,L781-L1028,L1249-L1628,L1684-L1958,L2418-L2527",
+    "iconSource": "app/src/main/res/drawable/ic_*.xml",
+    "notes": "The Android source is the visual/design reference; platform-specific behavior and known bugs are not copied automatically."
+  },
+  "color": {
+    "paper": { "value": "#F5F0E6", "type": "color", "description": "Warm off-white canvas" },
+    "paperDeep": { "value": "#EDE5D2", "type": "color", "description": "Deeper warm panel surface" },
+    "ink": { "value": "#2A2620", "type": "color", "description": "Warm near-black ink" },
+    "inkSoft": { "value": "#6B6357", "type": "color", "description": "Mid warm gray" },
+    "inkFaint": { "value": "#B8AE9B", "type": "color", "description": "Faint stroke/hint" },
+    "rule": { "value": "#D9CFB8", "type": "color", "description": "Hairline rule" },
+    "accent": { "value": "#3A4F6B", "type": "color", "description": "Ink-blue secondary accent" },
+    "hot": { "value": "#B5482E", "type": "color", "description": "Sienna active-state accent" },
+    "bezel": { "value": "#1A1714", "type": "color", "description": "Outside canvas" },
+    "inkDisabled": { "value": "#C8BFA9", "type": "color", "description": "Disabled control ink" }
+  },
+  "palette": {
+    "count": 32,
+    "columns": 8,
+    "rows": [
+      { "name": "deep", "values": ["#000000", "#6E2218", "#8A3F0F", "#886C18", "#3D5E26", "#195049", "#1A3D60", "#4A2A65"] },
+      { "name": "standard", "values": ["#1A1A1A", "#B5482E", "#C77A1F", "#C8A030", "#5A8C3A", "#2F7E78", "#2A5D8F", "#6B3A8A"] },
+      { "name": "mid-light", "values": ["#6E6457", "#C07A60", "#D0A270", "#CAB870", "#95B070", "#6FA59E", "#6F95C0", "#A088B5"] },
+      { "name": "pale", "values": ["#FFFFFF", "#7A7368", "#A89E8A", "#D9CFB8", "#F2D89A", "#F2A48F", "#9DB8D8", "#C7D2A8"] }
+    ]
+  },
+  "typography": {
+    "fontFamily": {
+      "mono": { "preferred": "JetBrains Mono", "fallback": "Menlo", "use": "tool labels, section headings, measurements, status" },
+      "sans": { "preferred": "Inter", "fallback": "Helvetica Neue", "use": "prose and control text" }
+    },
+    "size": { "status": 9, "sectionLabel": 8, "body": 12, "heading": 10, "dialogTitle": 11 },
+    "weight": { "regular": 400, "semibold": 600 }
+  },
+  "spacing": {
+    "railWidth": 56,
+    "pagesWidth": 84,
+    "layersWidth": 180,
+    "statusHeight": 28,
+    "railTile": 38,
+    "railTilePadding": 6,
+    "railTileVerticalMargin": 1,
+    "railRuleWidth": 30,
+    "railRuleVerticalMargin": 3,
+    "panelSectionHeaderHeight": 28,
+    "layerRowHeight": 32,
+    "pageThumbMaxWidth": 60,
+    "pageThumbMaxHeight": 78,
+    "panelBodyInset": { "leading": 10, "top": 8, "trailing": 10, "bottom": 12 },
+    "statusHorizontalInset": 12,
+    "statusItemGap": 18,
+    "undoChipTopInset": 16,
+    "undoChipLeadingInset": 16
+  },
+  "components": {
+    "toolTile": { "size": 38, "iconViewport": "24x24", "activeTint": "hot", "inactiveTint": "ink", "background": "paperDeep" },
+    "railSectionLabel": { "font": "mono", "size": 8, "tracking": 0.12, "color": "inkFaint" },
+    "layerSectionHeader": { "height": 28, "font": "mono", "size": 10, "tracking": 0.08, "background": "paperDeep", "rule": "rule" },
+    "layerRow": { "height": 32, "activeBackground": "paperDeep", "activeMarker": "hot", "divider": "rule" },
+    "brushSliderRow": { "horizontalInset": 10, "verticalInset": 4, "valueColumn": 36 },
+    "colorSwatches": { "active": "28x28", "previous": "22x22", "palette": "16x16", "recent": "18x18", "mySlots": "28x28" },
+    "statusBar": { "height": 28, "background": "paperDeep", "rule": "rule", "font": "mono", "size": 9 },
+    "undoRedoChip": { "background": "paperDeep", "iconSlot": "28x22", "topLeading": 16 }
+  },
+  "icons": {
+    "sourceGeometry": "24x24",
+    "rendering": "template/currentColor",
+    "assetPrefix": "dt_",
+    "names": ["menu", "pen", "eraser", "bucket", "shade", "line", "rect", "circle", "ellipse", "select", "lasso", "layers", "pages", "color", "reset_view", "undo", "redo", "eye", "eye_off", "more", "drag_handle", "plus", "plus_vector", "vector_select", "grid", "snap", "eyedropper", "docs"]
+  },
+  "layout": {
+    "landscape": {
+      "regions": ["tool rail (56dp)", "page sidebar (84dp)", "layer panel (180dp)", "canvas (remaining width)"],
+      "status": "28dp pinned to bottom"
+    },
+    "interaction": {
+      "pageThumbnail": "portrait fit inside 60×78dp without letterboxing",
+      "panelCollapse": "layers/color wrappers collapse with their divider",
+      "canvasInset": "undo/redo chip begins 16dp after visible panel row"
+    }
+  }
+}

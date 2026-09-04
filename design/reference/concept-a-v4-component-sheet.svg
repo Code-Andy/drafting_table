@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Figma-importable Concept A v4 reference sheet.
+  Geometry and colors mirror the upstream Android MainActivity preview.
+  Keep this as a visual review aid; app source remains authoritative for
+  interaction and renderer behavior.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
+  <defs>
+    <style>
+      .mono { font-family: 'JetBrains Mono', 'Menlo', monospace; }
+      .sans { font-family: 'Inter', 'Helvetica Neue', sans-serif; }
+      .ink { fill: #2A2620; }
+      .soft { fill: #6B6357; }
+      .faint { fill: #B8AE9B; }
+      .rule { stroke: #D9CFB8; }
+      .line { fill: none; stroke: #2A2620; stroke-linecap: round; stroke-linejoin: round; }
+      .caption { font-size: 14px; letter-spacing: .08em; }
+      .small { font-size: 12px; }
+    </style>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#2A2620" flood-opacity=".16"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1200" fill="#F5F0E6"/>
+  <text x="64" y="62" class="mono ink" font-size="28" font-weight="600" letter-spacing=".08em">DRAFTING TABLE / CONCEPT A V4</text>
+  <text x="64" y="91" class="sans soft" font-size="16">Original Android UI reference · iPad parity sheet · 24×24 template icon geometry</text>
+  <line x1="64" y1="116" x2="1536" y2="116" class="rule" stroke-width="1"/>
+
+  <!-- token strip -->
+  <g transform="translate(64 138)">
+    <text x="0" y="18" class="mono faint caption">TOKENS</text>
+    <g transform="translate(112 0)">
+      <rect width="34" height="34" rx="5" fill="#F5F0E6" stroke="#D9CFB8"/>
+      <text x="45" y="22" class="mono soft small">paper #F5F0E6</text>
+      <rect x="176" width="34" height="34" rx="5" fill="#EDE5D2"/>
+      <text x="221" y="22" class="mono soft small">paperDeep #EDE5D2</text>
+      <rect x="407" width="34" height="34" rx="5" fill="#2A2620"/>
+      <text x="452" y="22" class="mono soft small">ink #2A2620</text>
+      <rect x="594" width="34" height="34" rx="5" fill="#6B6357"/>
+      <text x="639" y="22" class="mono soft small">inkSoft #6B6357</text>
+      <rect x="800" width="34" height="34" rx="5" fill="#D9CFB8"/>
+      <text x="845" y="22" class="mono soft small">rule #D9CFB8</text>
+      <rect x="992" width="34" height="34" rx="5" fill="#B5482E"/>
+      <text x="1037" y="22" class="mono soft small">hot #B5482E</text>
+    </g>
+  </g>
+
+  <!-- landscape iPad frame -->
+  <g transform="translate(64 228)" filter="url(#shadow)">
+    <rect width="720" height="500" rx="28" fill="#1A1714"/>
+    <rect x="18" y="18" width="684" height="464" rx="15" fill="#F5F0E6"/>
+    <circle cx="360" cy="9" r="3" fill="#6B6357"/>
+    <!-- shell regions: 56/84/180dp at the reference scale -->
+    <rect x="18" y="18" width="31" height="464" fill="#EDE5D2"/>
+    <rect x="49" y="18" width="47" height="464" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <rect x="96" y="18" width="101" height="464" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <rect x="197" y="18" width="505" height="464" fill="#FFFFFF"/>
+    <!-- tool rail -->
+    <g transform="translate(21 31)" fill="none" stroke="#2A2620" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="0" y="0" width="25" height="25" rx="4" fill="#EDE5D2" stroke="#D9CFB8"/>
+      <path d="M6 8h13M6 13h13M6 18h13" stroke-width="1.3"/>
+      <line x1="3" y1="35" x2="22" y2="35" stroke="#D9CFB8"/>
+      <text x="12" y="50" text-anchor="middle" class="mono" font-size="6" fill="#B8AE9B" stroke="none">DRAW</text>
+      <rect x="0" y="57" width="25" height="25" rx="4" fill="#EDE5D2" stroke="#B5482E"/>
+      <path d="M11 62l4 4-7 12-4-4z" stroke-width="1.3"/>
+      <rect x="0" y="86" width="25" height="25" rx="4" fill="#EDE5D2" stroke="#D9CFB8"/>
+      <path d="M5 103l7-7 7 7" stroke-width="1.3"/>
+      <line x1="3" y1="121" x2="22" y2="121" stroke="#D9CFB8"/>
+      <text x="12" y="136" text-anchor="middle" class="mono" font-size="6" fill="#B8AE9B" stroke="none">VECTOR</text>
+      <rect x="0" y="143" width="25" height="25" rx="4" fill="#EDE5D2" stroke="#D9CFB8"/>
+      <path d="M5 163l14-14" stroke-width="1.3"/>
+      <rect x="0" y="172" width="25" height="25" rx="4" fill="#EDE5D2" stroke="#D9CFB8"/>
+      <circle cx="12" cy="184" r="7" stroke-width="1.3"/>
+    </g>
+    <!-- pages rail -->
+    <g transform="translate(55 33)">
+      <rect width="32" height="64" rx="2" fill="#F5F0E6" stroke="#D9CFB8"/>
+      <rect x="4" y="4" width="24" height="32" fill="#FFFFFF" stroke="#B5482E"/>
+      <rect x="4" y="42" width="24" height="17" fill="#FFFFFF" stroke="#D9CFB8"/>
+      <text x="16" y="79" text-anchor="middle" class="mono faint" font-size="7">PAGES</text>
+    </g>
+    <!-- layers panel -->
+    <g transform="translate(101 31)">
+      <rect width="91" height="132" fill="#F5F0E6" stroke="#D9CFB8"/>
+      <rect width="91" height="18" fill="#EDE5D2"/>
+      <text x="6" y="13" class="mono ink" font-size="7" font-weight="600">LAYERS</text>
+      <text x="72" y="13" class="mono soft" font-size="11">+</text>
+      <rect x="0" y="18" width="91" height="21" fill="#EDE5D2"/>
+      <rect x="0" y="18" width="3" height="21" fill="#B5482E"/>
+      <circle cx="11" cy="29" r="4" fill="none" stroke="#2A2620" stroke-width="1"/>
+      <text x="20" y="32" class="mono ink" font-size="7">layer 2</text>
+      <line x1="0" y1="39" x2="91" y2="39" stroke="#D9CFB8"/>
+      <circle cx="11" cy="50" r="4" fill="none" stroke="#6B6357" stroke-width="1"/>
+      <text x="20" y="53" class="mono soft" font-size="7">layer 1</text>
+      <line x1="0" y1="60" x2="91" y2="60" stroke="#D9CFB8"/>
+      <text x="6" y="75" class="mono soft" font-size="7">opacity</text>
+      <line x1="6" y1="84" x2="82" y2="84" stroke="#D9CFB8" stroke-width="2"/>
+      <circle cx="57" cy="84" r="3" fill="#B5482E"/>
+      <rect y="95" width="91" height="37" fill="#F5F0E6"/>
+      <text x="6" y="111" class="mono ink" font-size="7" font-weight="600">BRUSH</text>
+      <line x1="6" y1="119" x2="82" y2="119" stroke="#D9CFB8" stroke-width="2"/>
+      <circle cx="48" cy="119" r="3" fill="#2A2620"/>
+    </g>
+    <!-- canvas and undo chip -->
+    <rect x="216" y="42" width="448" height="370" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <rect x="230" y="56" width="420" height="342" fill="#FFFFFF" stroke="#D9CFB8"/>
+    <path d="M305 292 C355 145 428 300 490 190 S574 210 618 145" fill="none" stroke="#2A2620" stroke-width="4" stroke-linecap="round"/>
+    <rect x="231" y="57" width="84" height="24" rx="6" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <path d="M247 69h12M247 69c7-9 19-9 24-1" fill="none" stroke="#2A2620" stroke-width="1.4" stroke-linecap="round"/>
+    <path d="M287 69h12M299 69c-7-9-19-9-24-1" fill="none" stroke="#2A2620" stroke-width="1.4" stroke-linecap="round"/>
+    <rect x="18" y="447" width="684" height="35" fill="#EDE5D2"/>
+    <line x1="18" y1="447" x2="702" y2="447" stroke="#D9CFB8"/>
+    <text x="31" y="469" class="mono soft" font-size="8">doc · sketch</text>
+    <text x="123" y="469" class="mono hot" font-size="8">◇ brush</text>
+    <text x="607" y="469" class="mono soft" font-size="8">page 01 / 01</text>
+    <text x="360" y="520" text-anchor="middle" class="mono soft caption">LANDSCAPE FRAME · 56 / 84 / 180 / CANVAS · STATUS 28</text>
+  </g>
+
+  <!-- portrait iPad frame -->
+  <g transform="translate(832 228)" filter="url(#shadow)">
+    <rect width="320" height="500" rx="28" fill="#1A1714"/>
+    <rect x="14" y="18" width="292" height="464" rx="15" fill="#F5F0E6"/>
+    <circle cx="160" cy="9" r="3" fill="#6B6357"/>
+    <rect x="26" y="31" width="268" height="45" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <text x="40" y="58" class="mono ink" font-size="10" font-weight="600">DRAFTING TABLE</text>
+    <path d="M261 50h17M261 56h17M261 62h17" stroke="#2A2620" stroke-width="1.5" stroke-linecap="round"/>
+    <rect x="26" y="84" width="268" height="306" fill="#FFFFFF" stroke="#D9CFB8"/>
+    <rect x="46" y="106" width="228" height="252" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <path d="M78 296 C119 165 155 283 195 207 S231 235 258 173" fill="none" stroke="#2A2620" stroke-width="3" stroke-linecap="round"/>
+    <rect x="26" y="401" width="268" height="63" fill="#EDE5D2"/>
+    <text x="40" y="425" class="mono soft" font-size="8">brush</text>
+    <text x="40" y="444" class="mono soft" font-size="8">size 1.0</text>
+    <text x="240" y="444" class="mono soft" font-size="8">01 / 01</text>
+    <text x="160" y="520" text-anchor="middle" class="mono soft caption">PORTRAIT FRAME</text>
+  </g>
+
+  <!-- component cards -->
+  <text x="64" y="790" class="mono ink" font-size="18" font-weight="600" letter-spacing=".08em">COMPONENTS / 1:1 REFERENCE</text>
+
+  <!-- tool tile -->
+  <g transform="translate(64 820)">
+    <rect width="160" height="164" rx="8" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <text x="16" y="24" class="mono ink" font-size="11" font-weight="600">TOOL TILE</text>
+    <rect x="22" y="42" width="54" height="54" rx="7" fill="#EDE5D2" stroke="#B5482E" stroke-width="2"/>
+    <path d="M51 49l9 9-16 28-9-9z" class="line" stroke-width="2"/>
+    <rect x="84" y="42" width="54" height="54" rx="7" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <path d="M113 50h17M113 59h17M113 68h17" class="line" stroke-width="1.4"/>
+    <text x="26" y="119" class="mono hot small">active / hot</text>
+    <text x="88" y="119" class="mono soft small">idle / ink</text>
+    <text x="16" y="145" class="mono faint small">38×38dp · pad 6</text>
+  </g>
+
+  <!-- page thumbnail -->
+  <g transform="translate(244 820)">
+    <rect width="180" height="164" rx="8" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <text x="16" y="24" class="mono ink" font-size="11" font-weight="600">PAGE THUMB</text>
+    <rect x="28" y="40" width="76" height="100" fill="#FFFFFF" stroke="#B5482E" stroke-width="2"/>
+    <path d="M41 117 C58 68 72 128 93 83" fill="none" stroke="#2A2620" stroke-width="2"/>
+    <rect x="111" y="40" width="42" height="100" fill="#EDE5D2"/>
+    <text x="119" y="64" class="mono soft" font-size="9">01</text>
+    <path d="M122 87h20M122 95h20M122 103h14" stroke="#6B6357" stroke-width="1"/>
+    <text x="16" y="154" class="mono faint small">fit 60×78dp · no letterbox</text>
+  </g>
+
+  <!-- layer row -->
+  <g transform="translate(444 820)">
+    <rect width="230" height="164" rx="8" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <text x="16" y="24" class="mono ink" font-size="11" font-weight="600">LAYER ROW</text>
+    <rect x="16" y="41" width="198" height="40" fill="#EDE5D2"/>
+    <rect x="16" y="41" width="4" height="40" fill="#B5482E"/>
+    <circle cx="39" cy="61" r="7" fill="none" stroke="#2A2620" stroke-width="1.5"/>
+    <text x="54" y="66" class="mono ink" font-size="11">layer 2</text>
+    <text x="178" y="65" class="mono hot" font-size="10">100%</text>
+    <line x1="16" y1="81" x2="214" y2="81" stroke="#D9CFB8"/>
+    <circle cx="39" cy="101" r="7" fill="none" stroke="#6B6357" stroke-width="1.5"/>
+    <text x="54" y="106" class="mono soft" font-size="11">layer 1</text>
+    <text x="16" y="139" class="mono faint small">32dp row · 28dp header · 1dp rules</text>
+  </g>
+
+  <!-- brush controls -->
+  <g transform="translate(694 820)">
+    <rect width="290" height="164" rx="8" fill="#F5F0E6" stroke="#D9CFB8"/>
+    <text x="16" y="24" class="mono ink" font-size="11" font-weight="600">BRUSH / COLOR</text>
+    <text x="16" y="52" class="mono soft" font-size="10">size</text>
+    <line x1="65" y1="49" x2="244" y2="49" stroke="#D9CFB8" stroke-width="3"/>
+    <circle cx="178" cy="49" r="5" fill="#2A2620"/>
+    <text x="254" y="53" class="mono ink" font-size="10">1.0</text>
+    <text x="16" y="82" class="mono soft" font-size="10">opacity</text>
+    <line x1="65" y1="79" x2="244" y2="79" stroke="#D9CFB8" stroke-width="3"/>
+    <circle cx="215" cy="79" r="5" fill="#B5482E"/>
+    <text x="254" y="83" class="mono ink" font-size="10">100%</text>
+    <rect x="16" y="101" width="29" height="29" fill="#2A2620" stroke="#2A2620"/>
+    <rect x="24" y="109" width="22" height="22" fill="#EDE5D2" stroke="#6B6357"/>
+    <text x="57" y="120" class="mono ink" font-size="11">#000000</text>
+    <text x="16" y="150" class="mono faint small">body inset 10 / 8 / 10 / 12dp</text>
+  </g>
+
+  <!-- status -->
+  <g transform="translate(1004 820)">
+    <rect width="532" height="164" rx="8" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <text x="16" y="24" class="mono ink" font-size="11" font-weight="600">STATUS + UNDO CHIP</text>
+    <rect x="16" y="41" width="500" height="35" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <text x="28" y="63" class="mono soft" font-size="10">doc · sketch</text>
+    <text x="148" y="63" class="mono hot" font-size="10">◇ brush</text>
+    <text x="250" y="63" class="mono soft" font-size="10">grid: off</text>
+    <text x="429" y="63" class="mono soft" font-size="10">page 01 / 01</text>
+    <rect x="16" y="94" width="84" height="28" rx="6" fill="#EDE5D2" stroke="#D9CFB8"/>
+    <path d="M30 108h14M30 108c8-9 20-9 26-1" fill="none" stroke="#2A2620" stroke-width="1.4"/>
+    <path d="M69 108h14M83 108c-8-9-20-9-26-1" fill="none" stroke="#2A2620" stroke-width="1.4"/>
+    <text x="117" y="112" class="mono soft small">28dp status · 16dp chip insets</text>
+    <text x="16" y="146" class="mono faint small">mono 9sp · 18dp item gap · paperDeep surface</text>
+  </g>
+
+  <text x="64" y="1052" class="sans soft" font-size="14">Review note: preserve path geometry and spacing first; renderer ownership and Pencil latency are independent implementation layers.</text>
+  <text x="64" y="1080" class="mono faint" font-size="12">Source: bgkatz/drafting_table @ 9a668cde · Android colors.xml + MainActivity.kt · generated for Figma import</text>
+</svg>
