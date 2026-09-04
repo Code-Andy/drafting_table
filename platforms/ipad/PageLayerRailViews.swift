@@ -211,7 +211,7 @@ final class LayersRailView: UIView {
         layer.shadowRadius = 8
         layer.shadowOffset = CGSize(width: 0, height: 2)
         stack.axis = .vertical
-        stack.spacing = 8
+        stack.spacing = 3
         stack.alignment = .fill
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -224,18 +224,18 @@ final class LayersRailView: UIView {
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8),
-            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 10),
-            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -10),
-            stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -16)
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 5),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -5),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 6),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -6),
+            stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -10)
         ])
     }
 
     private func titleLabel(_ text: String) -> UILabel {
         let label = UILabel()
         label.text = text
-        label.font = .systemFont(ofSize: 10, weight: .bold)
+        label.font = .systemFont(ofSize: 9.5, weight: .bold)
         label.textColor = UIColor(red: 0.38, green: 0.33, blue: 0.27, alpha: 0.70)
         label.textAlignment = .center
         return label
@@ -243,35 +243,98 @@ final class LayersRailView: UIView {
 
     private func reload() {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        stack.addArrangedSubview(titleLabel("LAYERS"))
+
+        let headerRow = UIStackView()
+        headerRow.axis = .horizontal
+        headerRow.alignment = .center
+        headerRow.distribution = .fill
+        headerRow.spacing = 4
+
+        let lbl = titleLabel("LAYERS")
+        headerRow.addArrangedSubview(lbl)
+
+        let addBtn = UIButton(type: .system)
+        let addCfg = UIImage.SymbolConfiguration(pointSize: 11, weight: .bold)
+        addBtn.setImage(UIImage(systemName: "plus", withConfiguration: addCfg), for: .normal)
+        addBtn.tintColor = .systemBlue
+        addBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
+        addBtn.layer.cornerRadius = 4
+        addBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        addBtn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        addBtn.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
+        headerRow.addArrangedSubview(addBtn)
+
+        stack.addArrangedSubview(headerRow)
+
         let canDelete = layerInfos.count > 1
-        for info in layerInfos {
+        var activeInfo: DTLayerInfo? = nil
+
+        for info in layerInfos.reversed() {
+            if info.selected { activeInfo = info }
             let row = LayerRowView(info: info, canDelete: canDelete,
-                                   canMoveUp: info.index > 0,
-                                   canMoveDown: info.index + 1 < UInt(layerInfos.count))
+                                   canMoveUp: info.index + 1 < UInt(layerInfos.count),
+                                   canMoveDown: info.index > 0)
             row.onSelect = { [weak self] in self?.onSelect?(Int(info.index)) }
             row.onRename = { [weak self] in self?.onRename?(Int(info.index)) }
             row.onDelete = { [weak self] in self?.onDelete?(Int(info.index)) }
             row.onDuplicate = { [weak self] in self?.onDuplicate?(Int(info.index)) }
             row.onMove = { [weak self] offset in self?.onMove?(Int(info.index), Int(info.index) + offset) }
             row.onVisibility = { [weak self] visible in self?.onVisibility?(visible, Int(info.index)) }
-            row.onOpacity = { [weak self] opacity in self?.onOpacity?(opacity, Int(info.index)) }
-            row.onOpacityCommit = { [weak self] opacity in self?.onOpacityCommit?(opacity, Int(info.index)) }
             stack.addArrangedSubview(row)
         }
-        let add = UIButton(type: .system)
-        var addCfg = UIButton.Configuration.plain()
-        addCfg.image = UIImage(systemName: "plus")
-        addCfg.title = "Layer"
-        addCfg.imagePadding = 4
-        addCfg.baseForegroundColor = .systemBlue
-        add.configuration = addCfg
-        add.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
-        add.layer.cornerRadius = 7
-        add.heightAnchor.constraint(equalToConstant: 34).isActive = true
-        add.accessibilityLabel = "Add layer"
-        add.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
-        stack.addArrangedSubview(add)
+
+        if let active = activeInfo {
+            let opacityBox = UIView()
+            opacityBox.backgroundColor = UIColor.white.withAlphaComponent(0.7)
+            opacityBox.layer.cornerRadius = 6
+            opacityBox.layer.borderWidth = 1
+            opacityBox.layer.borderColor = UIColor.black.withAlphaComponent(0.06).cgColor
+
+            let opStack = UIStackView()
+            opStack.axis = .vertical
+            opStack.spacing = 2
+            opStack.translatesAutoresizingMaskIntoConstraints = false
+            opacityBox.addSubview(opStack)
+            NSLayoutConstraint.activate([
+                opStack.leadingAnchor.constraint(equalTo: opacityBox.leadingAnchor, constant: 6),
+                opStack.trailingAnchor.constraint(equalTo: opacityBox.trailingAnchor, constant: -6),
+                opStack.topAnchor.constraint(equalTo: opacityBox.topAnchor, constant: 4),
+                opStack.bottomAnchor.constraint(equalTo: opacityBox.bottomAnchor, constant: -4)
+            ])
+
+            let topRow = UIStackView()
+            topRow.axis = .horizontal
+            topRow.distribution = .equalSpacing
+
+            let alphaLabel = UILabel()
+            alphaLabel.text = "α OPACITY"
+            alphaLabel.font = .systemFont(ofSize: 8.5, weight: .bold)
+            alphaLabel.textColor = UIColor(red: 0.38, green: 0.33, blue: 0.27, alpha: 0.70)
+            topRow.addArrangedSubview(alphaLabel)
+
+            let valLabel = UILabel()
+            valLabel.text = String(format: "%.0f%%", max(0, min(1, active.opacity)) * 100)
+            valLabel.font = .monospacedDigitSystemFont(ofSize: 8.5, weight: .bold)
+            valLabel.textColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
+            topRow.addArrangedSubview(valLabel)
+            opStack.addArrangedSubview(topRow)
+
+            let slider = UISlider()
+            slider.minimumValue = 0
+            slider.maximumValue = 1
+            slider.value = Float(max(0, min(1, active.opacity)))
+            slider.tintColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
+            slider.addAction(UIAction { [weak self, weak valLabel] _ in
+                valLabel?.text = String(format: "%.0f%%", slider.value * 100)
+                self?.onOpacity?(CGFloat(slider.value), Int(active.index))
+            }, for: .valueChanged)
+            slider.addAction(UIAction { [weak self] _ in
+                self?.onOpacityCommit?(CGFloat(slider.value), Int(active.index))
+            }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
+            opStack.addArrangedSubview(slider)
+
+            stack.addArrangedSubview(opacityBox)
+        }
     }
 }
 
@@ -282,8 +345,6 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     var onDuplicate: (() -> Void)?
     var onMove: ((Int) -> Void)?
     var onVisibility: ((Bool) -> Void)?
-    var onOpacity: ((CGFloat) -> Void)?
-    var onOpacityCommit: ((CGFloat) -> Void)?
     private let info: DTLayerInfo
     private let canDelete: Bool
     private let canMoveUp: Bool
@@ -291,7 +352,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     private let nameLabel = UILabel()
     private let opacityLabel = UILabel()
     private let visibilityButton = UIButton(type: .system)
-    private let opacitySlider = UISlider()
+    private let accentBar = UIView()
 
     init(info: DTLayerInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool) {
         self.info = info
@@ -299,62 +360,63 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
         self.canMoveUp = canMoveUp
         self.canMoveDown = canMoveDown
         super.init(frame: .zero)
-        backgroundColor = info.selected ? UIColor.systemBlue.withAlphaComponent(0.12) : .clear
-        layer.cornerRadius = 7
-        heightAnchor.constraint(equalToConstant: 58).isActive = true
-        nameLabel.text = info.name
-        nameLabel.font = .systemFont(ofSize: 12, weight: info.selected ? .semibold : .regular)
-        nameLabel.textColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
-        nameLabel.lineBreakMode = .byTruncatingTail
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        opacityLabel.text = String(format: "%.0f%%", max(0, min(1, info.opacity)) * 100)
-        opacityLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
-        opacityLabel.textColor = .secondaryLabel
-        opacityLabel.textAlignment = .right
-        opacityLabel.translatesAutoresizingMaskIntoConstraints = false
-        visibilityButton.setImage(UIImage(systemName: info.visible ? "eye.fill" : "eye.slash"), for: .normal)
-        visibilityButton.tintColor = info.visible ? .systemBlue : .secondaryLabel
+
+        backgroundColor = info.selected ? UIColor.systemBlue.withAlphaComponent(0.12) : UIColor.white.withAlphaComponent(0.65)
+        layer.cornerRadius = 5
+        layer.borderWidth = info.selected ? 1.5 : 1
+        layer.borderColor = (info.selected ? UIColor.systemBlue.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.06)).cgColor
+        heightAnchor.constraint(equalToConstant: 30).isActive = true
+
+        accentBar.backgroundColor = info.selected ? UIColor.systemBlue : .clear
+        accentBar.layer.cornerRadius = 1
+        accentBar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(accentBar)
+
+        let eyeCfg = UIImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+        visibilityButton.setImage(UIImage(systemName: info.visible ? "eye.fill" : "eye.slash", withConfiguration: eyeCfg), for: .normal)
+        visibilityButton.tintColor = info.visible ? UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1) : .tertiaryLabel
         visibilityButton.accessibilityLabel = info.visible ? "Hide layer" : "Show layer"
         visibilityButton.translatesAutoresizingMaskIntoConstraints = false
         visibilityButton.addAction(UIAction { [weak self] _ in
             guard let self else { return }
             self.onVisibility?(!self.info.visible)
         }, for: .touchUpInside)
-        opacitySlider.minimumValue = 0
-        opacitySlider.maximumValue = 1
-        opacitySlider.value = Float(max(0, min(1, info.opacity)))
-        opacitySlider.isContinuous = true
-        opacitySlider.accessibilityLabel = "Layer opacity"
-        opacitySlider.accessibilityValue = opacityLabel.text
-        opacitySlider.translatesAutoresizingMaskIntoConstraints = false
-        opacitySlider.addAction(UIAction { [weak self] _ in
-            guard let self else { return }
-            let slider = self.opacitySlider
-            self.opacityLabel.text = String(format: "%.0f%%", slider.value * 100)
-            self.opacitySlider.accessibilityValue = self.opacityLabel.text
-            self.onOpacity?(CGFloat(slider.value))
-        }, for: .valueChanged)
-        opacitySlider.addAction(UIAction { [weak self] _ in
-            guard let self else { return }
-            self.onOpacityCommit?(CGFloat(self.opacitySlider.value))
-        }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
-        addSubview(nameLabel); addSubview(opacityLabel); addSubview(visibilityButton); addSubview(opacitySlider)
+        addSubview(visibilityButton)
+
+        nameLabel.text = info.name
+        nameLabel.font = .systemFont(ofSize: 9.5, weight: info.selected ? .bold : .regular)
+        nameLabel.textColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(nameLabel)
+
+        opacityLabel.text = String(format: "%.0f%%", max(0, min(1, info.opacity)) * 100)
+        opacityLabel.font = .monospacedDigitSystemFont(ofSize: 8.5, weight: .regular)
+        opacityLabel.textColor = .secondaryLabel
+        opacityLabel.textAlignment = .right
+        opacityLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(opacityLabel)
+
         NSLayoutConstraint.activate([
-            visibilityButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
-            visibilityButton.topAnchor.constraint(equalTo: topAnchor, constant: 5),
-            visibilityButton.widthAnchor.constraint(equalToConstant: 24),
-            visibilityButton.heightAnchor.constraint(equalToConstant: 24),
-            nameLabel.leadingAnchor.constraint(equalTo: visibilityButton.trailingAnchor, constant: 2),
+            accentBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            accentBar.widthAnchor.constraint(equalToConstant: 2.5),
+
+            visibilityButton.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 3),
+            visibilityButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            visibilityButton.widthAnchor.constraint(equalToConstant: 20),
+            visibilityButton.heightAnchor.constraint(equalToConstant: 20),
+
+            nameLabel.leadingAnchor.constraint(equalTo: visibilityButton.trailingAnchor, constant: 3),
             nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: opacityLabel.leadingAnchor, constant: -2),
-            nameLabel.centerYAnchor.constraint(equalTo: visibilityButton.centerYAnchor),
+            nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
             opacityLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
-            opacityLabel.centerYAnchor.constraint(equalTo: visibilityButton.centerYAnchor),
-            opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 30),
-            opacitySlider.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            opacitySlider.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            opacitySlider.topAnchor.constraint(equalTo: visibilityButton.bottomAnchor, constant: 0),
-            opacitySlider.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2)
+            opacityLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 26)
         ])
+
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(selected)))
         addInteraction(UIContextMenuInteraction(delegate: self))
         accessibilityLabel = "Layer \(info.name)"
@@ -371,8 +433,8 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
             guard let self else { return UIMenu(title: "", children: []) }
             let rename = UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.onRename?() }
             let duplicate = UIAction(title: "Duplicate", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.onDuplicate?() }
-            let moveUp = UIAction(title: "Move Up", image: UIImage(systemName: "arrow.up"), attributes: self.canMoveUp ? [] : [.disabled]) { [weak self] _ in self?.onMove?(-1) }
-            let moveDown = UIAction(title: "Move Down", image: UIImage(systemName: "arrow.down"), attributes: self.canMoveDown ? [] : [.disabled]) { [weak self] _ in self?.onMove?(1) }
+            let moveUp = UIAction(title: "Move Up", image: UIImage(systemName: "arrow.up"), attributes: self.canMoveUp ? [] : [.disabled]) { [weak self] _ in self?.onMove?(1) }
+            let moveDown = UIAction(title: "Move Down", image: UIImage(systemName: "arrow.down"), attributes: self.canMoveDown ? [] : [.disabled]) { [weak self] _ in self?.onMove?(-1) }
             let delete = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: self.canDelete ? [] : [.disabled]) { [weak self] _ in self?.onDelete?() }
             return UIMenu(title: self.info.name, children: [rename, duplicate, UIMenu(title: "Move", options: .displayInline, children: [moveUp, moveDown]), delete])
         }

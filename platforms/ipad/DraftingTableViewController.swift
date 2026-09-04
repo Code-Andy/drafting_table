@@ -75,6 +75,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var undoRedoLeadingConstraint: NSLayoutConstraint?
     private var bucketSubToolBarLeadingConstraint: NSLayoutConstraint?
     private var brushSubToolBarLeadingConstraint: NSLayoutConstraint?
+    private var layersRailLeadingConstraint: NSLayoutConstraint?
+    private var pagesToggleButton: UIButton!
+    private var layersToggleButton: UIButton!
 
     // Tool rail buttons
     private var brushButton: UIButton!
@@ -147,11 +150,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             pagesRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
             pagesRail.widthAnchor.constraint(equalToConstant: 72),
 
-            // Layer sidebar
-            layersRail.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -8),
+            // Layer sidebar (compact 120pt width, stacked on left)
             layersRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
             layersRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
-            layersRail.widthAnchor.constraint(equalToConstant: 156),
+            layersRail.widthAnchor.constraint(equalToConstant: 120),
 
             // Floating Undo / Redo chip over top-left canvas
             undoRedoChip.topAnchor.constraint(equalTo: safe.topAnchor, constant: 8),
@@ -175,12 +177,16 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             selectionActionBar.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -14),
             toastLabel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             toastLabel.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -14),
-            toastLabel.leadingAnchor.constraint(greaterThanOrEqualTo: pagesRail.trailingAnchor, constant: 18),
-            toastLabel.trailingAnchor.constraint(lessThanOrEqualTo: layersRail.leadingAnchor, constant: -18),
-            emptyState.centerXAnchor.constraint(equalTo: root.centerXAnchor), emptyState.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: -12),
-            emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: pagesRail.trailingAnchor, constant: 18), emptyState.trailingAnchor.constraint(lessThanOrEqualTo: layersRail.leadingAnchor, constant: -18),
-            diagnostics.leadingAnchor.constraint(equalTo: pagesRail.trailingAnchor, constant: 12), diagnostics.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
-            diagnostics.widthAnchor.constraint(greaterThanOrEqualToConstant: 150), diagnostics.widthAnchor.constraint(lessThanOrEqualToConstant: 240)
+            toastLabel.leadingAnchor.constraint(greaterThanOrEqualTo: safe.leadingAnchor, constant: 18),
+            toastLabel.trailingAnchor.constraint(lessThanOrEqualTo: safe.trailingAnchor, constant: -18),
+            emptyState.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            emptyState.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: -12),
+            emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: safe.leadingAnchor, constant: 18),
+            emptyState.trailingAnchor.constraint(lessThanOrEqualTo: safe.trailingAnchor, constant: -18),
+            diagnostics.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -12),
+            diagnostics.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
+            diagnostics.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
+            diagnostics.widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
         updateSubToolPosition(animated: false)
         canvas.onDiagnostics = { [weak self] text in
@@ -525,6 +531,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private func refreshRails() {
         pagesRail.pageInfos = canvas.engineBridge.pageInfos
         layersRail.layerInfos = canvas.engineBridge.layerInfos
+        updateRailToggleButtons()
     }
 
     private func addPage() {
@@ -850,18 +857,31 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func updateSubToolPosition(animated: Bool = true) {
-        let anchor = pagesRail.isHidden ? toolRail.trailingAnchor : pagesRail.trailingAnchor
+        layersRailLeadingConstraint?.isActive = false
+        let layerAnchor = pagesRail.isHidden ? toolRail.trailingAnchor : pagesRail.trailingAnchor
+        layersRailLeadingConstraint = layersRail.leadingAnchor.constraint(equalTo: layerAnchor, constant: 6)
+        layersRailLeadingConstraint?.isActive = true
+
+        let canvasLeftAnchor: NSLayoutXAxisAnchor
+        if !layersRail.isHidden {
+            canvasLeftAnchor = layersRail.trailingAnchor
+        } else if !pagesRail.isHidden {
+            canvasLeftAnchor = pagesRail.trailingAnchor
+        } else {
+            canvasLeftAnchor = toolRail.trailingAnchor
+        }
+
         undoRedoLeadingConstraint?.isActive = false
         bucketSubToolBarLeadingConstraint?.isActive = false
         brushSubToolBarLeadingConstraint?.isActive = false
 
-        undoRedoLeadingConstraint = undoRedoChip.leadingAnchor.constraint(equalTo: anchor, constant: 12)
+        undoRedoLeadingConstraint = undoRedoChip.leadingAnchor.constraint(equalTo: canvasLeftAnchor, constant: 12)
         undoRedoLeadingConstraint?.isActive = true
 
-        bucketSubToolBarLeadingConstraint = bucketSubToolBar.leadingAnchor.constraint(equalTo: anchor, constant: 12)
+        bucketSubToolBarLeadingConstraint = bucketSubToolBar.leadingAnchor.constraint(equalTo: canvasLeftAnchor, constant: 12)
         bucketSubToolBarLeadingConstraint?.isActive = true
 
-        brushSubToolBarLeadingConstraint = brushSubToolBar.leadingAnchor.constraint(equalTo: anchor, constant: 12)
+        brushSubToolBarLeadingConstraint = brushSubToolBar.leadingAnchor.constraint(equalTo: canvasLeftAnchor, constant: 12)
         brushSubToolBarLeadingConstraint?.isActive = true
 
         if animated {
@@ -1007,8 +1027,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         selectButton = railToolButton(systemName: "rectangle.dashed", label: "Select", action: #selector(selectMarquee))
         lassoButton = railToolButton(systemName: "lasso", label: "Lasso", action: #selector(selectLasso))
 
-        let pagesToggle = railToolButton(systemName: "doc.plaintext", label: "Pages", action: #selector(togglePagesRail))
-        let layersToggle = railToolButton(systemName: "square.3.layers.3d", label: "Layers", action: #selector(toggleLayersRail))
+        pagesToggleButton = railToolButton(systemName: "doc.on.doc", label: "Pages", action: #selector(togglePagesRail))
+        layersToggleButton = railToolButton(systemName: "square.3.layers.3d", label: "Layers", action: #selector(toggleLayersRail))
         let resetViewBtn = railToolButton(systemName: "arrow.down.right.and.arrow.up.left", label: "Reset", action: #selector(resetCanvasView))
         clearButton = railToolButton(systemName: "trash", label: "Clear", action: #selector(confirmClearDocument))
 
@@ -1022,7 +1042,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         [selectButton, lassoButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
         stack.addArrangedSubview(railTitle("PANELS"))
-        [pagesToggle, layersToggle].forEach(stack.addArrangedSubview)
+        [pagesToggleButton, layersToggleButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
         [resetViewBtn, clearButton].forEach(stack.addArrangedSubview)
 
@@ -1038,15 +1058,36 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
             stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
         ])
+        updateRailToggleButtons()
     }
 
     @objc private func togglePagesRail() {
         pagesRail.isHidden.toggle()
+        updateRailToggleButtons()
         updateSubToolPosition()
     }
 
     @objc private func toggleLayersRail() {
         layersRail.isHidden.toggle()
+        updateRailToggleButtons()
+        updateSubToolPosition()
+    }
+
+    private func updateRailToggleButtons() {
+        let selectedColor = UIColor.systemBlue.withAlphaComponent(0.16)
+        let normalColor = UIColor.white.withAlphaComponent(0.82)
+        if let pagesToggleButton, let pagesRail {
+            let active = !pagesRail.isHidden
+            pagesToggleButton.isSelected = active
+            pagesToggleButton.backgroundColor = active ? selectedColor : normalColor
+            pagesToggleButton.layer.borderColor = (active ? UIColor.systemBlue : DraftingTheme.rule.withAlphaComponent(0.6)).cgColor
+        }
+        if let layersToggleButton, let layersRail {
+            let active = !layersRail.isHidden
+            layersToggleButton.isSelected = active
+            layersToggleButton.backgroundColor = active ? selectedColor : normalColor
+            layersToggleButton.layer.borderColor = (active ? UIColor.systemBlue : DraftingTheme.rule.withAlphaComponent(0.6)).cgColor
+        }
     }
 
     private func styleRail(_ rail: UIView) {
