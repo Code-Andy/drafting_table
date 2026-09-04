@@ -6,40 +6,40 @@ This is the exact resume point as of 2026-09-03 in Toronto.
 
 - Local checkout: `D:\Vibe Code\Drafting Table Fork`
 - Branch: `ipad-native-port`
-- HEAD: `87f92f0` — `v0.9.1 prerelease: visible color tool, smooth joins, live grid snap`
+- HEAD: `8e28ee1` — `v0.9.7: gap-closing bucket fill, paper space maximization, Pencil Pro radial wheel`
 - Tracking: `origin/ipad-native-port` is up to date with HEAD
 - Fork: <https://github.com/Code-Andy/drafting_table>
 - Upstream: <https://github.com/bgkatz/drafting_table>
 - Upstream push URL: disabled as `no_push`
-- Project version in `project.yml`: `0.9.1` build `13`
-- Latest released versions: `v0.7.2`, `v0.8.0`, `v0.9.0`, `v0.9.1`
+- Project version in `project.yml`: `0.9.7` build `16`
+- Latest released versions: `v0.7.2`, `v0.8.0`, `v0.9.0`, `v0.9.1`, `v0.9.2`, `v0.9.6`, `v0.9.7`
 - Deployment target: iOS 17.5
 
 ## What HEAD contains
 
-HEAD brings the iPad port to the `v0.9.1` stabilization baseline:
+HEAD brings the iPad port to the **v0.9.7** feature baseline:
 
-1. **v0.7.2 Launch Watchdog & Heap Overflow Fix**:
-   - Resolved the beige-screen crash reproduced under AddressSanitizer: an ODR violation occurred because `core/include/DTDocument.hpp` and `platforms/ipad/Bridge/DTEngine.hpp` both defined `drafting_table::Page` with differing sizes (48 vs 56 bytes). The bridge types were moved into `namespace drafting_table::ipad`.
-   - Replaced continuous display link renders with on-demand rendering (`enableSetNeedsDisplay = true`, `isPaused = true`, 60 fps cap).
-   - Added a 220,000-vertex per-frame budget to prevent watchdog timeout kills on large documents.
-   - Added file-based launch breadcrumbs and uncaught-exception logs for diagnostic capture.
+1. **v0.9.7 Gap-Closing Bucket Fill & Paper Space Maximization**:
+   - Offscreen morphological obstacle dilation ($\lceil \text{gapSize} / 2 \rceil$) and BFS flood fill to bridge gaps between drawn strokes.
+   - Under-stroke bleed dilation to eliminate white halos.
+   - Moore-neighbor border tracing with RDP simplification and ear-clipping concave polygon triangulation in Metal (`DTMetalRenderer.mm`).
+   - Floating `bucketSubToolBar` sub-tool menu for gap margin (`0px`–`16px`) and bleed (`0px`–`4px`).
+   - Paper space maximized: top navigation bar and 40pt ribbon eliminated; canvas pinned to `root.topAnchor`.
+   - Apple Pencil Pro squeeze: custom `CircularRadialMenuView` dial centered around pen hover/touch point on glass with 12 radial tools.
+   - Tool rail restructured with top hamburger `≡` menu, active swatch, and 8 quick-palette pen colors.
+   - Parity with `tools/drafting_table.png`: floating `undoRedoChip` (`↶`/`↷`) over top-left paper and `DOCS ∨` button at top of Pages rail.
 
-2. **v0.8.0 Original UI Parity & Circle Tool**:
-   - Replaced horizontal rail with left vertical tool rail divided into DRAW, SHAPE, and SELECT sections mirroring the original Android app layout and glyphs.
-   - Added bottom status bar with interactive and staged chips: document name, current tool, `grid:` (live), `snap:` (live for shapes), `predict:` (live), `px:`, `angle:`, and `preview:`.
-   - Added Circle tool end-to-end (`DTTool` enum value 5, `validTool` bound update, Metal outline drawing, archive serialization, portable test coverage).
+2. **v0.9.6 Notebook Gallery & SF Symbols Line Art**:
+   - Multi-notebook shelf gallery with thumbnail previews and document lifecycle.
+   - High-contrast vector SF Symbols line art on all buttons.
+   - Diagnostics switch and photo import.
 
-3. **v0.9.0 Stroke De-dotting, HSV Color Picker, and Background Thumbnails**:
-   - Removed intermediate 4th-sample round cap fans that caused beading artifacts along variable-pressure curves.
-   - Added `ColorPickerViewController.swift` featuring an HSV saturation/value square, hue slider, RGB/HEX display, the upstream 32-color drafting palette, an 8-color LRU recents row, and 4 long-press user slots.
-   - Re-enabled page thumbnails using an asynchronous background cache rendered on a utility dispatch queue with epoch invalidation to protect main-thread startup.
-
-4. **v0.9.1 Visible Color Tool, Six-Slice Joins, and Live Shape Snapping**:
-   - Added visible color swatch button at the top of DRAW that displays live brush color and opens the HSV picker.
-   - Added six-slice exact-radius round joins at interior curve points to eliminate wedge gaps on tight turns without causing beading.
-   - Enabled live grid snapping in `CanvasView.makeSample` for Line, Rectangle, Ellipse, and Circle when `snap:` is toggled on.
-   - Resolved Swift type-checker timeouts with explicit CGFloat arithmetic in color conversions.
+3. **v0.9.2 Apple Pencil Pro Suite & Drafting Table Parity**:
+   - Sibling `HoverOverlayView` (outer ring, tilt needle, barrel roll tick, snap reticle).
+   - Shade tool (`DTTool::Shade = 6`) with polygon fill and antialiased outline.
+   - Selection & transform tools (Select and Lasso) for translating and duplicating strokes.
+   - 15-degree angle snapping (`π / 12`).
+   - Document rename modal.
 
 ## Portable validation
 
@@ -64,6 +64,9 @@ All 5 test suites pass on Windows MSVC via CMake/CTest:
 - `v0.8.0`: Left rail sections, status bar chips, Circle tool
 - `v0.9.0`: De-dotting, HSV color picker, background thumbnails
 - `v0.9.1`: Color swatch tool, six-slice smooth joins, live grid snap
+- `v0.9.2`: Apple Pencil Pro suite, Shade tool, selection & transform, 15° snap
+- `v0.9.6`: Notebooks gallery, line art symbols, photo import, center toggle
+- `v0.9.7`: Gap-closing bucket fill, paper space maximization, Pencil Pro radial wheel
 
 All releases and unsigned IPAs: <https://github.com/Code-Andy/drafting_table/releases>
 

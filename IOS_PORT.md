@@ -119,6 +119,20 @@ Version 0.9.1 introduces a visible color swatch tool button on the rail opening
 the HSV picker directly, six-slice exact-radius round joins for smooth tight
 curves without gaps or beading, and live grid snapping for shape tools.
 
+Version 0.9.2 completes the Apple Pencil Pro suite (sibling `HoverOverlayView`
+with orientation needle, barrel roll tick, dynamic ring, and snap target; haptic
+service integration; and 15° vector angle snap) plus the Shade tool, stroke
+selection/transformation, and document rename.
+
+Version 0.9.6 adds the multi-document Notebooks Shelf Gallery with interactive
+page cards, high-contrast vector SF Symbols line art on all buttons, diagnostics
+switch, and photo import.
+
+Version 0.9.7 delivers the intelligent gap-closing bucket fill engine with
+morphological dilation, under-stroke bleed, Moore contour tracing, and Metal
+ear-clipping triangulation; maximum paper space via top ribbon removal; top-left
+quick pen palette and menu button; floating Undo/Redo pill chip; and the Apple
+Pencil Pro circular radial wheel menu.
 
 ## Implemented architecture
 
