@@ -136,6 +136,7 @@ private final class PageCardButton: UIButton {
         self.canDelete = canDelete
         self.canMoveUp = canMoveUp
         self.canMoveDown = canMoveDown
+        self.editable = editable
         super.init(frame: .zero)
         var config = UIButton.Configuration.plain()
         var titleAttr = AttributedString("\(Int(info.index) + 1)\n\(info.name)")
