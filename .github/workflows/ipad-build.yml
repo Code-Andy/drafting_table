@@ -41,6 +41,8 @@ jobs:
     name: Build unsigned iOS device IPA
     runs-on: macos-15
     timeout-minutes: 45
+    outputs:
+      built_sha: ${{ steps.provenance.outputs.built_sha }}
 
     steps:
       - name: Check out source
@@ -86,6 +88,27 @@ jobs:
           set -euo pipefail
           bash scripts/ios/build_ipa.sh 2>&1 | tee /tmp/xcodebuild.log
 
+      - name: Verify build provenance
+        id: provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="dist/ios/build-metadata.txt"
+          test -s "$metadata"
+          source_sha="$(awk -F= '$1 == "source_sha" {print $2; exit}' "$metadata")"
+          ipa_sha256="$(awk -F= '$1 == "ipa_sha256" {print $2; exit}' "$metadata")"
+          [[ -n "$source_sha" && "$source_sha" == "$GITHUB_SHA" ]] || {
+            echo "error: build metadata source SHA does not match this workflow commit" >&2
+            cat "$metadata" >&2
+            exit 1
+          }
+          [[ "$ipa_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo "error: build metadata has no valid IPA SHA-256" >&2
+            exit 1
+          }
+          echo "built_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "Built exact SHA $source_sha (IPA SHA-256 $ipa_sha256)"
+
       - name: Report build error on failure
         if: failure()
         shell: bash
@@ -107,8 +130,10 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v7
         with:
-          name: DraftingTable-ipa-${{ github.sha }}
-          path: dist/ios/DraftingTable.ipa
+          name: DraftingTable-ipa-${{ steps.provenance.outputs.built_sha }}
+          path: |
+            dist/ios/DraftingTable.ipa
+            dist/ios/build-metadata.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -122,12 +147,36 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          # A manual dispatch may publish a release from an arbitrary branch.
+          # Always inspect and publish the exact commit that produced the IPA.
+          ref: ${{ needs.build.outputs.built_sha }}
+          fetch-depth: 1
 
       - name: Download IPA artifact
         uses: actions/download-artifact@v8
         with:
-          name: DraftingTable-ipa-${{ github.sha }}
+          name: DraftingTable-ipa-${{ needs.build.outputs.built_sha }}
           path: dist/ios
+
+      - name: Verify artifact identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.build.outputs.built_sha }}
+        run: |
+          set -euo pipefail
+          metadata="dist/ios/build-metadata.txt"
+          ipa="dist/ios/DraftingTable.ipa"
+          test -s "$metadata"
+          test -s "$ipa"
+          source_sha="$(awk -F= '$1 == "source_sha" {print $2; exit}' "$metadata")"
+          metadata_sha="$(awk -F= '$1 == "ipa_sha256" {print $2; exit}' "$metadata")"
+          checkout_sha="$(git rev-parse HEAD)"
+          actual_sha="$(shasum -a 256 "$ipa" | awk '{print $1}')"
+          [[ "$source_sha" == "$EXPECTED_SHA" ]] || { echo "error: artifact source SHA mismatch" >&2; exit 1; }
+          [[ "$checkout_sha" == "$EXPECTED_SHA" ]] || { echo "error: release checkout SHA mismatch" >&2; exit 1; }
+          [[ "$actual_sha" == "$metadata_sha" ]] || { echo "error: IPA checksum mismatch" >&2; exit 1; }
+          echo "Publishing IPA built from $EXPECTED_SHA (SHA-256 $actual_sha)"
 
       - name: Publish version tag release
         env:
@@ -138,6 +187,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          target_sha="${{ needs.build.outputs.built_sha }}"
           tag=""
           if [[ -n "$INPUT_TAG" ]]; then
             tag="$INPUT_TAG"
@@ -148,6 +198,26 @@ jobs:
             tag="v${version}"
           fi
 
+          if [[ ! "$tag" =~ ^v[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "error: release tag must use a safe v-prefixed name (got '$tag')" >&2
+            exit 1
+          fi
+
+          remote_tag_sha() {
+            local ref_name="$1"
+            local refs
+            refs="$(git ls-remote --tags origin "refs/tags/$ref_name" "refs/tags/$ref_name^{}")"
+            [[ -n "$refs" ]] || return 1
+            awk '$2 ~ /\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}' <<< "$refs" \
+              || awk 'NR == 1 {print $1; exit}' <<< "$refs"
+          }
+
+          existing_tag_sha="$(remote_tag_sha "$tag" || true)"
+          if [[ -n "$existing_tag_sha" && "$existing_tag_sha" != "$target_sha" ]]; then
+            echo "error: tag $tag points to $existing_tag_sha, not built SHA $target_sha" >&2
+            exit 1
+          fi
+
           title="${INPUT_TITLE:-Drafting Table $tag}"
           prerelease_flag=""
           if [[ "$IS_PRERELEASE" == "true" ]]; then
@@ -155,10 +225,14 @@ jobs:
           fi
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            [[ "$existing_tag_sha" == "$target_sha" ]] || {
+              echo "error: existing release $tag is not attached to the built SHA $target_sha" >&2
+              exit 1
+            }
             echo "Release $tag exists, uploading asset..."
             gh release upload "$tag" dist/ios/DraftingTable.ipa --clobber --repo "$GITHUB_REPOSITORY"
           else
             echo "Creating release $tag..."
             gh release create "$tag" dist/ios/DraftingTable.ipa --generate-notes \
-              --title "$title" $prerelease_flag --repo "$GITHUB_REPOSITORY"
+              --target "$target_sha" --title "$title" $prerelease_flag --repo "$GITHUB_REPOSITORY"
           fi
