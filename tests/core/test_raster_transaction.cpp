@@ -81,6 +81,7 @@ void testRasterUndoRedoAndPersistence() {
     const auto redo = coordinator.requestRedo();
     CHECK(redo.status == dt::UndoStatus::Applied && redo.plan.has_value());
     CHECK(redo.plan->token.generation == 3);
+    CHECK(redo.plan->tileSwaps[0].after.versionID > after.versionID);
     CHECK(redo.plan->tileSwaps[0].after.payloadID.empty());
     CHECK(coordinator.completeRestore(*redo.plan));
     CHECK(coordinator.currentGeneration() == 3 && coordinator.canUndo());

@@ -153,6 +153,7 @@ bool RasterTransactionCoordinator::commitInternal(
     }
 
     std::unordered_set<TileKey, TileKeyHash> tileKeys;
+    std::uint64_t nextVersionID = nextVersionID_;
     for (const auto& swap : completion.tileSwaps) {
         if (!validateRasterSwap(swap, completion.token.generation)) {
             return fail("invalid raster before/after version swap");
@@ -161,6 +162,10 @@ bool RasterTransactionCoordinator::commitInternal(
         if (!tileKeys.insert(key).second) {
             return fail("an operation contains a duplicate tile address");
         }
+        if (swap.after.versionID == std::numeric_limits<std::uint64_t>::max()) {
+            return fail("tile version ID space is exhausted");
+        }
+        nextVersionID = std::max(nextVersionID, swap.after.versionID + 1);
         const auto current = currentTiles_.find(key);
         if (current != currentTiles_.end() && current->second != swap.before) {
             return fail("raster before version does not match the current tile");
@@ -182,6 +187,7 @@ bool RasterTransactionCoordinator::commitInternal(
         }
     }
 
+    nextVersionID_ = nextVersionID;
     OperationRecord record;
     record.token = completion.token;
     record.tileSwaps = completion.tileSwaps;
