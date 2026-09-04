@@ -43,6 +43,7 @@ trap cleanup EXIT
 
 xcrun simctl boot "$device_udid" >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$device_udid" -b
+xcrun simctl uninstall "$device_udid" com.local.draftingtable.ipad >/dev/null 2>&1 || true
 xcrun simctl install "$device_udid" "$app_path"
 runtime_log="$(mktemp)"
 xcrun simctl spawn "$device_udid" log stream \
@@ -52,7 +53,7 @@ xcrun simctl spawn "$device_udid" log stream \
   >"$runtime_log" 2>&1 &
 log_stream_pid=$!
 xcrun simctl launch --terminate-running-process "$device_udid" \
-  com.local.draftingtable.ipad >/dev/null
+  com.local.draftingtable.ipad --renderer-self-test >/dev/null
 sleep 8
 process_table="$(xcrun simctl spawn "$device_udid" /bin/ps -A -o pid=,comm= 2>&1 || true)"
 echo "$process_table"
@@ -105,5 +106,34 @@ if [[ -z "$pid" ]]; then
   fi
   exit 1
 fi
+
+container="$(xcrun simctl get_app_container "$device_udid" com.local.draftingtable.ipad data)"
+package="$container/Library/Application Support/DraftingTable/Preview.drafttable"
+for _ in $(seq 1 40); do
+  if [[ -s "$package/CURRENT" ]] && find "$package/tiles" -type f -name '*.dtile' -print -quit 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 0.5
+done
+test -s "$package/CURRENT" || {
+  echo "Renderer self-test did not publish a package manifest" >&2
+  tail -n 400 "$runtime_log" >&2 || true
+  exit 1
+}
+tile_path="$(find "$package/tiles" -type f -name '*.dtile' -print -quit 2>/dev/null || true)"
+test -n "$tile_path" || {
+  echo "Renderer self-test produced no persisted tile" >&2
+  tail -n 400 "$runtime_log" >&2 || true
+  exit 1
+}
+python3 - "$tile_path" <<'PY'
+import pathlib, sys
+data = pathlib.Path(sys.argv[1]).read_bytes()
+header = 96
+assert len(data) == header + 256 * 256 * 4, len(data)
+alpha = data[header + 3::4]
+assert any(alpha), "renderer checkpoint contains only transparent pixels"
+print(f"Renderer self-test tile has {sum(value != 0 for value in alpha)} nonzero-alpha pixels")
+PY
 
 echo "Drafting Table simulator launch smoke test passed (pid $pid)"

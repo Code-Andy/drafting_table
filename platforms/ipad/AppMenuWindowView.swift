@@ -17,7 +17,7 @@ final class AppMenuWindowView: UIView {
 
     var onAction: ((Action) -> Void)?
 
-    private let windowWidth: CGFloat = 270.0
+    private let windowWidth: CGFloat = 320.0
     private let windowHeight: CGFloat = 220.0
 
     private let mainContainer = UIView()
@@ -203,6 +203,8 @@ final class AppMenuWindowView: UIView {
         cfg.baseForegroundColor = primaryColor
         cfg.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10)
         button.configuration = cfg
+        button.titleLabel?.numberOfLines = 2
+        button.titleLabel?.lineBreakMode = .byTruncatingTail
         button.contentHorizontalAlignment = .leading
         button.backgroundColor = isDestructive ? DraftingTheme.hot.withAlphaComponent(0.08) : UIColor.white.withAlphaComponent(0.72)
         button.layer.cornerRadius = 8
@@ -225,9 +227,11 @@ final class AppMenuWindowView: UIView {
 
     func present(in parentView: UIView, near anchor: CGPoint) {
         let safeMargin: CGFloat = 12.0
-        let posX = min(max(anchor.x, safeMargin), parentView.bounds.width - windowWidth - safeMargin)
-        let posY = min(max(anchor.y, safeMargin), parentView.bounds.height - windowHeight - safeMargin)
-        frame = CGRect(x: posX, y: posY, width: windowWidth, height: windowHeight)
+        let fittedWidth = min(windowWidth, max(1, parentView.bounds.width - safeMargin * 2))
+        let fittedHeight = min(windowHeight, max(1, parentView.bounds.height - safeMargin * 2))
+        let posX = max(safeMargin, min(anchor.x, parentView.bounds.width - fittedWidth - safeMargin))
+        let posY = max(safeMargin, min(anchor.y, parentView.bounds.height - fittedHeight - safeMargin))
+        frame = CGRect(x: posX, y: posY, width: fittedWidth, height: fittedHeight)
 
         let dismissOverlay = UIView(frame: parentView.bounds)
         dismissOverlay.backgroundColor = UIColor.black.withAlphaComponent(0.12)

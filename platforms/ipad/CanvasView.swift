@@ -563,16 +563,16 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
             lastSnappedAngleIndex = -1
         }
 
-        if touch.type == .pencil && normalizedForce(of: touch) < activationPressure {
-            return
-        }
+        // A UIKit Pencil contact is already an intentional down event. Some
+        // devices report zero or estimated force on the first sample; waiting
+        // for a threshold can suppress the entire stroke.
         strokeEngaged = true
         hideHoverPreview()
         engineBridge.beginStroke()
         onDrawingBegan?()
         appendBatch(for: touch,
                     event: event,
-                    minimumPencilPressure: touch.type == .pencil ? activationPressure : nil)
+                    minimumPencilPressure: nil)
         setNeedsDisplay()
     }
 
@@ -638,30 +638,14 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
 
         if activeTouch.type == .pencil {
-            let latest = event?.coalescedTouches(for: activeTouch)?.last ?? activeTouch
-            if strokeEngaged {
-                if normalizedForce(of: latest) < releasePressure {
-                    appendBatch(for: activeTouch,
-                                event: event,
-                                includePredicted: false,
-                                minimumPencilPressure: releasePressure)
-                    engineBridge.endStroke()
-                    strokeEngaged = false
-                    setNeedsDisplay()
-                } else {
-                    appendBatch(for: activeTouch, event: event)
-                }
-            } else if normalizedForce(of: latest) >= activationPressure {
+            if !strokeEngaged {
                 strokeEngaged = true
                 hideHoverPreview()
                 engineBridge.beginStroke()
                 onDrawingBegan?()
-                appendBatch(for: activeTouch,
-                            event: event,
-                            includePredicted: false,
-                            minimumPencilPressure: activationPressure)
-                setNeedsDisplay()
             }
+            appendBatch(for: activeTouch, event: event)
+            setNeedsDisplay()
             return
         }
         appendBatch(for: activeTouch, event: event)
@@ -725,11 +709,9 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                 }
                 engineBridge.endStroke()
             } else {
-                if activeTouch.type != .pencil || normalizedForce(of: activeTouch) >= releasePressure {
-                    var finalSample = makeSample(activeTouch, predicted: false)
-                    withUnsafePointer(to: &finalSample) { pointer in
-                        engineBridge.appendSamples(pointer, count: 1, realCount: 1)
-                    }
+                var finalSample = makeSample(activeTouch, predicted: false)
+                withUnsafePointer(to: &finalSample) { pointer in
+                    engineBridge.appendSamples(pointer, count: 1, realCount: 1)
                 }
                 engineBridge.endStroke()
             }

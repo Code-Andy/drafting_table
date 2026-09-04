@@ -94,15 +94,12 @@ final class DrawingSettingsViewController: UIViewController {
 
         let stack = UIStackView(arrangedSubviews: [
             sectionTitle("PENCIL & BRUSH"),
-            settingRow(title: "Pen activation", detail: "Start drawing only after this pressure threshold.", slider: activationSlider, value: activationValue),
             settingRow(title: "Brush size", detail: "Set the diameter of new brush strokes.", slider: sizeSlider, value: sizeValue),
             settingRow(title: "Brush opacity", detail: "Set the opacity of new brush strokes.", slider: opacitySlider, value: opacityValue),
             settingRow(title: "Brush hardness", detail: "Soft edges blend more naturally; hard edges stay crisp.", slider: hardnessSlider, value: hardnessValue),
             colorRow(),
             sectionTitle("CANVAS & INTERACTION"),
             switchRow(title: "Grid", detail: "Show a drafting grid over the page.", control: gridSwitch),
-            switchRow(title: "Center-Out Shapes", detail: "Draw circle and ellipse radiating from center point.", control: centerModeSwitch),
-            switchRow(title: "Transparent PNG Export", detail: "Omit paper background when exporting PNG images.", control: transparentExportSwitch),
             sectionTitle("DIAGNOSTICS & DEBUG"),
             switchRow(title: "Metal Diagnostics Overlay", detail: "Show FPS, render latency, Pencil hover coords, and touch count.", control: diagnosticsSwitch),
             infoLabel()

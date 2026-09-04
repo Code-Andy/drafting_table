@@ -328,7 +328,7 @@ final class LayersRailView: UIView {
         headerRow.axis = .horizontal
         headerRow.alignment = .center
         headerRow.distribution = .fill
-        headerRow.spacing = 3
+        headerRow.spacing = 8
 
         let lbl = titleLabel("LAYERS")
         lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -477,7 +477,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
         layer.cornerRadius = 5
         layer.borderWidth = info.selected ? 1.5 : 1
         layer.borderColor = (info.selected ? UIColor.systemBlue.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.06)).cgColor
-        heightAnchor.constraint(equalToConstant: 30).isActive = true
+        heightAnchor.constraint(equalToConstant: 44).isActive = true
 
         accentBar.backgroundColor = info.selected ? UIColor.systemBlue : .clear
         accentBar.layer.cornerRadius = 1
@@ -496,7 +496,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
         addSubview(visibilityButton)
 
         typeBadge.text = isVector ? "V" : "R"
-        typeBadge.font = .systemFont(ofSize: 7.5, weight: .bold)
+        typeBadge.font = .systemFont(ofSize: 10, weight: .bold)
         typeBadge.textColor = isVector ? .systemBlue : UIColor(red: 0.38, green: 0.33, blue: 0.27, alpha: 0.8)
         typeBadge.backgroundColor = isVector ? UIColor.systemBlue.withAlphaComponent(0.12) : UIColor.black.withAlphaComponent(0.06)
         typeBadge.textAlignment = .center
@@ -506,7 +506,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
         addSubview(typeBadge)
 
         nameLabel.text = info.name
-        nameLabel.font = .systemFont(ofSize: 9.5, weight: info.selected ? .bold : .regular)
+        nameLabel.font = .systemFont(ofSize: 12, weight: info.selected ? .bold : .regular)
         nameLabel.textColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -534,13 +534,13 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
 
             visibilityButton.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 2),
             visibilityButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            visibilityButton.widthAnchor.constraint(equalToConstant: 18),
-            visibilityButton.heightAnchor.constraint(equalToConstant: 18),
+            visibilityButton.widthAnchor.constraint(equalToConstant: 32),
+            visibilityButton.heightAnchor.constraint(equalToConstant: 32),
 
             typeBadge.leadingAnchor.constraint(equalTo: visibilityButton.trailingAnchor, constant: 2),
             typeBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
-            typeBadge.widthAnchor.constraint(equalToConstant: 13),
-            typeBadge.heightAnchor.constraint(equalToConstant: 13),
+            typeBadge.widthAnchor.constraint(equalToConstant: 22),
+            typeBadge.heightAnchor.constraint(equalToConstant: 22),
 
             nameLabel.leadingAnchor.constraint(equalTo: typeBadge.trailingAnchor, constant: 2),
             nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: opacityLabel.leadingAnchor, constant: -2),
@@ -548,12 +548,12 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
 
             opacityLabel.trailingAnchor.constraint(equalTo: dragHandle.leadingAnchor, constant: -2),
             opacityLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 22),
+            opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 36),
 
             dragHandle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
             dragHandle.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dragHandle.widthAnchor.constraint(equalToConstant: 12),
-            dragHandle.heightAnchor.constraint(equalToConstant: 12)
+            dragHandle.widthAnchor.constraint(equalToConstant: 24),
+            dragHandle.heightAnchor.constraint(equalToConstant: 24)
         ])
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(selected)))

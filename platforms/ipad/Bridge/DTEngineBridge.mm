@@ -506,5 +506,5 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
 
 - (void)dt_notifyCommitLocked:(uint64_t)generation{void(^h)(uint64_t)=self.documentCommitHandler;if(h)dispatch_async(dispatch_get_main_queue(),^{h(generation);});}
 - (void)dt_notifyEmptyCheckpointLocked:(uint64_t)operationID generation:(uint64_t)generation{void(^h)(DTCheckpointPayloadBatch*)=self.checkpointPayloadHandler;if(!h)return;DTCheckpointPayloadBatch*batch=[[DTCheckpointPayloadBatch alloc] initWithOperationID:operationID generation:generation tiles:@[]];self->_lastCheckpointBatch=batch;dispatch_async(dispatch_get_main_queue(),^{h(batch);});}
-- (void)dt_reportErrorLocked:(NSString*)message{if(!message.length)return;void(^h)(NSString*)=self.rendererErrorHandler;if(h){NSString*owned=[message copy];dispatch_async(dispatch_get_main_queue(),^{h(owned);});}else NSLog(@"DraftingTable renderer: %@",message);}
+- (void)dt_reportErrorLocked:(NSString*)message{if(!message.length)return;NSLog(@"DraftingTable renderer: %@",message);void(^h)(NSString*)=self.rendererErrorHandler;if(h){NSString*owned=[message copy];dispatch_async(dispatch_get_main_queue(),^{h(owned);});}}
 @end

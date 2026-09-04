@@ -32,6 +32,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private static let docTitleDefaultsKey = "draftingTable.documentTitle"
     private static let showDiagnosticsDefaultsKey = DrawingSettingsViewController.showDiagnosticsKey
     private static let shapeCenterModeDefaultsKey = DrawingSettingsViewController.shapeCenterModeKey
+    private static let v010CanvasResetKey = "draftingTable.v010CanvasReset"
 
     private var canvas: CanvasView!
     private var hoverOverlay: HoverOverlayView!
@@ -139,6 +140,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             root.addSubview($0)
         }
         configureEmptyState(); configurePagesRail(); configureLayersRail(); configureToolRail(); configureStatusBar(); configureToast()
+        // Canvas-first v0.10 layout: one compact tool dock and one readable
+        // layer inspector. Hide single-page and legacy overflow chrome.
+        pagesRail.isHidden = true
+        topToolBar.isHidden = true
+        statusBar.isHidden = true
+        bucketSubToolBar.isHidden = true
+        brushSubToolBar.isHidden = true
+        selectionActionBar.isHidden = true
         DTLaunchBreadcrumb("vc:loadView:done")
 
         let safe = root.safeAreaLayoutGuide
@@ -152,19 +161,19 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             // Left vertical tool rail (compact 54pt width, starts at top of screen)
             toolRail.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 8),
             toolRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
-            toolRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
-            toolRail.widthAnchor.constraint(equalToConstant: 54),
+            toolRail.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -8),
+            toolRail.widthAnchor.constraint(equalToConstant: 64),
 
             // Page sidebar (compact 72pt width)
             pagesRail.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 8),
             pagesRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
-            pagesRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
-            pagesRail.widthAnchor.constraint(equalToConstant: 72),
+            pagesRail.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -8),
+            pagesRail.widthAnchor.constraint(equalToConstant: 112),
 
             // Layer sidebar (compact 120pt width, stacked on left)
             layersRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
-            layersRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
-            layersRail.widthAnchor.constraint(equalToConstant: 120),
+            layersRail.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -8),
+            layersRail.widthAnchor.constraint(equalToConstant: 240),
 
             // Top Bar (horizontal controls across canvas top)
             topToolBar.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
@@ -340,6 +349,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
                 self.updateUndoRedoState()
                 self.canvas.setNeedsDisplay()
                 self.fitPaperIfNeeded()
+                self.runRendererSelfTestIfRequested()
                 self.updateLaunchBreadcrumb(stage: "restoredPackage")
             } catch {
                 self.showToast("Could not recover Drafting Table package")
@@ -352,22 +362,50 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     /// launches preserve the user's pan/zoom/rotation exactly.
     private func fitPaperIfNeeded() {
         let defaults = UserDefaults.standard
-        guard defaults.object(forKey: "draftingTable.canvasScale") == nil,
-              defaults.object(forKey: "draftingTable.canvasTranslationX") == nil,
-              defaults.object(forKey: "draftingTable.canvasTranslationY") == nil else { return }
+        guard !defaults.bool(forKey: Self.v010CanvasResetKey) else { return }
+        view.layoutIfNeeded()
         canvas.resetView()
+        defaults.set(true, forKey: Self.v010CanvasResetKey)
+    }
+
+    /// CI-only end-to-end raster probe. It uses the same public bridge calls
+    /// as Pencil input and is enabled only by an explicit simulator launch
+    /// argument. The smoke script verifies the persisted tile has nonzero
+    /// alpha, catching compile-clean input/renderer/checkpoint disconnects.
+    private func runRendererSelfTestIfRequested() {
+        guard ProcessInfo.processInfo.arguments.contains("--renderer-self-test") else { return }
+        let center = CGPoint(x: canvas.paperSize.width * 0.45,
+                             y: canvas.paperSize.height * 0.45)
+        var samples: [DTPencilSample] = []
+        for offset in stride(from: CGFloat(-24), through: CGFloat(24), by: 12) {
+            var sample = DTPencilSample()
+            sample.x = Float(center.x + offset)
+            sample.y = Float(center.y + offset * 0.25)
+            sample.pressure = 1
+            sample.altitude = Float.pi / 2
+            sample.timestamp = ProcessInfo.processInfo.systemUptime
+            sample.flags = .real
+            samples.append(sample)
+        }
+        canvas.engineBridge.beginStroke()
+        samples.withUnsafeBufferPointer { buffer in
+            canvas.engineBridge.appendSamples(buffer.baseAddress,
+                                               count: UInt(buffer.count),
+                                               realCount: UInt(buffer.count))
+        }
+        canvas.engineBridge.endStroke()
+        NSLog("DraftingTable renderer self-test submitted %lu samples", samples.count)
     }
 
     private func applyStoredSettings() {
         let defaults = UserDefaults.standard
-        let activation = min(max(storedFloat(defaults, key: DrawingSettingsViewController.activationKey, fallback: 3), 0), 20)
         let size = min(max(storedFloat(defaults, key: DrawingSettingsViewController.brushSizeKey, fallback: 8), 1), 40)
         let opacity = min(max(storedFloat(defaults, key: DrawingSettingsViewController.brushOpacityKey, fallback: 100), 5), 100)
         let hardness = min(max(storedFloat(defaults, key: DrawingSettingsViewController.brushHardnessKey, fallback: 80), 0), 100)
         let color = storedUInt32(defaults,
                                  key: DrawingSettingsViewController.brushColorKey,
                                  fallback: DrawingSettingsViewController.defaultBrushColorRGBA)
-        canvas.activationPressure = CGFloat(activation / 100)
+        canvas.activationPressure = 0
         canvas.engineBridge.brushSize = CGFloat(size)
         canvas.engineBridge.brushOpacity = CGFloat(opacity / 100)
         canvas.engineBridge.brushHardness = CGFloat(hardness / 100)
@@ -399,7 +437,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func showSettings() {
         let settings = DrawingSettingsViewController()
-        settings.onActivationChanged = { [weak self] value in self?.canvas.activationPressure = value }
         settings.onBrushSizeChanged = { [weak self] value in
             self?.canvas.engineBridge.brushSize = value
             self?.refreshBrushSubToolBar()
@@ -1165,14 +1202,12 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func updateSubToolPosition(animated: Bool = true) {
         layersRailLeadingConstraint?.isActive = false
-        let layerAnchor = pagesRail.isHidden ? toolRail.trailingAnchor : pagesRail.trailingAnchor
-        layersRailLeadingConstraint = layersRail.leadingAnchor.constraint(equalTo: layerAnchor, constant: 6)
+        layersRailLeadingConstraint = layersRail.trailingAnchor.constraint(
+            equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8)
         layersRailLeadingConstraint?.isActive = true
 
         let canvasLeftAnchor: NSLayoutXAxisAnchor
-        if !layersRail.isHidden {
-            canvasLeftAnchor = layersRail.trailingAnchor
-        } else if !pagesRail.isHidden {
+        if !pagesRail.isHidden {
             canvasLeftAnchor = pagesRail.trailingAnchor
         } else {
             canvasLeftAnchor = toolRail.trailingAnchor
@@ -1264,6 +1299,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
         brushButton = railToolButton(systemName: "pencil.tip", label: "Brush", action: #selector(selectBrush))
         eraserButton = railToolButton(systemName: "eraser", label: "Eraser", action: #selector(selectEraser))
+        undoButton = railToolButton(systemName: "arrow.uturn.backward", label: "Undo", action: #selector(undoCanvas))
+        redoButton = railToolButton(systemName: "arrow.uturn.forward", label: "Redo", action: #selector(redoCanvas))
 
         pagesToggleButton = railToolButton(systemName: "doc.on.doc", label: "Pages", action: #selector(togglePagesRail))
         layersToggleButton = railToolButton(systemName: "square.3.layers.3d", label: "Layers", action: #selector(toggleLayersRail))
@@ -1271,10 +1308,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         clearButton = railToolButton(systemName: "trash", label: "Clear", action: #selector(confirmClearDocument))
 
         stack.addArrangedSubview(railTitle("DRAW"))
-        [brushButton, eraserButton].forEach(stack.addArrangedSubview)
+        [brushButton, eraserButton, undoButton, redoButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
-        stack.addArrangedSubview(railTitle("PANELS"))
-        [pagesToggleButton, layersToggleButton].forEach(stack.addArrangedSubview)
+        stack.addArrangedSubview(railTitle("VIEW"))
+        [layersToggleButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
         stack.addArrangedSubview(resetViewBtn)
 
