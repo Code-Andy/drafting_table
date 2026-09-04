@@ -289,7 +289,7 @@ final class PreviewDocumentCoordinator {
                                                  exists: true,
                                                  versionID: payload.key.versionID,
                                                  generation: payload.key.generation,
-                                                 premultipliedRGBA8: payload.pixels as NSData))
+                                                 premultipliedRGBA8: payload.pixels))
         }
         return PackageLoad(pageID: page.pageID,
                            generation: snapshot.documentGeneration,

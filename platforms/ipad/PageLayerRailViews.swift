@@ -130,6 +130,7 @@ private final class PageCardButton: UIButton {
     private let canMoveUp: Bool
     private let canMoveDown: Bool
     private let editable: Bool
+    private let editable: Bool
 
     init(info: DTPageInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool, thumbnail: UIImage?, editable: Bool = true) {
         self.info = info
