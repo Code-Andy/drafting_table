@@ -16,9 +16,9 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     /// the C++ document model.
     var onDrawingBegan: (() -> Void)?
 
-    /// Called once when a document mutation is committed (stroke lift-off),
-    /// cancelled, or otherwise finalized. This intentionally is not called
-    /// for every Pencil sample so autosave remains inexpensive.
+    /// Legacy UI hook retained for source compatibility. v0.1 does not call
+    /// this from touch-end/cancel; the controller refreshes from
+    /// `DTEngineBridge.documentCommitHandler` after GPU completion instead.
     var onDocumentChanged: (() -> Void)?
 
     /// Called when a Pencil gesture changes the active drawing tool.
@@ -99,13 +99,13 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     var currentTool: DTTool {
         get { uiTool }
         set {
-            uiTool = newValue
-            if newValue.rawValue <= DTTool.bucket.rawValue {
-                engineBridge.tool = newValue
-            }
-            if newValue != .select && newValue != .lasso {
-                clearSelection()
-            }
+            // The v0.1 tile renderer has authoritative brush and
+            // destination-out eraser paths only. Keep retained-stroke and
+            // shape tools unreachable until their tile implementations land.
+            let accepted: DTTool = newValue == .eraser ? .eraser : .brush
+            uiTool = accepted
+            engineBridge.tool = accepted
+            clearSelection()
             HapticFeedbackService.shared.toolSwitched()
             onToolChanged?()
             setNeedsDisplay()
@@ -646,7 +646,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                                 includePredicted: false,
                                 minimumPencilPressure: releasePressure)
                     engineBridge.endStroke()
-                    onDocumentChanged?()
                     strokeEngaged = false
                     setNeedsDisplay()
                 } else {
@@ -679,7 +678,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                 isRotatingSelection = false
                 recalculateSelectionBounds(for: selectedStrokeIndices)
                 updateSelectionBoundsOverlay()
-                onDocumentChanged?()
             } else if isSelecting {
                 isSelecting = false
                 finishSelection()
@@ -726,7 +724,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                     engineBridge.appendSamples(buffer.baseAddress, count: 2, realCount: 2)
                 }
                 engineBridge.endStroke()
-                onDocumentChanged?()
             } else {
                 if activeTouch.type != .pencil || normalizedForce(of: activeTouch) >= releasePressure {
                     var finalSample = makeSample(activeTouch, predicted: false)
@@ -735,7 +732,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                     }
                 }
                 engineBridge.endStroke()
-                onDocumentChanged?()
             }
         }
         strokeEngaged = false
@@ -761,7 +757,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
         if strokeEngaged {
             engineBridge.cancelStroke()
-            onDocumentChanged?()
         }
         strokeEngaged = false
         activeTouch = nil
@@ -830,7 +825,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
                 updateSelectionBoundsOverlay()
             }
             setNeedsDisplay()
-            onDocumentChanged?()
         }
     }
 
@@ -841,7 +835,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
             HapticFeedbackService.shared.undoRedo()
             clearSelection()
             setNeedsDisplay()
-            onDocumentChanged?()
             onSelectionChanged?([], nil)
         }
     }
@@ -1027,7 +1020,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         guard activeTouch?.type == .direct else { return }
         if strokeEngaged {
             engineBridge.cancelStroke()
-            onDocumentChanged?()
         }
         strokeEngaged = false
         activeTouch = nil
@@ -1410,7 +1402,6 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
 
         HapticFeedbackService.shared.toolSwitched()
-        onDocumentChanged?()
         setNeedsDisplay()
     }
 

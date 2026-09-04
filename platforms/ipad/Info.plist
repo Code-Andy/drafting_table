@@ -36,10 +36,10 @@
 		<dict>
 			<key>UTTypeConformsTo</key>
 			<array>
-				<string>public.data</string>
+				<string>com.apple.package</string>
 			</array>
 			<key>UTTypeDescription</key>
-			<string>Drafting Table Document</string>
+			<string>Drafting Table Package</string>
 			<key>UTTypeIdentifier</key>
 			<string>com.local.draftingtable.document</string>
 			<key>UTTypeTagSpecification</key>

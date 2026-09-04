@@ -57,4 +57,14 @@ final class DraftingTableSceneDelegate: UIResponder, UIWindowSceneDelegate {
               let canvasController = navigation.viewControllers.first as? DraftingTableViewController else { return }
         canvasController.saveDocument()
     }
+
+    /// Files/iCloud providers deliver `.drafttable` package URLs here when the
+    /// app is opened externally.  The view controller validates and installs
+    /// the candidate package transactionally.
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        guard let url = URLContexts.first?.url,
+              let navigation = window?.rootViewController as? UINavigationController,
+              let controller = navigation.viewControllers.first as? DraftingTableViewController else { return }
+        controller.openPackage(at: url)
+    }
 }

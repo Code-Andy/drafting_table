@@ -54,7 +54,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var toastLabel: InsetLabel!
     private var selectionActionBar: UIView!
     private var selectionCountLabel: UILabel!
-    private let persistence = StrokePersistenceStore()
+    /// Package-backed coordinator.  It is the only owner of persistence; the
+    /// legacy flat archive facade is intentionally not used by the v0.1 UI.
+    private let documentCoordinator = PreviewDocumentCoordinator()
+    private var isRestoringDocument = false
 
     // Top chrome & Sub-tool UI
     private var mainMenuButton: UIButton!
@@ -176,11 +179,11 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             brushSubToolBar.topAnchor.constraint(equalTo: topToolBar.bottomAnchor, constant: 8),
             brushSubToolBar.widthAnchor.constraint(equalToConstant: 220),
 
-            // Status bar touching true bottom edge
+            // Keep bottom controls above the home-indicator safe area.
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            statusBar.heightAnchor.constraint(equalToConstant: 34),
+            statusBar.bottomAnchor.constraint(equalTo: safe.bottomAnchor),
+            statusBar.heightAnchor.constraint(equalToConstant: 40),
 
             selectionActionBar.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             selectionActionBar.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -14),
@@ -203,7 +206,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             self.diagnostics.update(text: text)
         }
         canvas.onDrawingBegan = { [weak self] in self?.emptyState.isHidden = true }
-        canvas.onDocumentChanged = { [weak self] in self?.documentDidChange() }
         canvas.onSqueeze = { [weak self] in self?.handlePencilSqueeze() }
         canvas.onCenterModeChanged = { [weak self] _ in self?.updateStatusBar() }
         canvas.onSelectionChanged = { [weak self] indices, _ in
@@ -221,6 +223,18 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             self.selectedTool = tool
             UserDefaults.standard.set(Int(tool.rawValue), forKey: Self.selectedToolDefaultsKey)
             self.updateToolSelection()
+        }
+        documentCoordinator.onCommit = { [weak self] _ in
+            // This callback is delivered only after the renderer's command
+            // buffer has completed.  It is the UI refresh boundary for undo,
+            // layer state and the empty-canvas hint.
+            self?.documentDidChange()
+        }
+        documentCoordinator.onError = { [weak self] message in
+            self?.showToast("Drafting Table: \(message)")
+        }
+        documentCoordinator.bind(engineBridge: canvas.engineBridge) { [weak canvas] in
+            canvas?.paperSize ?? CGSize(width: 1536, height: 2048)
         }
     }
 
@@ -244,20 +258,18 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         // archive, reading UserDefaults, and laying out the rails now happens
         // after the window is visible so the watchdog never kills us between
         // the beige launch screen and the first committed frame.
-        NSLog("DraftingTable launch: viewDidLoad, deferring restore")
+        NSLog("DraftingTable launch: viewDidLoad, deferring package restore")
         applyStoredSettings()
         refreshRails(); updateToolSelection(); updateUndoRedoState(); refreshMySlotsRail(); refreshColorSwatch(); refreshBrushSubToolBar()
         updateLaunchBreadcrumb(stage: "viewDidLoad")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            NSLog("DraftingTable launch: deferred restore begin")
+            NSLog("DraftingTable launch: deferred package restore begin")
             self.restoreDocument()
             self.refreshRails(); self.updateToolSelection(); self.updateUndoRedoState(); self.refreshMySlotsRail()
             self.refreshColorSwatch(); self.refreshBrushSubToolBar()
             self.canvas.setNeedsDisplay()
-            NSLog("DraftingTable launch: deferred restore done strokes=%lu",
-                  UInt(self.canvas.engineBridge.strokeCount))
-            self.updateLaunchBreadcrumb(stage: "restored")
+            self.updateLaunchBreadcrumb(stage: "restoreScheduled")
         }
     }
 
@@ -275,8 +287,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     /// Called by the scene delegate before suspension as a final autosave.
     func saveDocument() {
-        guard isViewLoaded, let canvas else { return }
-        do { try persistence.save(canvas.engineBridge.archiveData()) } catch { /* retry on next mutation */ }
+        // Tile checkpoints are committed by PreviewDocumentCoordinator after
+        // the renderer completion callback.  There is deliberately no
+        // synchronous archive snapshot here; keeping this method as a no-op
+        // preserves the scene delegate hook while removing the old DTAR path.
     }
 
     /// Tiny launch breadcrumb for the next crash report. If the app ever dies
@@ -299,20 +313,45 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         // Any in-flight background renders belong to the previous document
         // state; bumping the epoch orphans them so stale art can never land.
         thumbnailEpoch &+= 1
-        saveDocument(); emptyState.isHidden = canvas.engineBridge.strokeCount > 0
+        emptyState.isHidden = canvas.engineBridge.strokeCount > 0
         refreshRails()
         updateUndoRedoState(); canvas.setNeedsDisplay()
     }
 
     private func restoreDocument() {
-        guard let data = persistence.load() else { return }
-        guard canvas.engineBridge.loadArchiveData(data) else {
-            persistence.quarantineCorruptArchive()
-            return
+        guard !isRestoringDocument else { return }
+        isRestoringDocument = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isRestoringDocument = false }
+            do {
+                let load = try await self.documentCoordinator.recoverDefaultPackage(
+                    engineBridge: self.canvas.engineBridge,
+                    pageSize: self.canvas.paperSize)
+                self.canvas.paperSize = CGSize(width: load.width, height: load.height)
+                self.pageThumbnailCache.removeAll(keepingCapacity: true)
+                self.thumbnailEpoch &+= 1
+                self.emptyState.isHidden = self.canvas.engineBridge.strokeCount > 0
+                self.refreshRails()
+                self.updateUndoRedoState()
+                self.canvas.setNeedsDisplay()
+                self.fitPaperIfNeeded()
+                self.updateLaunchBreadcrumb(stage: "restoredPackage")
+            } catch {
+                self.showToast("Could not recover Drafting Table package")
+                self.updateLaunchBreadcrumb(stage: "restoreFailed")
+            }
         }
-        pageThumbnailCache.removeAll(keepingCapacity: true)
-        thumbnailEpoch &+= 1
-        emptyState.isHidden = canvas.engineBridge.strokeCount > 0; canvas.setNeedsDisplay(); refreshRails()
+    }
+
+    /// Fits the sheet once when no view transform has been stored.  Subsequent
+    /// launches preserve the user's pan/zoom/rotation exactly.
+    private func fitPaperIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "draftingTable.canvasScale") == nil,
+              defaults.object(forKey: "draftingTable.canvasTranslationX") == nil,
+              defaults.object(forKey: "draftingTable.canvasTranslationY") == nil else { return }
+        canvas.resetView()
     }
 
     private func applyStoredSettings() {
@@ -339,9 +378,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         canvas.shapeCenterMode = defaults.bool(forKey: Self.shapeCenterModeDefaultsKey)
         diagnostics.isHidden = !defaults.bool(forKey: Self.showDiagnosticsDefaultsKey)
         let storedTool = defaults.integer(forKey: Self.selectedToolDefaultsKey)
-        selectedTool = (0...Int(DTTool.lasso.rawValue)).contains(storedTool)
-            ? (DTTool(rawValue: UInt8(storedTool)) ?? .brush)
-            : .brush
+        selectedTool = storedTool == Int(DTTool.eraser.rawValue) ? .eraser : .brush
         canvas.currentTool = selectedTool
     }
 
@@ -484,15 +521,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     @objc private func confirmClearDocument() {
         let alert = UIAlertController(title: "Clear Entire Document",
-                                      message: "Are you sure you want to clear all pages and strokes? This cannot be undone.",
+                                      message: "The v0.1 preview keeps document history transactional. Use Undo to remove the latest stroke.",
                                       preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Clear All", style: .destructive) { [weak self] _ in
-            guard let self else { return }
-            self.canvas.engineBridge.clearCanvas()
-            self.documentDidChange(invalidateAllThumbnails: true)
-            HapticFeedbackService.shared.undoRedo()
-        })
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
 
@@ -507,12 +539,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let settings = UIAction(title: "Settings", image: UIImage(systemName: "slider.horizontal.3")) { [weak self] _ in self?.showSettings() }
         let renameDoc = UIAction(title: "Rename Document…", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.promptRenameDocument() }
         let clearDoc = UIAction(title: "Clear Entire Document", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.confirmClearDocument() }
-        let exportPage = UIAction(title: "Export Current Page (PNG)", image: UIImage(systemName: "photo")) { [weak self] _ in self?.exportCurrentPagePNG() }
-        let exportPDF = UIAction(title: "Export All Pages (PDF)", image: UIImage(systemName: "doc.richtext")) { [weak self] _ in self?.exportAllPagesPDF() }
         let open = UIAction(title: "Open .drafttable…", image: UIImage(systemName: "folder")) { [weak self] _ in self?.openDocument() }
-        let saveCopy = UIAction(title: "Save Copy…", image: UIImage(systemName: "square.and.arrow.down")) { [weak self] _ in self?.saveDocumentCopy() }
-        let documents = UIMenu(title: "Documents", options: .displayInline, children: [renameDoc, open, saveCopy, clearDoc])
-        let menu = UIMenu(title: "Document", children: [settings, grid, documents, UIMenu(title: "Export", options: .displayInline, children: [exportPage, exportPDF])])
+        let documents = UIMenu(title: "Documents", options: .displayInline, children: [renameDoc, open, clearDoc])
+        let menu = UIMenu(title: "Document", children: [settings, grid, documents])
         return UIBarButtonItem(image: UIImage(systemName: "ellipsis.circle"), menu: menu)
     }
 
@@ -534,46 +563,54 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         // v0.9.0: thumbnails are back through the background cache. The rail
         // callback stays synchronous and cheap; raster work happens off-main
         // and refreshes the rail when ready.
-        pagesRail.thumbnailForPage = { [weak self] index in self?.thumbnail(forPageAt: index) }
+        // Thumbnails depend on the removed retained-stroke snapshot path and
+        // remain intentionally absent in the narrow v0.1 slice.
+        pagesRail.thumbnailForPage = nil
         pagesRail.onSelect = { [weak self] index in
             guard let self else { return }
+            guard index == 0 else { return }
             self.canvas.engineBridge.setActivePageIndex(UInt(index))
-            self.documentDidChange()
+            self.refreshRails()
         }
-        pagesRail.onAdd = { [weak self] in self?.addPage() }
-        pagesRail.onRename = { [weak self] index in self?.renamePage(at: index) }
-        pagesRail.onDelete = { [weak self] index in self?.deletePage(at: index) }
-        pagesRail.onDuplicate = { [weak self] index in self?.duplicatePage(at: index) }
-        pagesRail.onMove = { [weak self] from, to in self?.movePage(from: from, to: to) }
-        pagesRail.onDocsMenu = { [weak self] in self?.openGallery() }
+        // v0.1 deliberately exposes one package-backed page.  Creation,
+        // deletion, duplication, reordering and retained-page actions remain
+        // unavailable until the multi-page renderer slice lands.
+        pagesRail.onAdd = nil
+        pagesRail.onRename = nil
+        pagesRail.onDelete = nil
+        pagesRail.onDuplicate = nil
+        pagesRail.onMove = nil
+        pagesRail.onDocsMenu = { [weak self] in self?.openDocument() }
     }
 
     private func configureLayersRail() {
         layersRail.onSelect = { [weak self] index in
             guard let self else { return }
-            self.canvas.engineBridge.setActiveLayerIndex(UInt(index))
-            self.documentDidChange()
+            guard (0..<2).contains(index) else { return }
+            _ = self.canvas.engineBridge.setActiveLayerIndex(UInt(index))
+            self.refreshRails()
         }
-        layersRail.onAdd = { [weak self] in self?.addLayer() }
-        layersRail.onAddVector = { [weak self] in self?.addVectorLayer() }
-        layersRail.onRename = { [weak self] index in self?.renameLayer(at: index) }
-        layersRail.onDelete = { [weak self] index in self?.deleteLayer(at: index) }
-        layersRail.onDuplicate = { [weak self] index in self?.duplicateLayer(at: index) }
-        layersRail.onMove = { [weak self] from, to in self?.moveLayer(from: from, to: to) }
+        layersRail.onAdd = nil
+        layersRail.onAddVector = nil
+        layersRail.onRename = nil
+        layersRail.onDelete = nil
+        layersRail.onDuplicate = nil
+        layersRail.onMove = nil
         layersRail.onVisibility = { [weak self] visible, index in
             guard let self else { return }
-            self.canvas.engineBridge.setLayerVisible(visible, at: UInt(index))
-            self.documentDidChange()
+            guard (0..<2).contains(index) else { return }
+            _ = self.canvas.engineBridge.setLayerVisible(visible, at: UInt(index))
         }
         layersRail.onOpacity = { [weak self] opacity, index in
             guard let self else { return }
-            self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
+            guard (0..<2).contains(index) else { return }
+            _ = self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
             self.canvas.setNeedsDisplay()
         }
         layersRail.onOpacityCommit = { [weak self] opacity, index in
             guard let self else { return }
-            self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
-            self.documentDidChange()
+            guard (0..<2).contains(index) else { return }
+            _ = self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
         }
     }
 
@@ -879,7 +916,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
         stack.addArrangedSubview(createTopDivider())
 
-        // 8. Paper Size Selection Menu Button
+        // 8. Paper size is fixed by the package page in v0.1.  The old menu
+        // changed only the immediate renderer and could desynchronise saved
+        // metadata, so it is intentionally not exposed.
         paperSizeButton = UIButton(type: .system)
         var paperBtnConfig = UIButton.Configuration.plain()
         paperBtnConfig.image = UIImage(systemName: "doc.plaintext", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium))
@@ -889,7 +928,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         paperSizeButton.configuration = paperBtnConfig
         paperSizeButton.showsMenuAsPrimaryAction = true
         paperSizeButton.menu = createPaperSizeMenu()
-        stack.addArrangedSubview(paperSizeButton)
+        paperSizeButton.isHidden = true
 
         // 9. Reset View Button
         let resetBtn = UIButton(type: .system)
@@ -1178,23 +1217,23 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             guard let self else { return }
             switch action {
             case .notebooksGallery:
-                self.openGallery()
+                self.showToast("Notebook gallery is deferred in the v0.1 preview")
             case .renameDocument:
                 self.promptRenameDocument()
             case .exportPNG:
-                self.exportCurrentPagePNG()
+                self.showToast("PNG export is deferred until tile readback is exposed")
             case .exportPDF:
-                self.exportAllPagesPDF()
+                self.showToast("PDF export is deferred until tile readback is exposed")
             case .saveArchive:
-                self.saveDocumentCopy()
+                self.showToast("Use Files to share the .drafttable package")
             case .importPhoto:
-                self.promptImportPhoto()
+                self.showToast("Image import is deferred in the v0.1 preview")
             case .settings:
                 self.openSettings()
             case .resetView:
                 self.resetCanvasView()
             case .clearDocument:
-                self.confirmClearDocument()
+                self.showToast("Clear is unavailable in v0.1; use Undo")
             }
         }
 
@@ -1205,22 +1244,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func showExportMenu(sourceView: UIView? = nil) {
-        let alert = UIAlertController(title: "Export & Share", message: nil, preferredStyle: .actionSheet)
-        let anchor = sourceView ?? mainMenuButton ?? view
-        alert.popoverPresentationController?.sourceView = anchor
-        alert.popoverPresentationController?.sourceRect = anchor?.bounds ?? .zero
-
-        alert.addAction(UIAlertAction(title: "Export Current Page (PNG)", style: .default) { [weak self] _ in
-            self?.exportCurrentPagePNG()
-        })
-        alert.addAction(UIAlertAction(title: "Export All Pages (PDF)", style: .default) { [weak self] _ in
-            self?.exportAllPagesPDF()
-        })
-        alert.addAction(UIAlertAction(title: "Save Archive Copy (.drafttable)", style: .default) { [weak self] _ in
-            self?.saveDocumentCopy()
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        present(alert, animated: true)
+        _ = sourceView
+        showToast("Export is deferred until tile readback is exposed")
     }
 
     private func configureToolRail() {
@@ -1237,14 +1262,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
         brushButton = railToolButton(systemName: "pencil.tip", label: "Brush", action: #selector(selectBrush))
         eraserButton = railToolButton(systemName: "eraser", label: "Eraser", action: #selector(selectEraser))
-        bucketButton = railToolButton(systemName: "drop.fill", label: "Bucket", action: #selector(selectBucket))
-        shadeButton = railToolButton(systemName: "skew", label: "Shade", action: #selector(selectShade))
-        lineButton = railToolButton(systemName: "line.diagonal", label: "Line", action: #selector(selectLine))
-        rectangleButton = railToolButton(systemName: "rectangle", label: "Rect", action: #selector(selectRectangle))
-        circleButton = railToolButton(systemName: "circle", label: "Circle", action: #selector(selectCircle))
-        ellipseButton = railToolButton(systemName: "oval", label: "Ellipse", action: #selector(selectEllipse))
-        selectButton = railToolButton(systemName: "rectangle.dashed", label: "Select", action: #selector(selectMarquee))
-        lassoButton = railToolButton(systemName: "lasso", label: "Lasso", action: #selector(selectLasso))
 
         pagesToggleButton = railToolButton(systemName: "doc.on.doc", label: "Pages", action: #selector(togglePagesRail))
         layersToggleButton = railToolButton(systemName: "square.3.layers.3d", label: "Layers", action: #selector(toggleLayersRail))
@@ -1252,18 +1269,12 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         clearButton = railToolButton(systemName: "trash", label: "Clear", action: #selector(confirmClearDocument))
 
         stack.addArrangedSubview(railTitle("DRAW"))
-        [brushButton, eraserButton, bucketButton, shadeButton].forEach(stack.addArrangedSubview)
-        stack.addArrangedSubview(railRule())
-        stack.addArrangedSubview(railTitle("VECTOR"))
-        [lineButton, rectangleButton, circleButton, ellipseButton].forEach(stack.addArrangedSubview)
-        stack.addArrangedSubview(railRule())
-        stack.addArrangedSubview(railTitle("SELECT"))
-        [selectButton, lassoButton].forEach(stack.addArrangedSubview)
+        [brushButton, eraserButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
         stack.addArrangedSubview(railTitle("PANELS"))
         [pagesToggleButton, layersToggleButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(railRule())
-        [resetViewBtn, clearButton].forEach(stack.addArrangedSubview)
+        stack.addArrangedSubview(resetViewBtn)
 
         scroll.addSubview(stack); toolRail.addSubview(scroll)
         NSLayoutConstraint.activate([
@@ -1641,10 +1652,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             guard let self else { return }
             switch action {
             case .selectTool(let tool):
-                if tool == .bucket {
-                    self.selectBucket()
-                } else {
+                if tool == .brush || tool == .eraser {
                     self.selectTool(tool)
+                } else {
+                    self.showToast("That tool is deferred in the v0.1 preview")
                 }
             case .openColorPicker:
                 self.openColorPickerDirect()
@@ -1769,92 +1780,66 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     @objc private func selectLasso() { selectTool(.lasso) }
 
     private func selectTool(_ tool: DTTool) {
-        selectedTool = tool
-        canvas.currentTool = tool
-        UserDefaults.standard.set(Int(tool.rawValue), forKey: Self.selectedToolDefaultsKey)
+        let accepted: DTTool = tool == .eraser ? .eraser : .brush
+        selectedTool = accepted
+        canvas.currentTool = accepted
+        UserDefaults.standard.set(Int(accepted.rawValue), forKey: Self.selectedToolDefaultsKey)
         HapticFeedbackService.shared.toolSwitched()
         updateToolSelection()
     }
 
-    @objc private func undoCanvas() { guard canvas.engineBridge.canUndo else { return }; _ = canvas.engineBridge.undoLastStroke(); documentDidChange() }
-    @objc private func redoCanvas() { guard canvas.engineBridge.canRedo else { return }; _ = canvas.engineBridge.redoLastStroke(); documentDidChange() }
-    @objc private func clearCanvas() { guard canvas.engineBridge.strokeCount > 0 else { return }; canvas.engineBridge.clearCanvas(); documentDidChange() }
+    @objc private func undoCanvas() {
+        guard canvas.engineBridge.canUndo else { return }
+        guard canvas.engineBridge.undoLastStroke() else {
+            showToast("Undo is waiting for the renderer")
+            return
+        }
+        // UI refresh and persistence follow documentCommitHandler after the
+        // restore command buffer completes; do not publish a stale snapshot.
+        canvas.setNeedsDisplay()
+    }
+
+    @objc private func redoCanvas() {
+        guard canvas.engineBridge.canRedo else { return }
+        guard canvas.engineBridge.redoLastStroke() else {
+            showToast("Redo is waiting for the renderer")
+            return
+        }
+        canvas.setNeedsDisplay()
+    }
+
+    @objc private func clearCanvas() {
+        showToast("Clear is unavailable in the v0.1 preview; use Undo")
+    }
     @objc private func openSettings() { showSettings() }
     @objc private func resetCanvasView() { canvas.resetView() }
 
     private func exportCurrentPagePNG() {
-        guard let page = canvas.engineBridge.pageInfos.first(where: { $0.selected }) else { return }
-        let transparent = UserDefaults.standard.bool(forKey: "draftingTable.transparentExport")
-        guard let data = DocumentExportService.pngData(
-            strokes: canvas.engineBridge.renderableStrokes(forPageAt: page.index),
-            canvasSize: canvas.bounds.size,
-            transparentBackground: transparent
-        ) else { return }
-        shareTemporary(data: data, extension: "png", activityItem: "Drafting Table Page")
+        showToast("PNG export is deferred until tile readback is exposed")
     }
 
     @objc private func promptImportPhoto() {
-        let picker = UIImagePickerController()
-        picker.sourceType = .photoLibrary
-        picker.delegate = self
-        picker.modalPresentationStyle = .formSheet
-        present(picker, animated: true)
+        showToast("Image import is deferred in the v0.1 preview")
     }
 
     private func insertImportedImage(_ image: UIImage) {
-        let center = canvas.documentPoint(for: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY))
-        let maxDim: CGFloat = 360.0
-        let aspect = image.size.width > 0 ? image.size.height / image.size.width : 1.0
-        let w = min(image.size.width, maxDim)
-        let h = w * aspect
-        let minX = center.x - w * 0.5
-        let minY = center.y - h * 0.5
-        let maxX = center.x + w * 0.5
-        let maxY = center.y + h * 0.5
-
-        var p0 = DTRenderPoint(x: Float(minX), y: Float(minY), pressure: 1.0, predicted: 0)
-        var p1 = DTRenderPoint(x: Float(maxX), y: Float(maxY), pressure: 1.0, predicted: 0)
-        let val0 = NSValue(bytes: &p0, objCType: "{DTRenderPoint=ffff}")
-        let val1 = NSValue(bytes: &p1, objCType: "{DTRenderPoint=ffff}")
-
-        _ = canvas.engineBridge.insertStroke(points: [val0, val1],
-                                             tool: .rectangle,
-                                             brushSize: 2.0,
-                                             brushOpacity: 1.0,
-                                             brushColorRGBA: canvas.engineBridge.brushColorRGBA,
-                                             brushHardness: 1.0)
-        documentDidChange()
-        showToast("Image imported (\(Int(w)) × \(Int(h)))")
+        _ = image
+        showToast("Image import is deferred in the v0.1 preview")
     }
 
     @objc private func openGallery() {
-        saveDocument()
-        let currentTitle = UserDefaults.standard.string(forKey: Self.docTitleDefaultsKey) ?? "DraftingTable"
-        let gallery = DocumentGalleryViewController(currentDocumentName: currentTitle)
-        gallery.delegate = self
-        let nav = UINavigationController(rootViewController: gallery)
-        nav.modalPresentationStyle = .formSheet
-        present(nav, animated: true)
+        openDocument()
     }
 
     private func openDocument() {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.draftingTableDocument, .data], asCopy: true)
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.draftingTableDocument], asCopy: false)
         picker.delegate = self
         picker.allowsMultipleSelection = false
         presentPickerSafely(picker)
     }
 
     private func saveDocumentCopy() {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("DraftingTable-\(UUID().uuidString).drafttable")
-        do {
-            try canvas.engineBridge.archiveData().write(to: url, options: .atomic)
-            pendingDocumentExportURL = url
-            let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
-            picker.delegate = self
-            presentPickerSafely(picker)
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-        }
+        showToast("Use Files to share the current .drafttable package")
     }
 
     private func presentPickerSafely(_ picker: UIDocumentPickerViewController) {
@@ -1867,26 +1852,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        let wasExporting = pendingDocumentExportURL != nil
-        defer {
-            if let pendingDocumentExportURL {
-                try? FileManager.default.removeItem(at: pendingDocumentExportURL)
-                self.pendingDocumentExportURL = nil
-            }
-        }
-        guard !wasExporting, let url = urls.first else { return }
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-        do {
-            let data = try Data(contentsOf: url)
-            guard canvas.engineBridge.loadArchiveData(data) else {
-                showDocumentError("This file is not a valid Drafting Table document.")
-                return
-            }
-            documentDidChange(invalidateAllThumbnails: true)
-        } catch {
-            showDocumentError("Drafting Table could not read that file.")
-        }
+        pendingDocumentExportURL = nil
+        guard let url = urls.first else { return }
+        openPackage(at: url)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
@@ -1902,10 +1870,45 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         present(alert, animated: true)
     }
 
+    /// Opens a package through a temporary coordinator and swaps the engine
+    /// only after the candidate manifest, tile checksums and Metal upload all
+    /// succeed.  The coordinator retains the security-scoped URL for the
+    /// lifetime of the active package.
+    func openPackage(at url: URL) {
+        guard isViewLoaded else { return }
+        guard !isRestoringDocument else {
+            showToast("Document is still loading")
+            return
+        }
+        isRestoringDocument = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isRestoringDocument = false }
+            do {
+                let load = try await self.documentCoordinator.switchToPackage(
+                    at: url,
+                    engineBridge: self.canvas.engineBridge,
+                    pageSize: self.canvas.paperSize)
+                self.canvas.paperSize = CGSize(width: load.width, height: load.height)
+                self.pageThumbnailCache.removeAll(keepingCapacity: true)
+                self.thumbnailEpoch &+= 1
+                self.emptyState.isHidden = self.canvas.engineBridge.strokeCount > 0
+                self.refreshRails()
+                self.updateUndoRedoState()
+                self.canvas.setNeedsDisplay()
+                self.fitPaperIfNeeded()
+                UserDefaults.standard.set(url.deletingPathExtension().lastPathComponent,
+                                          forKey: Self.docTitleDefaultsKey)
+                self.updateDocumentTitleLabel()
+                self.showToast("Opened \(url.deletingPathExtension().lastPathComponent)")
+            } catch {
+                self.showDocumentError("Drafting Table could not open that package.")
+            }
+        }
+    }
+
     private func exportAllPagesPDF() {
-        let pages = canvas.engineBridge.pageInfos.map { canvas.engineBridge.renderableStrokes(forPageAt: $0.index) }
-        guard let data = DocumentExportService.pdfData(pages: pages, canvasSize: canvas.bounds.size) else { return }
-        shareTemporary(data: data, extension: "pdf", activityItem: "Drafting Table Document")
+        showToast("PDF export is deferred until tile readback is exposed")
     }
 
     private func shareTemporary(data: Data, extension fileExtension: String, activityItem: String) {
@@ -1935,28 +1938,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var thumbnailEpoch: UInt64 = 0
 
     private func requestThumbnail(forPageAt index: UInt) {
-        guard !thumbnailsInFlight.contains(index) else { return }
-        let canvasSize = canvas.bounds.size
-        guard canvasSize.width >= 1, canvasSize.height >= 1 else { return }
-        thumbnailsInFlight.insert(index)
-        let epoch = thumbnailEpoch
-        let bridge = canvas.engineBridge
-        thumbnailQueue.async { [weak self] in
-            let strokes = bridge.renderableStrokes(forPageAt: index)
-            let image = DocumentExportService.thumbnail(
-                strokes: strokes,
-                canvasSize: canvasSize,
-                targetSize: CGSize(width: 52, height: 34))
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.thumbnailsInFlight.remove(index)
-                guard epoch == self.thumbnailEpoch,
-                      let image,
-                      self.pageThumbnailCache[index] == nil else { return }
-                self.pageThumbnailCache[index] = image
-                self.refreshRails()
-            }
-        }
+        // Page thumbnails are intentionally disabled with one fixed page and
+        // no retained-stroke snapshot fallback.
+        _ = index
     }
 }
 
@@ -1974,30 +1958,15 @@ extension DraftingTableViewController: UIImagePickerControllerDelegate, UINaviga
 
 extension DraftingTableViewController: DocumentGalleryDelegate {
     func documentGallery(_ gallery: DocumentGalleryViewController, didSelectDocumentAt url: URL, name: String) {
-        do {
-            let data = try Data(contentsOf: url)
-            guard canvas.engineBridge.loadArchiveData(data) else {
-                showDocumentError("Invalid Drafting Table document.")
-                return
-            }
-            UserDefaults.standard.set(name, forKey: Self.docTitleDefaultsKey)
-            documentDidChange(invalidateAllThumbnails: true)
-            updateDocumentTitleLabel()
-            showToast("Opened: \(name)")
-        } catch {
-            showDocumentError("Could not load document.")
-        }
+        _ = gallery
+        _ = name
+        openPackage(at: url)
     }
 
     func documentGalleryDidCreateNewDocument(_ gallery: DocumentGalleryViewController, name: String, preset: String) {
-        saveDocument()
-        canvas.engineBridge.clearCanvas()
-        UserDefaults.standard.set(name, forKey: Self.docTitleDefaultsKey)
-        documentDidChange(invalidateAllThumbnails: true)
-        updateDocumentTitleLabel()
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let url = dir.appendingPathComponent("\(name).drafttable")
-        try? canvas.engineBridge.archiveData().write(to: url, options: .atomic)
-        showToast("Created notebook: \(name)")
+        _ = gallery
+        _ = name
+        _ = preset
+        showToast("Creating additional notebooks is deferred in the v0.1 preview")
     }
 }

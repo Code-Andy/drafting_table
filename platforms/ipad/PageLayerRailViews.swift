@@ -93,7 +93,8 @@ final class PagesRailView: UIView {
             let card = PageCardButton(info: info, canDelete: canDelete,
                                       canMoveUp: info.index > 0,
                                       canMoveDown: info.index + 1 < UInt(pageInfos.count),
-                                      thumbnail: thumbnailForPage?(info.index))
+                                      thumbnail: thumbnailForPage?(info.index),
+                                      editable: onRename != nil || onDelete != nil || onDuplicate != nil || onMove != nil)
             card.onSelect = { [weak self] in self?.onSelect?(Int(info.index)) }
             card.onRename = { [weak self] in self?.onRename?(Int(info.index)) }
             card.onDelete = { [weak self] in self?.onDelete?(Int(info.index)) }
@@ -104,15 +105,17 @@ final class PagesRailView: UIView {
             }
             stack.addArrangedSubview(card)
         }
-        let add = UIButton(type: .system)
-        add.setImage(UIImage(systemName: "plus"), for: .normal)
-        add.tintColor = .systemBlue
-        add.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
-        add.layer.cornerRadius = 6
-        add.heightAnchor.constraint(equalToConstant: 28).isActive = true
-        add.accessibilityLabel = "Add page"
-        add.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
-        stack.addArrangedSubview(add)
+        if let onAdd {
+            let add = UIButton(type: .system)
+            add.setImage(UIImage(systemName: "plus"), for: .normal)
+            add.tintColor = .systemBlue
+            add.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
+            add.layer.cornerRadius = 6
+            add.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            add.accessibilityLabel = "Add page"
+            add.addAction(UIAction { _ in onAdd() }, for: .touchUpInside)
+            stack.addArrangedSubview(add)
+        }
     }
 }
 
@@ -126,8 +129,9 @@ private final class PageCardButton: UIButton {
     private let canDelete: Bool
     private let canMoveUp: Bool
     private let canMoveDown: Bool
+    private let editable: Bool
 
-    init(info: DTPageInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool, thumbnail: UIImage?) {
+    init(info: DTPageInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool, thumbnail: UIImage?, editable: Bool = true) {
         self.info = info
         self.canDelete = canDelete
         self.canMoveUp = canMoveUp
@@ -153,7 +157,9 @@ private final class PageCardButton: UIButton {
         accessibilityValue = info.selected ? "Selected" : "Not selected"
         accessibilityTraits = info.selected ? [.button, .selected] : [.button]
         addTarget(self, action: #selector(selected), for: .touchUpInside)
-        addInteraction(UIContextMenuInteraction(delegate: self))
+        if editable {
+            addInteraction(UIContextMenuInteraction(delegate: self))
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -327,29 +333,33 @@ final class LayersRailView: UIView {
         lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
         headerRow.addArrangedSubview(lbl)
 
-        let addRasterBtn = UIButton(type: .system)
-        let addCfg = UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
-        addRasterBtn.setImage(UIImage(systemName: "plus", withConfiguration: addCfg), for: .normal)
-        addRasterBtn.tintColor = UIColor(red: 0.25, green: 0.22, blue: 0.18, alpha: 1)
-        addRasterBtn.backgroundColor = UIColor.black.withAlphaComponent(0.06)
-        addRasterBtn.layer.cornerRadius = 4
-        addRasterBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        addRasterBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        addRasterBtn.accessibilityLabel = "Add raster layer"
-        addRasterBtn.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
-        headerRow.addArrangedSubview(addRasterBtn)
+        if let onAdd {
+            let addRasterBtn = UIButton(type: .system)
+            let addCfg = UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+            addRasterBtn.setImage(UIImage(systemName: "plus", withConfiguration: addCfg), for: .normal)
+            addRasterBtn.tintColor = UIColor(red: 0.25, green: 0.22, blue: 0.18, alpha: 1)
+            addRasterBtn.backgroundColor = UIColor.black.withAlphaComponent(0.06)
+            addRasterBtn.layer.cornerRadius = 4
+            addRasterBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
+            addRasterBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            addRasterBtn.accessibilityLabel = "Add raster layer"
+            addRasterBtn.addAction(UIAction { _ in onAdd() }, for: .touchUpInside)
+            headerRow.addArrangedSubview(addRasterBtn)
+        }
 
-        let addVectorBtn = UIButton(type: .system)
-        addVectorBtn.setTitle("+V", for: .normal)
-        addVectorBtn.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
-        addVectorBtn.tintColor = .systemBlue
-        addVectorBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.09)
-        addVectorBtn.layer.cornerRadius = 4
-        addVectorBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
-        addVectorBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        addVectorBtn.accessibilityLabel = "Add vector layer"
-        addVectorBtn.addAction(UIAction { [weak self] _ in self?.onAddVector?() }, for: .touchUpInside)
-        headerRow.addArrangedSubview(addVectorBtn)
+        if let onAddVector {
+            let addVectorBtn = UIButton(type: .system)
+            addVectorBtn.setTitle("+V", for: .normal)
+            addVectorBtn.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
+            addVectorBtn.tintColor = .systemBlue
+            addVectorBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.09)
+            addVectorBtn.layer.cornerRadius = 4
+            addVectorBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            addVectorBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            addVectorBtn.accessibilityLabel = "Add vector layer"
+            addVectorBtn.addAction(UIAction { _ in onAddVector() }, for: .touchUpInside)
+            headerRow.addArrangedSubview(addVectorBtn)
+        }
 
         stack.addArrangedSubview(headerRow)
 
@@ -360,7 +370,8 @@ final class LayersRailView: UIView {
             if info.selected { activeInfo = info }
             let row = LayerRowView(info: info, canDelete: canDelete,
                                    canMoveUp: info.index + 1 < UInt(layerInfos.count),
-                                   canMoveDown: info.index > 0)
+                                   canMoveDown: info.index > 0,
+                                   editable: onRename != nil || onDelete != nil || onDuplicate != nil || onMove != nil)
             row.onSelect = { [weak self] in self?.onSelect?(Int(info.index)) }
             row.onRename = { [weak self] in self?.onRename?(Int(info.index)) }
             row.onDelete = { [weak self] in self?.onDelete?(Int(info.index)) }
@@ -451,11 +462,12 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
         return pan
     }()
 
-    init(info: DTLayerInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool) {
+    init(info: DTLayerInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool, editable: Bool = true) {
         self.info = info
         self.canDelete = canDelete
         self.canMoveUp = canMoveUp
         self.canMoveDown = canMoveDown
+        self.editable = editable
         super.init(frame: .zero)
 
         let isVector = info.name.lowercased().contains("vector")
@@ -544,7 +556,9 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGe
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(selected)))
         addGestureRecognizer(panGesture)
-        addInteraction(UIContextMenuInteraction(delegate: self))
+        if editable {
+            addInteraction(UIContextMenuInteraction(delegate: self))
+        }
         accessibilityLabel = "\(isVector ? "Vector" : "Raster") layer \(info.name)"
         accessibilityValue = "\(info.visible ? "Visible" : "Hidden"), \(opacityLabel.text ?? "")"
         accessibilityTraits = info.selected ? [.button, .selected] : [.button]
