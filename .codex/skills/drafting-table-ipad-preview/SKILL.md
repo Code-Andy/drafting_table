@@ -34,9 +34,11 @@ authoritative checklist and assumption log.
 - If the shared index is dirty, commit owned files with `git commit --only`.
   Do not reset or include other agents' changes.
 - Run portable Windows tests, then push and use macOS GitHub Actions for
-  Swift/Objective-C++/Metal validation. Deliver one verified unsigned arm64
-  IPA for SideStore/AltStore. Do not prepare App Store/TestFlight
-  distribution unless explicitly requested.
+  Swift/Objective-C++/Metal validation. A launch-only simulator smoke is not
+  enough: submit a synthetic stroke through the public bridge and assert its
+  persisted tile contains nonzero alpha. Deliver one verified unsigned arm64
+  IPA for SideStore/AltStore. Do not prepare App Store/TestFlight distribution
+  unless explicitly requested.
 
 ## v0.1 acceptance boundary
 
