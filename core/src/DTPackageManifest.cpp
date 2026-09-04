@@ -10,7 +10,7 @@ namespace drafting_table::package {
 namespace {
 
 constexpr std::size_t kObjectRecordMinimumBytes = 1u + 4u + 4u + 4u + 8u + 8u;
-constexpr std::size_t kTileRecordMinimumBytes = 4u + 4u + 4u + 4u + 8u + 4u;
+constexpr std::size_t kTileRecordMinimumBytes = 8u + 8u + 4u + 4u + 8u + 4u;
 
 ManifestResult success() {
     return {true, ManifestError::None, {}};
@@ -25,8 +25,8 @@ bool hasNul(const std::string& value) {
 }
 
 bool safeRelativePath(const std::string& path) {
-    if (path.empty() || hasNul(path) || path.front() == '/' || path.front() == '\\' ||
-        (path.size() >= 2u && path[1] == ':')) {
+    if (path.empty() || hasNul(path) || path.find('\\') != std::string::npos ||
+        path.front() == '/' || (path.size() >= 2u && path[1] == ':')) {
         return false;
     }
 
@@ -184,8 +184,8 @@ struct Reader {
 };
 
 struct TileKey {
-    std::uint32_t page = 0;
-    std::uint32_t layer = 0;
+    std::uint64_t pageID = 0;
+    std::uint64_t layerID = 0;
     std::int32_t x = 0;
     std::int32_t y = 0;
 
@@ -194,8 +194,9 @@ struct TileKey {
 
 struct TileKeyHash {
     std::size_t operator()(const TileKey& key) const noexcept {
-        std::size_t result = static_cast<std::size_t>(key.page);
-        result = result * 31u + static_cast<std::size_t>(key.layer);
+        std::size_t result = static_cast<std::size_t>(key.pageID ^ (key.pageID >> 32u));
+        result = result * 31u + static_cast<std::size_t>(
+            key.layerID ^ (key.layerID >> 32u));
         result = result * 31u + static_cast<std::size_t>(
             static_cast<std::uint32_t>(key.x));
         result = result * 31u + static_cast<std::size_t>(
@@ -210,9 +211,9 @@ bool descriptorLess(const ObjectDescriptor& lhs, const ObjectDescriptor& rhs) {
 }
 
 bool tileLess(const TileBinding& lhs, const TileBinding& rhs) {
-    return std::tie(lhs.page, lhs.layer, lhs.tileX, lhs.tileY,
+    return std::tie(lhs.pageID, lhs.layerID, lhs.tileX, lhs.tileY,
                     lhs.contentGeneration, lhs.objectId) <
-           std::tie(rhs.page, rhs.layer, rhs.tileX, rhs.tileY,
+           std::tie(rhs.pageID, rhs.layerID, rhs.tileX, rhs.tileY,
                     rhs.contentGeneration, rhs.objectId);
 }
 
@@ -274,10 +275,6 @@ ManifestResult validate(const PackageManifest& manifest) {
     std::unordered_set<TileKey, TileKeyHash> tileKeys;
     tileKeys.reserve(manifest.tiles.size());
     for (const auto& tile : manifest.tiles) {
-        if (tile.page >= kMaxManifestPageIndex || tile.layer >= kMaxManifestLayerIndex) {
-            return failure(ManifestError::BoundsExceeded,
-                           "tile page or layer index exceeds limits");
-        }
         if (tile.contentGeneration == 0u ||
             tile.contentGeneration > manifest.documentGeneration) {
             return failure(ManifestError::ValidationFailed,
@@ -300,7 +297,7 @@ ManifestResult validate(const PackageManifest& manifest) {
             return failure(ManifestError::ValidationFailed,
                            "tile binding refers to a non-tile object");
         }
-        if (!tileKeys.insert({tile.page, tile.layer, tile.tileX, tile.tileY}).second) {
+        if (!tileKeys.insert({tile.pageID, tile.layerID, tile.tileX, tile.tileY}).second) {
             return failure(ManifestError::ValidationFailed,
                            "manifest contains duplicate tile bindings");
         }
@@ -379,8 +376,8 @@ ManifestResult encode(const PackageManifest& manifest,
                   return tileLess(*lhs, *rhs);
               });
     for (const auto* tile : tiles) {
-        writer.u32(tile->page);
-        writer.u32(tile->layer);
+        writer.u64(tile->pageID);
+        writer.u64(tile->layerID);
         writer.i32(tile->tileX);
         writer.i32(tile->tileY);
         writer.u64(tile->contentGeneration);
@@ -444,7 +441,8 @@ ManifestResult decode(std::span<const std::uint8_t> bytes,
     parsed.tiles.reserve(tileCount);
     for (std::uint32_t index = 0; index < tileCount; ++index) {
         TileBinding tile;
-        if (!reader.u32(tile.page) || !reader.u32(tile.layer) || !reader.i32(tile.tileX) ||
+        if (!reader.u64(tile.pageID) || !reader.u64(tile.layerID) ||
+            !reader.i32(tile.tileX) ||
             !reader.i32(tile.tileY) || !reader.u64(tile.contentGeneration) ||
             !reader.string(tile.objectId)) {
             return failure(ManifestError::Truncated, "truncated tile binding");

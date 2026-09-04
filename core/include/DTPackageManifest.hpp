@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <vector>
@@ -27,8 +28,13 @@ inline constexpr std::uint32_t kMaxManifestObjects = 1u << 20;
 inline constexpr std::uint32_t kMaxManifestTileBindings = 1u << 20;
 inline constexpr std::uint32_t kMaxManifestStringBytes = 1u << 20;
 inline constexpr std::uint64_t kMaxManifestObjectBytes = 1ull << 40;
-inline constexpr std::uint32_t kMaxManifestPageIndex = 1u << 20;
-inline constexpr std::uint32_t kMaxManifestLayerIndex = 1u << 20;
+// Page and layer values are stable document identities, not presentation
+// indices.  All uint64 values are valid; unlike record counts these values do
+// not drive allocation and therefore need no artificial index-sized cap.
+inline constexpr std::uint64_t kMaxManifestPageID =
+    (std::numeric_limits<std::uint64_t>::max)();
+inline constexpr std::uint64_t kMaxManifestLayerID =
+    (std::numeric_limits<std::uint64_t>::max)();
 
 enum class ManifestError : std::uint8_t {
     None = 0,
@@ -81,8 +87,10 @@ struct ObjectDescriptor {
 };
 
 struct TileBinding {
-    std::uint32_t page = 0;
-    std::uint32_t layer = 0;
+    // Stable IDs remain valid when pages/layers are reordered in the UI.
+    // They must not be populated with presentation-vector indices.
+    std::uint64_t pageID = 0;
+    std::uint64_t layerID = 0;
     std::int32_t tileX = 0;
     std::int32_t tileY = 0;
     // Generation of the tile payload, not merely the manifest that references

@@ -42,8 +42,9 @@ PackageManifest sampleManifest(std::uint64_t generation = 7,
         ObjectDescriptor{"tile-a", "objects/tile-a.rgba", "", ObjectKind::Tile, 256, 0x1111},
     };
     manifest.tiles = {
-        TileBinding{1, 2, -1, 3, generation, "tile-b"},
-        TileBinding{0, 0, 0, 0, generation, "tile-a"},
+        TileBinding{0x123456789abcdef0ULL, 0xfedcba9876543210ULL,
+                    -1, 3, generation, "tile-b"},
+        TileBinding{0x100000000ULL, 0x200000000ULL, 0, 0, generation, "tile-a"},
     };
     return manifest;
 }
@@ -79,7 +80,8 @@ void testRoundTripAndCanonicalEncoding() {
     CHECK(decoded.objects[0].id == "meta");
     CHECK(decoded.objects[1].id == "tile-a");
     CHECK(decoded.objects[2].id == "tile-b");
-    CHECK(decoded.tiles[0].page == 0 && decoded.tiles[0].layer == 0);
+    CHECK(decoded.tiles[0].pageID == 0x100000000ULL &&
+          decoded.tiles[0].layerID == 0x200000000ULL);
     CHECK(decoded.tiles[1].tileX == -1 && decoded.tiles[1].objectId == "tile-b");
     CHECK(dt::package::encode(decoded) == bytes);
 }
@@ -98,6 +100,10 @@ void testValidationRules() {
 
     invalid = sampleManifest();
     invalid.objects[0].path = "../escape.rgba";
+    CHECK(dt::package::validate(invalid).error == ManifestError::ValidationFailed);
+
+    invalid = sampleManifest();
+    invalid.objects[0].path = "objects\\..\\escape.rgba";
     CHECK(dt::package::validate(invalid).error == ManifestError::ValidationFailed);
 
     invalid = sampleManifest();
