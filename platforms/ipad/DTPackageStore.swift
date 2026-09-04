@@ -92,16 +92,16 @@ public struct DTTileAddress: Codable, Hashable, Sendable {
 }
 
 /// A versioned immutable tile identity. `generation` is the document content
-/// generation assigned by the serial document coordinator; `versionID` makes
-/// each payload path collision-resistant even when generations are retried.
+/// generation assigned by the serial document coordinator; `versionID` is the
+/// nonzero UInt64 renderer version that produced the exact payload.
 public struct DTTileKey: Codable, Hashable, Sendable {
     public let address: DTTileAddress
     public let generation: UInt64
-    public let versionID: UUID
+    public let versionID: UInt64
 
     public init(address: DTTileAddress,
                 generation: UInt64,
-                versionID: UUID = UUID()) {
+                versionID: UInt64) {
         self.address = address
         self.generation = generation
         self.versionID = versionID
@@ -112,7 +112,7 @@ public struct DTTileKey: Codable, Hashable, Sendable {
                 x: Int32,
                 y: Int32,
                 generation: UInt64,
-                versionID: UUID = UUID()) {
+                versionID: UInt64) {
         self.init(address: DTTileAddress(pageID: pageID, layerID: layerID, x: x, y: y),
                   generation: generation,
                   versionID: versionID)
@@ -136,7 +136,7 @@ public enum DTTileWritableSource: String, Codable, Hashable, Sendable {
 
 public struct DTTileRecord: Codable, Hashable, Sendable {
     public let address: DTTileAddress
-    public let versionID: UUID
+    public let versionID: UInt64
     public var contentGeneration: UInt64
     public var persistedGeneration: UInt64
     public var gpuResidency: DTTileGPUResidency
@@ -144,7 +144,7 @@ public struct DTTileRecord: Codable, Hashable, Sendable {
     public var payloadReference: String?
 
     public init(address: DTTileAddress,
-                versionID: UUID,
+                versionID: UInt64,
                 contentGeneration: UInt64,
                 persistedGeneration: UInt64,
                 gpuResidency: DTTileGPUResidency = .notResident,
@@ -218,7 +218,7 @@ public struct DTTilePayload: Codable, Sendable, Hashable {
     public static let tileHeight = 256
     public static let bytesPerPixel = 4
     public static let pixelByteCount = tileWidth * tileHeight * bytesPerPixel
-    public static let tileFileByteCount = 104 + pixelByteCount
+    public static let tileFileByteCount = 96 + pixelByteCount
 
     public let key: DTTileKey
     /// Exact 8-bit premultiplied RGBA bytes in row-major order. No PNG or
@@ -226,6 +226,9 @@ public struct DTTilePayload: Codable, Sendable, Hashable {
     public let pixels: Data
 
     public init(key: DTTileKey, pixels: Data) throws {
+        guard key.generation > 0, key.versionID > 0 else {
+            throw DTPackageStoreError.invalidManifest
+        }
         guard pixels.count == Self.pixelByteCount else {
             throw DTPackageStoreError.invalidTilePayload(expectedBytes: Self.pixelByteCount,
                                                           actualBytes: pixels.count)
@@ -249,7 +252,7 @@ public struct DTTilePayload: Codable, Sendable, Hashable {
                 x: Int32,
                 y: Int32,
                 generation: UInt64,
-                versionID: UUID = UUID(),
+                versionID: UInt64,
                 pixels: Data) throws {
         try self.init(key: DTTileKey(pageID: pageID,
                                      layerID: layerID,
@@ -393,7 +396,7 @@ public actor DTPackageStore {
     public static let currentFileName = "CURRENT"
     public static let manifestsDirectoryName = "manifests"
     public static let tilesDirectoryName = "tiles"
-    public static let tileHeaderByteCount = 104
+    public static let tileHeaderByteCount = 96
 
     private static let manifestPrefix = "manifest-"
     private static let manifestSuffix = ".json"
@@ -483,7 +486,7 @@ public actor DTPackageStore {
             var incomingAddresses = Set<DTTileAddress>()
 
             for payload in transaction.tiles {
-                guard payload.key.generation > 0 else {
+                guard payload.key.generation > 0, payload.key.versionID > 0 else {
                     throw DTPackageStoreError.invalidManifest
                 }
                 guard payload.key.generation <= transaction.documentGeneration else {
@@ -766,6 +769,7 @@ public actor DTPackageStore {
         for entry in envelope.manifest.tiles {
             guard entry.contentGeneration == entry.key.generation,
                   entry.contentGeneration > 0,
+                  entry.key.versionID > 0,
                   entry.contentGeneration <= envelope.manifest.documentGeneration,
                   entry.persistedGeneration == entry.contentGeneration,
                   entry.byteCount == Self.tileHeaderSize + DTTilePayload.pixelByteCount,
@@ -857,7 +861,7 @@ public actor DTPackageStore {
         appendUInt32(UInt32(bitPattern: payload.key.address.x), to: &header)
         appendUInt32(UInt32(bitPattern: payload.key.address.y), to: &header)
         appendUInt64(payload.key.generation, to: &header)
-        appendUUID(payload.key.versionID, to: &header)
+        appendUInt64(payload.key.versionID, to: &header)
         appendUInt16(UInt16(DTTilePayload.tileWidth), to: &header)
         appendUInt16(UInt16(DTTilePayload.tileHeight), to: &header)
         header.append(UInt8(DTTilePayload.bytesPerPixel))
@@ -876,15 +880,15 @@ public actor DTPackageStore {
               Data(data.prefix(Self.tileMagic.count)) == Self.tileMagic,
               readUInt16(data, at: 8) == Self.tileFormatVersion,
               readUInt16(data, at: 10) == 0,
-              readUInt16(data, at: 60) == UInt16(DTTilePayload.tileWidth),
-              readUInt16(data, at: 62) == UInt16(DTTilePayload.tileHeight),
-              data[64] == UInt8(DTTilePayload.bytesPerPixel),
-              data[65] == Self.tilePixelFormatPremultipliedRGBA8,
-              readUInt16(data, at: 66) == 0,
-              readUInt32(data, at: 68) == UInt32(DTTilePayload.pixelByteCount) else {
+              readUInt16(data, at: 52) == UInt16(DTTilePayload.tileWidth),
+              readUInt16(data, at: 54) == UInt16(DTTilePayload.tileHeight),
+              data[56] == UInt8(DTTilePayload.bytesPerPixel),
+              data[57] == Self.tilePixelFormatPremultipliedRGBA8,
+              readUInt16(data, at: 58) == 0,
+              readUInt32(data, at: 60) == UInt32(DTTilePayload.pixelByteCount) else {
             throw DTPackageStoreError.invalidTileHeader
         }
-        guard let payloadLength = readUInt32(data, at: 68),
+        guard let payloadLength = readUInt32(data, at: 60),
               Int(payloadLength) == DTTilePayload.pixelByteCount,
               data.count == Self.tileHeaderSize + Int(payloadLength),
               let pageID = readUInt64(data, at: 12),
@@ -892,11 +896,11 @@ public actor DTPackageStore {
               let xBits = readUInt32(data, at: 28),
               let yBits = readUInt32(data, at: 32),
               let generation = readUInt64(data, at: 36),
-              let versionID = readUUID(data, at: 44) else {
+              let versionID = readUInt64(data, at: 44) else {
             throw DTPackageStoreError.invalidTileHeader
         }
         let pixels = data.subdata(in: Self.tileHeaderSize..<data.count)
-        let expectedChecksum = data.subdata(in: 72..<Self.tileHeaderSize)
+        let expectedChecksum = data.subdata(in: 64..<Self.tileHeaderSize)
         guard Data(SHA256.hash(data: pixels)) == expectedChecksum else {
             throw DTPackageStoreError.tileChecksumMismatch
         }
@@ -910,7 +914,7 @@ public actor DTPackageStore {
     }
 
     private static func tileRelativePath(for key: DTTileKey) -> String {
-        "\(tilesDirectoryName)/p\(key.address.pageID)/l\(key.address.layerID)/x\(key.address.x)y\(key.address.y)-g\(key.generation)-v\(key.versionID.uuidString.lowercased()).dtile"
+        "\(tilesDirectoryName)/p\(key.address.pageID)/l\(key.address.layerID)/x\(key.address.x)y\(key.address.y)-g\(key.generation)-v\(key.versionID).dtile"
     }
 
     private static func manifestFileName(_ generation: UInt64) -> String {
@@ -950,11 +954,6 @@ private func appendUInt64(_ value: UInt64, to data: inout Data) {
     appendUInt32(UInt32(truncatingIfNeeded: value >> 32), to: &data)
 }
 
-private func appendUUID(_ uuid: UUID, to data: inout Data) {
-    var value = uuid.uuid
-    withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
-}
-
 private func readUInt16(_ data: Data, at offset: Int) -> UInt16? {
     guard offset >= 0, offset + 2 <= data.count else { return nil }
     return UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
@@ -970,14 +969,4 @@ private func readUInt64(_ data: Data, at offset: Int) -> UInt64? {
     guard let low = readUInt32(data, at: offset),
           let high = readUInt32(data, at: offset + 4) else { return nil }
     return UInt64(low) | (UInt64(high) << 32)
-}
-
-private func readUUID(_ data: Data, at offset: Int) -> UUID? {
-    guard offset >= 0, offset + 16 <= data.count else { return nil }
-    let bytes = Array(data[offset..<(offset + 16)])
-    guard bytes.count == 16 else { return nil }
-    return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3],
-                       bytes[4], bytes[5], bytes[6], bytes[7],
-                       bytes[8], bytes[9], bytes[10], bytes[11],
-                       bytes[12], bytes[13], bytes[14], bytes[15]))
 }
