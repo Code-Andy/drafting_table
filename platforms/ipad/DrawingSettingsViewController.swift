@@ -107,15 +107,11 @@ final class DrawingSettingsViewController: UIViewController {
             settingRow(title: "size", detail: "Set the diameter of new brush strokes.", slider: sizeSlider, value: sizeValue),
             settingRow(title: "α", detail: "Set the opacity of new brush strokes.", slider: opacitySlider, value: opacityValue),
             settingRow(title: "hard", detail: "Soft edges blend naturally; hard edges stay crisp.", slider: hardnessSlider, value: hardnessValue),
-            settingRow(title: "activate", detail: "Ignore lighter contact and screen-protector noise.", slider: activationSlider, value: activationValue),
             colorRow(),
             sectionTitle("CANVAS & INTERACTION"),
             switchRow(title: "grid", detail: "Show a drafting grid over the page.", control: gridSwitch),
-            switchRow(title: "center mode", detail: "Draw circles and ellipses from their center.", control: centerModeSwitch),
             sectionTitle("DIAGNOSTICS & DEBUG"),
             switchRow(title: "diagnostics", detail: "Show FPS, latency, hover coordinates, and touch count.", control: diagnosticsSwitch),
-            sectionTitle("EXPORT"),
-            switchRow(title: "transparent PNG", detail: "Keep transparent pixels when exporting.", control: transparentExportSwitch),
             infoLabel()
         ])
         stack.axis = .vertical
