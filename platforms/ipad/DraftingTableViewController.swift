@@ -64,6 +64,17 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var bucketSubToolBar: UIView!
     private var gapSegment: UISegmentedControl!
     private var bleedSegment: UISegmentedControl!
+    private var brushSubToolBar: UIView!
+    private var brushSizeSlider: UISlider!
+    private var brushSizeLabel: UILabel!
+    private var brushOpacitySlider: UISlider!
+    private var brushOpacityLabel: UILabel!
+    private var brushHardnessSlider: UISlider!
+    private var brushHardnessLabel: UILabel!
+
+    private var undoRedoLeadingConstraint: NSLayoutConstraint?
+    private var bucketSubToolBarLeadingConstraint: NSLayoutConstraint?
+    private var brushSubToolBarLeadingConstraint: NSLayoutConstraint?
 
     // Tool rail buttons
     private var brushButton: UIButton!
@@ -105,10 +116,11 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         toastLabel = InsetLabel()
         configureUndoRedoChip()
         configureBucketSubToolBar()
+        configureBrushSubToolBar()
         configureSelectionActionBar()
         DTLaunchBreadcrumb("vc:create:rails:done")
         view = root
-        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, undoRedoChip, bucketSubToolBar, selectionActionBar, toastLabel].forEach {
+        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, undoRedoChip, bucketSubToolBar, brushSubToolBar, selectionActionBar, toastLabel].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview($0)
         }
@@ -129,11 +141,11 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             toolRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
             toolRail.widthAnchor.constraint(equalToConstant: 54),
 
-            // Page sidebar
+            // Page sidebar (compact 72pt width)
             pagesRail.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 8),
             pagesRail.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
             pagesRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
-            pagesRail.widthAnchor.constraint(equalToConstant: 80),
+            pagesRail.widthAnchor.constraint(equalToConstant: 72),
 
             // Layer sidebar
             layersRail.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -8),
@@ -142,14 +154,16 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             layersRail.widthAnchor.constraint(equalToConstant: 156),
 
             // Floating Undo / Redo chip over top-left canvas
-            undoRedoChip.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 12),
             undoRedoChip.topAnchor.constraint(equalTo: safe.topAnchor, constant: 8),
             undoRedoChip.heightAnchor.constraint(equalToConstant: 34),
 
             // Bucket Sub-Tool Menu (gap error margin & bleed)
-            bucketSubToolBar.leadingAnchor.constraint(equalTo: toolRail.trailingAnchor, constant: 12),
             bucketSubToolBar.topAnchor.constraint(equalTo: undoRedoChip.bottomAnchor, constant: 8),
             bucketSubToolBar.widthAnchor.constraint(equalToConstant: 248),
+
+            // Brush Sub-Tool Menu (size, opacity, hardness)
+            brushSubToolBar.topAnchor.constraint(equalTo: undoRedoChip.bottomAnchor, constant: 8),
+            brushSubToolBar.widthAnchor.constraint(equalToConstant: 220),
 
             // Status bar touching true bottom edge
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
@@ -168,6 +182,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             diagnostics.leadingAnchor.constraint(equalTo: pagesRail.trailingAnchor, constant: 12), diagnostics.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
             diagnostics.widthAnchor.constraint(greaterThanOrEqualToConstant: 150), diagnostics.widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
+        updateSubToolPosition(animated: false)
         canvas.onDiagnostics = { [weak self] text in
             guard let self, !self.diagnostics.isHidden else { return }
             self.diagnostics.update(text: text)
@@ -342,10 +357,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         present(navigation, animated: true)
     }
 
-    /// Color tool: opens the HSV picker directly from the rail swatch.
-    @objc private func openColorPickerDirect() { presentColorPicker() }
+    /// Color tool: opens the HSV picker directly from the rail swatch as a popover.
+    @objc private func openColorPickerDirect() { presentColorPicker(sourceView: colorSwatchButton) }
 
-    private func presentColorPicker() {
+    private func presentColorPicker(sourceView: UIView? = nil) {
         let picker = ColorPickerViewController()
         picker.initialColorRGBA = canvas.engineBridge.brushColorRGBA
         picker.onColorChanged = { [weak self] packed in self?.applyBrushColor(packed) }
@@ -355,8 +370,15 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             self?.showToast("Eyedropper needs the tile sampler (M2)")
         }
         let navigation = UINavigationController(rootViewController: picker)
-        navigation.modalPresentationStyle = .formSheet
-        if let sheet = navigation.sheetPresentationController { sheet.detents = [.medium(), .large()]; sheet.prefersGrabberVisible = true }
+        navigation.modalPresentationStyle = .popover
+        let anchor = sourceView ?? colorSwatchButton ?? view
+        if let popover = navigation.popoverPresentationController {
+            popover.sourceView = anchor
+            popover.sourceRect = anchor?.bounds ?? .zero
+            popover.permittedArrowDirections = [.left, .up]
+        }
+        navigation.preferredContentSize = CGSize(width: 320, height: 500)
+        picker.preferredContentSize = CGSize(width: 320, height: 500)
         present(navigation, animated: true)
     }
 
@@ -727,6 +749,130 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         stack.addArrangedSubview(bleedSegment)
     }
 
+    private func configureBrushSubToolBar() {
+        brushSubToolBar = UIView()
+        brushSubToolBar.backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.96)
+        brushSubToolBar.layer.cornerRadius = 9
+        brushSubToolBar.layer.borderWidth = 1
+        brushSubToolBar.layer.borderColor = DraftingTheme.rule.cgColor
+        brushSubToolBar.layer.shadowColor = UIColor.black.cgColor
+        brushSubToolBar.layer.shadowOpacity = 0.10
+        brushSubToolBar.layer.shadowRadius = 6
+        brushSubToolBar.layer.shadowOffset = CGSize(width: 0, height: 2)
+        brushSubToolBar.translatesAutoresizingMaskIntoConstraints = false
+        brushSubToolBar.isHidden = true
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .fill
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        brushSubToolBar.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: brushSubToolBar.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: brushSubToolBar.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: brushSubToolBar.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: brushSubToolBar.bottomAnchor, constant: -8)
+        ])
+
+        let titleLbl = UILabel()
+        titleLbl.text = "BRUSH OPTIONS"
+        titleLbl.font = .systemFont(ofSize: 10, weight: .bold)
+        titleLbl.textColor = DraftingTheme.inkSoft
+        titleLbl.textAlignment = .center
+        stack.addArrangedSubview(titleLbl)
+
+        let currentSize = canvas.engineBridge.brushSize
+        brushSizeLabel = UILabel()
+        brushSizeLabel.text = String(format: "SIZE: %.1f pt", currentSize)
+        brushSizeLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        brushSizeLabel.textColor = DraftingTheme.inkSoft
+        stack.addArrangedSubview(brushSizeLabel)
+
+        brushSizeSlider = UISlider()
+        brushSizeSlider.minimumValue = 1.0
+        brushSizeSlider.maximumValue = 40.0
+        brushSizeSlider.value = Float(currentSize)
+        brushSizeSlider.tintColor = DraftingTheme.ink
+        brushSizeSlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let val = CGFloat(self.brushSizeSlider.value)
+            self.canvas.engineBridge.brushSize = val
+            UserDefaults.standard.set(Float(val), forKey: DrawingSettingsViewController.brushSizeKey)
+            self.brushSizeLabel.text = String(format: "SIZE: %.1f pt", val)
+            self.saveDocument()
+        }, for: .valueChanged)
+        stack.addArrangedSubview(brushSizeSlider)
+
+        let currentOpacity = canvas.engineBridge.brushOpacity
+        brushOpacityLabel = UILabel()
+        brushOpacityLabel.text = String(format: "OPACITY: %d%%", Int(currentOpacity * 100))
+        brushOpacityLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        brushOpacityLabel.textColor = DraftingTheme.inkSoft
+        stack.addArrangedSubview(brushOpacityLabel)
+
+        brushOpacitySlider = UISlider()
+        brushOpacitySlider.minimumValue = 0.05
+        brushOpacitySlider.maximumValue = 1.0
+        brushOpacitySlider.value = Float(currentOpacity)
+        brushOpacitySlider.tintColor = DraftingTheme.ink
+        brushOpacitySlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let val = CGFloat(self.brushOpacitySlider.value)
+            self.canvas.engineBridge.brushOpacity = val
+            UserDefaults.standard.set(Float(val * 100), forKey: DrawingSettingsViewController.brushOpacityKey)
+            self.brushOpacityLabel.text = String(format: "OPACITY: %d%%", Int(val * 100))
+            self.saveDocument()
+        }, for: .valueChanged)
+        stack.addArrangedSubview(brushOpacitySlider)
+
+        let currentHardness = canvas.engineBridge.brushHardness
+        brushHardnessLabel = UILabel()
+        brushHardnessLabel.text = String(format: "HARDNESS: %d%%", Int(currentHardness * 100))
+        brushHardnessLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+        brushHardnessLabel.textColor = DraftingTheme.inkSoft
+        stack.addArrangedSubview(brushHardnessLabel)
+
+        brushHardnessSlider = UISlider()
+        brushHardnessSlider.minimumValue = 0.0
+        brushHardnessSlider.maximumValue = 1.0
+        brushHardnessSlider.value = Float(currentHardness)
+        brushHardnessSlider.tintColor = DraftingTheme.ink
+        brushHardnessSlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let val = CGFloat(self.brushHardnessSlider.value)
+            self.canvas.engineBridge.brushHardness = val
+            UserDefaults.standard.set(Float(val * 100), forKey: DrawingSettingsViewController.brushHardnessKey)
+            self.brushHardnessLabel.text = String(format: "HARDNESS: %d%%", Int(val * 100))
+            self.saveDocument()
+        }, for: .valueChanged)
+        stack.addArrangedSubview(brushHardnessSlider)
+    }
+
+    private func updateSubToolPosition(animated: Bool = true) {
+        let anchor = pagesRail.isHidden ? toolRail.trailingAnchor : pagesRail.trailingAnchor
+        undoRedoLeadingConstraint?.isActive = false
+        bucketSubToolBarLeadingConstraint?.isActive = false
+        brushSubToolBarLeadingConstraint?.isActive = false
+
+        undoRedoLeadingConstraint = undoRedoChip.leadingAnchor.constraint(equalTo: anchor, constant: 12)
+        undoRedoLeadingConstraint?.isActive = true
+
+        bucketSubToolBarLeadingConstraint = bucketSubToolBar.leadingAnchor.constraint(equalTo: anchor, constant: 12)
+        bucketSubToolBarLeadingConstraint?.isActive = true
+
+        brushSubToolBarLeadingConstraint = brushSubToolBar.leadingAnchor.constraint(equalTo: anchor, constant: 12)
+        brushSubToolBarLeadingConstraint?.isActive = true
+
+        if animated {
+            UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
+                self.view.layoutIfNeeded()
+            }
+        } else {
+            self.view.layoutIfNeeded()
+        }
+    }
+
     private func applyQuickColor(_ rgba: UInt32) {
         canvas.engineBridge.brushColorRGBA = rgba
         UserDefaults.standard.set(Int(rgba), forKey: DrawingSettingsViewController.brushColorKey)
@@ -735,34 +881,40 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     @objc private func showMainMenu(_ sender: UIButton) {
-        let alert = UIAlertController(title: "Drafting Table", message: nil, preferredStyle: .actionSheet)
-        alert.addAction(UIAlertAction(title: "Notebooks Gallery", style: .default) { [weak self] _ in
-            self?.openGallery()
-        })
-        alert.addAction(UIAlertAction(title: "Rename Document", style: .default) { [weak self] _ in
-            self?.promptRenameDocument()
-        })
-        alert.addAction(UIAlertAction(title: "Export & Share...", style: .default) { [weak self] _ in
-            self?.showExportMenu(sourceView: sender)
-        })
-        alert.addAction(UIAlertAction(title: "Import Photo...", style: .default) { [weak self] _ in
-            self?.promptImportPhoto()
-        })
-        alert.addAction(UIAlertAction(title: "Settings...", style: .default) { [weak self] _ in
-            self?.openSettings()
-        })
-        alert.addAction(UIAlertAction(title: "Reset Canvas View", style: .default) { [weak self] _ in
-            self?.resetCanvasView()
-        })
-        alert.addAction(UIAlertAction(title: "Clear Document", style: .destructive) { [weak self] _ in
-            self?.confirmClearDocument()
-        })
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = sender
-            popover.sourceRect = sender.bounds
+        if let existing = view.subviews.first(where: { $0 is AppMenuWindowView }) as? AppMenuWindowView {
+            existing.dismiss(animated: true)
+            return
         }
-        present(alert, animated: true)
+
+        let menuWindow = AppMenuWindowView()
+        menuWindow.onAction = { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .notebooksGallery:
+                self.openGallery()
+            case .renameDocument:
+                self.promptRenameDocument()
+            case .exportPNG:
+                self.exportCurrentPagePNG()
+            case .exportPDF:
+                self.exportAllPagesPDF()
+            case .saveArchive:
+                self.saveDocumentCopy()
+            case .importPhoto:
+                self.promptImportPhoto()
+            case .settings:
+                self.openSettings()
+            case .resetView:
+                self.resetCanvasView()
+            case .clearDocument:
+                self.confirmClearDocument()
+            }
+        }
+
+        let safeTop = view.safeAreaInsets.top
+        let anchorX = pagesRail.isHidden ? (toolRail.frame.maxX + 10) : (pagesRail.frame.maxX + 10)
+        let anchorY = max(safeTop, 16.0) + 6.0
+        menuWindow.present(in: view, near: CGPoint(x: anchorX, y: anchorY))
     }
 
     private func showExportMenu(sourceView: UIView? = nil) {
@@ -890,6 +1042,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     @objc private func togglePagesRail() {
         pagesRail.isHidden.toggle()
+        updateSubToolPosition()
     }
 
     @objc private func toggleLayersRail() {
@@ -1238,8 +1391,25 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             button.accessibilityValue = button.isSelected ? "Selected" : "Not selected"
         }
         bucketSubToolBar?.isHidden = (selectedTool != .bucket)
+        brushSubToolBar?.isHidden = (selectedTool != .brush)
+        if selectedTool == .brush {
+            refreshBrushSubToolBar()
+        }
         refreshColorSwatch()
         updateStatusBar()
+    }
+
+    private func refreshBrushSubToolBar() {
+        guard brushSizeSlider != nil else { return }
+        let size = canvas.engineBridge.brushSize
+        let opacity = canvas.engineBridge.brushOpacity
+        let hardness = canvas.engineBridge.brushHardness
+        brushSizeSlider.value = Float(size)
+        brushSizeLabel.text = String(format: "SIZE: %.1f pt", size)
+        brushOpacitySlider.value = Float(opacity)
+        brushOpacityLabel.text = String(format: "OPACITY: %d%%", Int(opacity * 100))
+        brushHardnessSlider.value = Float(hardness)
+        brushHardnessLabel.text = String(format: "HARDNESS: %d%%", Int(hardness * 100))
     }
 
     private func updateUndoRedoState() {
@@ -1443,7 +1613,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             let image = DocumentExportService.thumbnail(
                 strokes: strokes,
                 canvasSize: canvasSize,
-                targetSize: CGSize(width: 96, height: 60))
+                targetSize: CGSize(width: 52, height: 34))
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.thumbnailsInFlight.remove(index)

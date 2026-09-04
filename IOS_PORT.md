@@ -134,6 +134,13 @@ ear-clipping triangulation; maximum paper space via top ribbon removal; top-left
 quick pen palette and menu button; floating Undo/Redo pill chip; and the Apple
 Pencil Pro circular radial wheel menu.
 
+Version 0.9.8 adds compact page previews (52x34) with 9.5pt titles and a 72pt
+rail width; dedicated on-canvas `brushSubToolBar` (size, opacity, hardness);
+dynamic top-left positioning of subtool bars to the right of the Pages rail when
+opened (`pagesRail.trailingAnchor + 12`) or tool rail when closed; direct popover
+presentation for the Color swatch tool; and a built-in non-scrolling paper menu
+window (`AppMenuWindowView`) replacing system action sheets.
+
 ## Implemented architecture
 
 ### Portable C++20

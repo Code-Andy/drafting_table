@@ -38,7 +38,7 @@ final class PagesRailView: UIView {
         layer.shadowOffset = CGSize(width: 0, height: 2)
 
         stack.axis = .vertical
-        stack.spacing = 10
+        stack.spacing = 6
         stack.alignment = .fill
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -73,16 +73,18 @@ final class PagesRailView: UIView {
         let docsBtn = UIButton(type: .system)
         var docCfg = UIButton.Configuration.plain()
         docCfg.image = UIImage(systemName: "doc.text")
-        docCfg.title = "DOCS ∨"
-        docCfg.imagePadding = 4
+        var docTitle = AttributedString("DOCS ∨")
+        docTitle.font = .systemFont(ofSize: 9.5, weight: .bold)
+        docCfg.attributedTitle = docTitle
+        docCfg.imagePadding = 3
         docCfg.baseForegroundColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
+        docCfg.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4)
         docsBtn.configuration = docCfg
-        docsBtn.titleLabel?.font = .systemFont(ofSize: 11, weight: .bold)
         docsBtn.backgroundColor = UIColor.white.withAlphaComponent(0.85)
         docsBtn.layer.cornerRadius = 6
         docsBtn.layer.borderWidth = 1
         docsBtn.layer.borderColor = UIColor.black.withAlphaComponent(0.08).cgColor
-        docsBtn.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        docsBtn.heightAnchor.constraint(equalToConstant: 26).isActive = true
         docsBtn.addAction(UIAction { [weak self] _ in self?.onDocsMenu?() }, for: .touchUpInside)
         stack.addArrangedSubview(docsBtn)
         stack.addArrangedSubview(titleLabel("PAGES"))
@@ -106,8 +108,8 @@ final class PagesRailView: UIView {
         add.setImage(UIImage(systemName: "plus"), for: .normal)
         add.tintColor = .systemBlue
         add.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
-        add.layer.cornerRadius = 7
-        add.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        add.layer.cornerRadius = 6
+        add.heightAnchor.constraint(equalToConstant: 28).isActive = true
         add.accessibilityLabel = "Add page"
         add.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
         stack.addArrangedSubview(add)
@@ -132,21 +134,21 @@ private final class PageCardButton: UIButton {
         self.canMoveDown = canMoveDown
         super.init(frame: .zero)
         var config = UIButton.Configuration.plain()
-        config.title = "\(Int(info.index) + 1)\n\(info.name)"
+        var titleAttr = AttributedString("\(Int(info.index) + 1)\n\(info.name)")
+        titleAttr.font = .systemFont(ofSize: 9.5, weight: info.selected ? .semibold : .regular)
+        config.attributedTitle = titleAttr
         config.titleAlignment = .center
         config.image = thumbnail
         config.imagePlacement = .top
-        config.imagePadding = 3
+        config.imagePadding = 2
         config.baseForegroundColor = UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1)
-        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 3, bottom: 8, trailing: 3)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 2, bottom: 4, trailing: 2)
         self.configuration = config
-        titleLabel?.font = .systemFont(ofSize: 13, weight: info.selected ? .semibold : .regular)
-        titleLabel?.numberOfLines = 2
         backgroundColor = info.selected ? UIColor.systemBlue.withAlphaComponent(0.12) : UIColor.white.withAlphaComponent(0.9)
-        layer.cornerRadius = 7
-        layer.borderWidth = info.selected ? 2 : 1
+        layer.cornerRadius = 6
+        layer.borderWidth = info.selected ? 1.5 : 1
         layer.borderColor = (info.selected ? UIColor.systemBlue.withAlphaComponent(0.75) : UIColor.black.withAlphaComponent(0.08)).cgColor
-        heightAnchor.constraint(greaterThanOrEqualToConstant: 64).isActive = true
+        heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
         accessibilityLabel = "Page \(Int(info.index) + 1), \(info.name)"
         accessibilityValue = info.selected ? "Selected" : "Not selected"
         accessibilityTraits = info.selected ? [.button, .selected] : [.button]

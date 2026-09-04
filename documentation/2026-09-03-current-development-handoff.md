@@ -6,20 +6,22 @@ This is the exact resume point as of 2026-09-03 in Toronto.
 
 - Local checkout: `D:\Vibe Code\Drafting Table Fork`
 - Branch: `ipad-native-port`
-- HEAD: `8e28ee1` — `v0.9.7: gap-closing bucket fill, paper space maximization, Pencil Pro radial wheel`
-- Tracking: `origin/ipad-native-port` is up to date with HEAD
-- Fork: <https://github.com/Code-Andy/drafting_table>
-- Upstream: <https://github.com/bgkatz/drafting_table>
-- Upstream push URL: disabled as `no_push`
-- Project version in `project.yml`: `0.9.7` build `16`
-- Latest released versions: `v0.7.2`, `v0.8.0`, `v0.9.0`, `v0.9.1`, `v0.9.2`, `v0.9.6`, `v0.9.7`
+- Project version in `project.yml`: `0.9.8` build `17`
+- Latest released versions: `v0.7.2`, `v0.8.0`, `v0.9.0`, `v0.9.1`, `v0.9.2`, `v0.9.6`, `v0.9.7`, `v0.9.8`
 - Deployment target: iOS 17.5
 
 ## What HEAD contains
 
-HEAD brings the iPad port to the **v0.9.7** feature baseline:
+HEAD brings the iPad port to the **v0.9.8** feature baseline:
 
-1. **v0.9.7 Gap-Closing Bucket Fill & Paper Space Maximization**:
+1. **v0.9.8 Compact Page Rail, Dynamic Subtools, Popover Color Tool & Built-in App Menu Window**:
+   - Compact page previews (52x34) and typography (9.5pt titles, 44pt card min height, 72pt rail width).
+   - Dedicated on-canvas `brushSubToolBar` (size 1–40pt, opacity 5–100%, hardness 0–100%).
+   - Dynamic top-left subtool menu anchoring: automatically shifts to the right of `pagesRail` when opened (`pagesRail.trailingAnchor + 12`) or `toolRail` when closed.
+   - Popover color selector: tapping the color swatch opens the HSV color picker directly as an iPad popover anchored to the swatch button.
+   - Built-in in-app menu window (`AppMenuWindowView`): replaces system action sheets with a compact 270x345pt non-scrolling paper window featuring an integrated Export & Share subview.
+
+2. **v0.9.7 Gap-Closing Bucket Fill & Paper Space Maximization**:
    - Offscreen morphological obstacle dilation ($\lceil \text{gapSize} / 2 \rceil$) and BFS flood fill to bridge gaps between drawn strokes.
    - Under-stroke bleed dilation to eliminate white halos.
    - Moore-neighbor border tracing with RDP simplification and ear-clipping concave polygon triangulation in Metal (`DTMetalRenderer.mm`).
@@ -67,6 +69,7 @@ All 5 test suites pass on Windows MSVC via CMake/CTest:
 - `v0.9.2`: Apple Pencil Pro suite, Shade tool, selection & transform, 15° snap
 - `v0.9.6`: Notebooks gallery, line art symbols, photo import, center toggle
 - `v0.9.7`: Gap-closing bucket fill, paper space maximization, Pencil Pro radial wheel
+- `v0.9.8`: Compact page previews/fonts, dynamic subtools, popover color selector, in-app menu window
 
 All releases and unsigned IPAs: <https://github.com/Code-Andy/drafting_table/releases>
 
