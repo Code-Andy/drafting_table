@@ -52,6 +52,7 @@ xcrun simctl spawn "$device_udid" log stream \
   --predicate 'process == "DraftingTable" OR eventMessage CONTAINS[c] "com.local.draftingtable.ipad"' \
   >"$runtime_log" 2>&1 &
 log_stream_pid=$!
+SIMCTL_CHILD_DRAFTING_TABLE_RENDERER_SELF_TEST=1 \
 xcrun simctl launch --terminate-running-process "$device_udid" \
   com.local.draftingtable.ipad --renderer-self-test >/dev/null
 sleep 8
@@ -117,6 +118,13 @@ for _ in $(seq 1 40); do
 done
 test -s "$package/CURRENT" || {
   echo "Renderer self-test did not publish a package manifest" >&2
+  self_test_log="$container/Library/Caches/DraftingTable-renderer-self-test.txt"
+  if [[ -f "$self_test_log" ]]; then
+    echo "--- renderer self-test stages ---" >&2
+    cat "$self_test_log" >&2
+  else
+    echo "--- renderer self-test stage file missing ---" >&2
+  fi
   tail -n 400 "$runtime_log" >&2 || true
   exit 1
 }

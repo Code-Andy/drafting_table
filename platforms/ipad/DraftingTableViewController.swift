@@ -59,6 +59,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     /// legacy flat archive facade is intentionally not used by the v0.1 UI.
     private let documentCoordinator = PreviewDocumentCoordinator()
     private var isRestoringDocument = false
+    private var rendererSelfTestSubmitted = false
 
     // Top chrome & Sub-tool UI
     private var mainMenuButton: UIButton!
@@ -238,8 +239,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             // buffer has completed.  It is the UI refresh boundary for undo,
             // layer state and the empty-canvas hint.
             self?.documentDidChange()
+            self?.appendRendererSelfTestStage("committed")
         }
         documentCoordinator.onError = { [weak self] message in
+            self?.appendRendererSelfTestStage("error: \(message)")
             self?.showToast("Drafting Table: \(message)")
         }
         documentCoordinator.bind(engineBridge: canvas.engineBridge) { [weak canvas] in
@@ -292,6 +295,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         // On-demand renderer needs one explicit kick once layout has a real size.
         canvas.setNeedsDisplay()
         updateLaunchBreadcrumb(stage: "appeared")
+        guard Self.rendererSelfTestRequested else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.runRendererSelfTestIfRequested()
+        }
     }
 
     /// Called by the scene delegate before suspension as a final autosave.
@@ -349,9 +356,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
                 self.updateUndoRedoState()
                 self.canvas.setNeedsDisplay()
                 self.fitPaperIfNeeded()
-                self.runRendererSelfTestIfRequested()
+                self.appendRendererSelfTestStage("restore succeeded")
                 self.updateLaunchBreadcrumb(stage: "restoredPackage")
             } catch {
+                self.appendRendererSelfTestStage("restore failed: \(error.localizedDescription)")
                 self.showToast("Could not recover Drafting Table package")
                 self.updateLaunchBreadcrumb(stage: "restoreFailed")
             }
@@ -373,7 +381,9 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     /// argument. The smoke script verifies the persisted tile has nonzero
     /// alpha, catching compile-clean input/renderer/checkpoint disconnects.
     private func runRendererSelfTestIfRequested() {
-        guard ProcessInfo.processInfo.arguments.contains("--renderer-self-test") else { return }
+        guard Self.rendererSelfTestRequested, !rendererSelfTestSubmitted else { return }
+        rendererSelfTestSubmitted = true
+        appendRendererSelfTestStage("submitted")
         let center = CGPoint(x: canvas.paperSize.width * 0.45,
                              y: canvas.paperSize.height * 0.45)
         var samples: [DTPencilSample] = []
@@ -395,6 +405,27 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         }
         canvas.engineBridge.endStroke()
         NSLog("DraftingTable renderer self-test submitted %lu samples", samples.count)
+    }
+
+    private static var rendererSelfTestRequested: Bool {
+        ProcessInfo.processInfo.arguments.contains("--renderer-self-test") ||
+            ProcessInfo.processInfo.environment["DRAFTING_TABLE_RENDERER_SELF_TEST"] == "1"
+    }
+
+    private func appendRendererSelfTestStage(_ stage: String) {
+        guard Self.rendererSelfTestRequested else { return }
+        let base = FileManager.default.urls(for: .cachesDirectory,
+                                            in: .userDomainMask).first
+        guard let url = base?.appendingPathComponent(
+            "DraftingTable-renderer-self-test.txt", isDirectory: false) else { return }
+        let line = "\(Date().timeIntervalSince1970) \(stage)\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(line.utf8))
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 
     private func applyStoredSettings() {
