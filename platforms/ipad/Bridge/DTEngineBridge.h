@@ -93,13 +93,17 @@ typedef NS_ENUM(uint8_t, DTLayerKind) {
 - (instancetype)init NS_UNAVAILABLE;
 @end
 
-/// Swift-visible immutable checkpoint payload. Pixel data is exactly one
-/// 256x256 premultiplied RGBA8 tile and is created only after Metal completion.
+/// Swift-visible immutable checkpoint payload. Materialized pixel data is
+/// exactly one 256x256 premultiplied RGBA8 tile and is created only after
+/// Metal completion; an undo removal is represented by an empty tombstone.
 @interface DTTileCheckpointPayload : NSObject
 @property(nonatomic, readonly) uint64_t pageID;
 @property(nonatomic, readonly) uint64_t layerID;
 @property(nonatomic, readonly) int32_t tileX;
 @property(nonatomic, readonly) int32_t tileY;
+/// NO is an undo tombstone: versionID is zero and pixel data is empty. The
+/// package writer removes that tile reference when publishing its manifest.
+@property(nonatomic, readonly) BOOL exists;
 @property(nonatomic, readonly) uint64_t versionID;
 @property(nonatomic, readonly) uint64_t generation;
 @property(nonatomic, readonly, copy) NSData *premultipliedRGBA8;
@@ -107,9 +111,17 @@ typedef NS_ENUM(uint8_t, DTLayerKind) {
                         layerID:(uint64_t)layerID
                           tileX:(int32_t)tileX
                           tileY:(int32_t)tileY
+                         exists:(BOOL)exists
                       versionID:(uint64_t)versionID
                      generation:(uint64_t)generation
             premultipliedRGBA8:(NSData *)premultipliedRGBA8 NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithPageID:(uint64_t)pageID
+                        layerID:(uint64_t)layerID
+                          tileX:(int32_t)tileX
+                          tileY:(int32_t)tileY
+                      versionID:(uint64_t)versionID
+                     generation:(uint64_t)generation
+            premultipliedRGBA8:(NSData *)premultipliedRGBA8;
 - (instancetype)init NS_UNAVAILABLE;
 @end
 

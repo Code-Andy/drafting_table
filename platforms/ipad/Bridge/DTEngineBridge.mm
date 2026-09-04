@@ -119,13 +119,16 @@ using drafting_table::ipad::Stroke;
 @end
 
 @implementation DTTileCheckpointPayload
-- (instancetype)initWithPageID:(uint64_t)pageID layerID:(uint64_t)layerID tileX:(int32_t)tileX tileY:(int32_t)tileY versionID:(uint64_t)versionID generation:(uint64_t)generation premultipliedRGBA8:(NSData *)premultipliedRGBA8 {
+- (instancetype)initWithPageID:(uint64_t)pageID layerID:(uint64_t)layerID tileX:(int32_t)tileX tileY:(int32_t)tileY exists:(BOOL)exists versionID:(uint64_t)versionID generation:(uint64_t)generation premultipliedRGBA8:(NSData *)premultipliedRGBA8 {
     if ((self = [super init])) {
         _pageID = pageID; _layerID = layerID; _tileX = tileX; _tileY = tileY;
-        _versionID = versionID; _generation = generation;
+        _exists = exists; _versionID = versionID; _generation = generation;
         _premultipliedRGBA8 = [premultipliedRGBA8 copy];
     }
     return self;
+}
+- (instancetype)initWithPageID:(uint64_t)pageID layerID:(uint64_t)layerID tileX:(int32_t)tileX tileY:(int32_t)tileY versionID:(uint64_t)versionID generation:(uint64_t)generation premultipliedRGBA8:(NSData *)premultipliedRGBA8 {
+    return [self initWithPageID:pageID layerID:layerID tileX:tileX tileY:tileY exists:YES versionID:versionID generation:generation premultipliedRGBA8:premultipliedRGBA8];
 }
 @end
 
@@ -455,7 +458,7 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
 - (BOOL)acknowledgePersistedOperationID:(uint64_t)operationID generation:(uint64_t)generation tiles:(NSArray<DTPersistedTileAcknowledgement *> *)tiles {
     __block BOOL accepted=NO;
     [self dt_syncDocument:^{
-        if(!operationID||!generation||tiles.count==0)return;
+        if(!operationID||!generation)return;
         std::vector<drafting_table::PersistedTileBinding> bindings;bindings.reserve(tiles.count);
         for(DTPersistedTileAcknowledgement*item in tiles){if(!item.pageID||!item.layerID||!item.versionID||!item.payloadID.length)return;drafting_table::PersistedTileBinding b;b.pageID=PageID{item.pageID};b.layerID=LayerID{item.layerID};b.address={item.tileX,item.tileY};b.versionID=item.versionID;b.payloadID=std::string(item.payloadID.UTF8String?:"");bindings.push_back(std::move(b));}
         const std::span<const drafting_table::PersistedTileBinding> bindingSpan(bindings.data(),bindings.size());
@@ -472,7 +475,7 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
         if(!pageID||!generation||generation==UINT64_MAX||layers.count!=2||!std::isfinite((double)width)||!std::isfinite((double)height)||width<1||height<1)validation=@"A package page requires valid dimensions, generation, and exactly two raster layers";
         if(self->_transactions->hasInFlightOperation()||self->_strokeQueue.count)validation=@"Cannot load a package while a renderer transaction is active";
         if(layers.count==2&&(layers[0].layerID==0||layers[1].layerID==0||layers[0].layerID==layers[1].layerID))validation=@"Persisted layer IDs must be nonzero and distinct";
-        for(DTTileCheckpointPayload*t in tiles){if(t.pageID!=pageID||!t.layerID||!t.versionID||!t.generation||t.generation>generation||t.premultipliedRGBA8.length!=drafting_table::kRasterTileBytes){validation=@"Persisted tile metadata or RGBA8 byte length is invalid";break;}if(t.layerID!=layers[0].layerID&&t.layerID!=layers[1].layerID){validation=@"Persisted tile references an unknown v0.1 layer";break;}}
+        for(DTTileCheckpointPayload*t in tiles){if(!t.exists||t.pageID!=pageID||!t.layerID||!t.versionID||!t.generation||t.generation>generation||t.premultipliedRGBA8.length!=drafting_table::kRasterTileBytes){validation=@"Persisted tile metadata or RGBA8 byte length is invalid";break;}if(t.layerID!=layers[0].layerID&&t.layerID!=layers[1].layerID){validation=@"Persisted tile references an unknown v0.1 layer";break;}}
         if(validation||!self->_renderSink){NSString*message=validation?:@"Metal renderer is not installed";if(done)dispatch_async(dispatch_get_main_queue(),^{done(NO,message);});return;}
         NSMutableArray*renderLayers=[NSMutableArray arrayWithCapacity:2];for(DTPersistedLayerDescriptor*l in layers)[renderLayers addObject:[[DTLayerRenderDescriptor alloc] initWithLayerID:l.layerID name:l.name visible:l.visible opacity:std::clamp((float)l.opacity,0.f,1.f)]];
         DTRenderMetadataDescriptor*metadata=[[DTRenderMetadataDescriptor alloc] initWithPageID:pageID generation:generation activeLayerID:layers[1].layerID pageWidth:(float)width pageHeight:(float)height layers:renderLayers];
