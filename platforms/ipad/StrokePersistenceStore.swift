@@ -1,45 +1,76 @@
 import Foundation
 
-/// Small, recoverable document store for the development iPad shell.
+/// App-facing façade for the package actor.
 ///
-/// Writes go to a sibling temporary file and are then atomically replaced so
-/// an interrupted suspend or power loss cannot leave a partially written
-/// archive behind. The store deliberately owns no engine state.
+/// The old controller used synchronous `save(Data)`/`load()` calls for a flat
+/// DTAR archive. Those entry points remain only as a source-compatible guard:
+/// they deliberately do not read or write a live DTAR fallback. New code must
+/// submit a value-type `DTPackageCommit` to `packageStore`.
 final class StrokePersistenceStore {
-    private let fileURL: URL
-    private let fileManager: FileManager
+    let packageStore: DTPackageStore
 
-    init(fileManager: FileManager = .default) {
-        self.fileManager = fileManager
-        let base = fileManager.urls(for: .applicationSupportDirectory,
-                                    in: .userDomainMask).first
-            ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let directory = base.appendingPathComponent("DraftingTable", isDirectory: true)
-        try? fileManager.createDirectory(at: directory,
-                                         withIntermediateDirectories: true)
-        fileURL = directory.appendingPathComponent("document.archive", isDirectory: false)
+    init(packageURL: URL? = nil, fileManager: FileManager = .default) {
+        packageStore = DTPackageStore(packageURL: packageURL, fileManager: fileManager)
     }
 
-    func load() -> Data? {
-        try? Data(contentsOf: fileURL)
+    /// Loads the newest complete package manifest. This is the integration API
+    /// for the document coordinator and is intentionally asynchronous because
+    /// it may coordinate Files/iCloud access and validate tile checksums.
+    func loadPackage() async throws -> DTPackageSnapshot? {
+        try await packageStore.load()
     }
 
+    /// Commits immutable tile generations and metadata using the actor's
+    /// tile -> manifest -> CURRENT protocol.
+    @discardableResult
+    func commit(_ transaction: DTPackageCommit) async throws -> DTPackageSnapshot {
+        try await packageStore.commit(transaction)
+    }
+
+    @discardableResult
+    func commit(document: DTPackageDocumentDescriptor,
+                documentGeneration: UInt64 = 1,
+                tiles: [DTTilePayload] = [],
+                removedTiles: Set<DTTileAddress> = [],
+                expectedManifestGeneration: UInt64? = nil) async throws -> DTPackageSnapshot {
+        try await packageStore.commit(document: document,
+                                       documentGeneration: documentGeneration,
+                                       tiles: tiles,
+                                       removedTiles: removedTiles,
+                                       expectedManifestGeneration: expectedManifestGeneration)
+    }
+
+    func loadTile(_ key: DTTileKey) async throws -> DTTilePayload {
+        try await packageStore.loadTile(key)
+    }
+
+    /// Explicit one-way DTAR import helper. The returned bytes must be decoded
+    /// and translated into a package commit by the caller; this method never
+    /// writes those bytes to the package store.
+    static func loadLegacyDTAR(from url: URL,
+                               fileManager: FileManager = .default) throws -> Data {
+        try DTPackageStore.loadLegacyDTAR(from: url, fileManager: fileManager)
+    }
+
+    // MARK: Deprecated flat-archive compatibility
+
+    /// Source-compatible shim for the pre-package controller. Keeping this
+    /// method throwing prevents accidental dual writes while the controller is
+    /// migrated to `commit(_:)`.
+    @available(*, deprecated, message: "Use async commit(_:) on packageStore; flat DTAR writes are disabled")
     func save(_ data: Data) throws {
-        let temporaryURL = fileURL.appendingPathExtension("tmp")
-        try data.write(to: temporaryURL, options: [.atomic])
-        if fileManager.fileExists(atPath: fileURL.path) {
-            _ = try fileManager.replaceItemAt(fileURL, withItemAt: temporaryURL,
-                                              backupItemName: nil,
-                                              options: [.usingNewMetadataOnly])
-        } else {
-            try fileManager.moveItem(at: temporaryURL, to: fileURL)
-        }
+        _ = data
+        throw DTPackageStoreError.legacyDTARWriteDisabled
     }
 
-    func quarantineCorruptArchive() {
-        guard fileManager.fileExists(atPath: fileURL.path) else { return }
-        let quarantine = fileURL.deletingPathExtension()
-            .appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970)).archive")
-        try? fileManager.moveItem(at: fileURL, to: quarantine)
-    }
+    /// Source-compatible shim for the pre-package controller. It returns nil
+    /// rather than treating a flat DTAR as a live fallback. Use `loadPackage()`.
+    @available(*, deprecated, message: "Use async loadPackage(); flat DTAR reads require explicit import")
+    func load() -> Data? { nil }
+
+    /// Retained only so old recovery call sites compile. Package recovery is
+    /// non-destructive and ignores unreferenced partial files; there is no flat
+    /// archive to quarantine here.
+    @available(*, deprecated, message: "Package recovery supersedes flat archive quarantine")
+    func quarantineCorruptArchive() {}
 }
