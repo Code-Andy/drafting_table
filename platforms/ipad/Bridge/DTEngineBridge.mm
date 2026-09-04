@@ -269,6 +269,7 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
 - (void)dt_finishMetadataOnlyRestoreLocked:(const RestorePlan&)plan;
 - (BOOL)dt_mutateLayerAtIndex:(NSUInteger)index mutate:(DTLayerMetadataMutation)mutation;
 - (void)dt_notifyCommitLocked:(uint64_t)generation;
+- (void)dt_notifyEmptyCheckpointLocked:(uint64_t)operationID generation:(uint64_t)generation;
 - (void)dt_reportErrorLocked:(NSString *)message;
 @end
 
@@ -437,11 +438,11 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
         self->_activeRestore.reset();auto queued=self->_transactions->processQueuedUndo();if(queued.status==UndoStatus::Applied&&queued.plan)[self dt_submitRestorePlanLocked:*queued.plan];else[self dt_drainStrokeQueueLocked];});
 }
 - (void)dt_finishMetadataOnlyRestoreLocked:(const RestorePlan&)plan {
-    if(!_transactions->completeRestore(plan,true)){[self dt_reportErrorLocked:@"Core rejected metadata undo/redo"];_activeRestore.reset();return;}for(const auto&swap:plan.metadataSwaps)if(Page*p=_document->pageByID(swap.pageID))if(Layer*l=p->layerByID(swap.layerID))l->applyMetadata(swap.after);_document->setGeneration(plan.token.generation);if(plan.direction==UndoDirection::Undo){if(_historyCursor)--_historyCursor;}else _historyCursor=std::min(_historyCursor+1,_historyOrder.size());[self dt_publishMetadataLocked];[self dt_notifyCommitLocked:plan.token.generation];_activeRestore.reset();[self dt_drainStrokeQueueLocked];
+    if(!_transactions->completeRestore(plan,true)){[self dt_reportErrorLocked:@"Core rejected metadata undo/redo"];_activeRestore.reset();return;}for(const auto&swap:plan.metadataSwaps)if(Page*p=_document->pageByID(swap.pageID))if(Layer*l=p->layerByID(swap.layerID))l->applyMetadata(swap.after);_document->setGeneration(plan.token.generation);if(plan.direction==UndoDirection::Undo){if(_historyCursor)--_historyCursor;}else _historyCursor=std::min(_historyCursor+1,_historyOrder.size());[self dt_publishMetadataLocked];[self dt_notifyCommitLocked:plan.token.generation];[self dt_notifyEmptyCheckpointLocked:plan.token.operationID generation:plan.token.generation];_activeRestore.reset();[self dt_drainStrokeQueueLocked];
 }
 
 - (BOOL)dt_mutateLayerAtIndex:(NSUInteger)index mutate:(DTLayerMetadataMutation)mutation {
-    __block BOOL result=NO;[self dt_syncDocument:^{if(!mutation||!self->_transactions->idle())return;Page*p=self->_document->activePage();Layer*l=p?p->layer(index):nullptr;if(!p||!l)return;LayerMetadata before=l->metadata(),after=before;mutation(&after);after.opacity=std::clamp(after.opacity,0.f,1.f);if(after==before){result=YES;return;}auto token=self->_transactions->reserveLayerMetadataOperation();if(!token)return;LayerMetadataSwap swap{p->id(),l->id(),before,after};if(!self->_transactions->commitLayerMetadataOperation(*token,std::span<const LayerMetadataSwap>(&swap,1))||!l->applyMetadata(after)){if(self->_transactions->inFlight())self->_transactions->abort(*token);return;}self->_document->setGeneration(token->generation);if(self->_historyCursor<self->_historyOrder.size())self->_historyOrder.resize(self->_historyCursor);self->_historyOrder.push_back(token->operationID);self->_historyCursor=self->_historyOrder.size();[self dt_publishMetadataLocked];[self dt_notifyCommitLocked:token->generation];result=YES;}];return result;
+    __block BOOL result=NO;[self dt_syncDocument:^{if(!mutation||!self->_transactions->idle())return;Page*p=self->_document->activePage();Layer*l=p?p->layer(index):nullptr;if(!p||!l)return;LayerMetadata before=l->metadata(),after=before;mutation(&after);after.opacity=std::clamp(after.opacity,0.f,1.f);if(after==before){result=YES;return;}auto token=self->_transactions->reserveLayerMetadataOperation();if(!token)return;LayerMetadataSwap swap{p->id(),l->id(),before,after};if(!self->_transactions->commitLayerMetadataOperation(*token,std::span<const LayerMetadataSwap>(&swap,1))||!l->applyMetadata(after)){if(self->_transactions->inFlight())self->_transactions->abort(*token);return;}self->_document->setGeneration(token->generation);if(self->_historyCursor<self->_historyOrder.size())self->_historyOrder.resize(self->_historyCursor);self->_historyOrder.push_back(token->operationID);self->_historyCursor=self->_historyOrder.size();[self dt_publishMetadataLocked];[self dt_notifyCommitLocked:token->generation];[self dt_notifyEmptyCheckpointLocked:token->operationID generation:token->generation];result=YES;}];return result;
 }
 
 - (BOOL)setActivePageIndex:(NSUInteger)i{return i==0;}- (BOOL)selectPageAtIndex:(NSUInteger)i{return [self setActivePageIndex:i];}
@@ -504,5 +505,6 @@ typedef void (^DTLayerMetadataMutation)(LayerMetadata *metadata);
 - (NSArray<DTRenderStroke*>*)renderableStrokes{return @[];}- (NSArray<DTRenderStroke*>*)renderableStrokesForPageAtIndex:(NSUInteger)i{(void)i;return @[];}
 
 - (void)dt_notifyCommitLocked:(uint64_t)generation{void(^h)(uint64_t)=self.documentCommitHandler;if(h)dispatch_async(dispatch_get_main_queue(),^{h(generation);});}
+- (void)dt_notifyEmptyCheckpointLocked:(uint64_t)operationID generation:(uint64_t)generation{void(^h)(DTCheckpointPayloadBatch*)=self.checkpointPayloadHandler;if(!h)return;DTCheckpointPayloadBatch*batch=[[DTCheckpointPayloadBatch alloc] initWithOperationID:operationID generation:generation tiles:@[]];self->_lastCheckpointBatch=batch;dispatch_async(dispatch_get_main_queue(),^{h(batch);});}
 - (void)dt_reportErrorLocked:(NSString*)message{if(!message.length)return;void(^h)(NSString*)=self.rendererErrorHandler;if(h){NSString*owned=[message copy];dispatch_async(dispatch_get_main_queue(),^{h(owned);});}else NSLog(@"DraftingTable renderer: %@",message);}
 @end

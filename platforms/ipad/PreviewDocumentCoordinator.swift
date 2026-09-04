@@ -31,9 +31,8 @@ final class PreviewDocumentCoordinator {
     private var securityScopedURL: URL?
     private var packageEpoch = UUID()
     private var saveTail: Task<Void, Never>?
+    private var documentID = UUID()
     private var documentDescriptors: [UInt64: DTPackageDocumentDescriptor] = [:]
-    private var pendingCheckpointGenerations = Set<UInt64>()
-    private var metadataFallbackTasks: [UInt64: Task<Void, Never>] = [:]
 
     init(packageURL: URL = DTPackageStore.defaultPackageURL()) {
         self.packageURL = packageURL
@@ -73,29 +72,7 @@ final class PreviewDocumentCoordinator {
         guard generation > 0 else { return }
         documentDescriptors[generation] = makeDocumentDescriptor(engineBridge: engineBridge,
                                                                  pageSize: pageSize)
-        pendingCheckpointGenerations.insert(generation)
         onCommit?(generation)
-
-        // Metadata-only transactions (opacity, visibility, undo of an empty
-        // tile) do not necessarily produce a payload batch.  Give the paired
-        // checkpoint callback a chance to arrive, then publish metadata alone
-        // if no payload was delivered for this generation.
-        metadataFallbackTasks[generation]?.cancel()
-        metadataFallbackTasks[generation] = Task { @MainActor [weak self, weak engineBridge] in
-            do {
-                try await Task.sleep(nanoseconds: 250_000_000)
-            } catch {
-                return
-            }
-            guard let self,
-                  let engineBridge,
-                  self.pendingCheckpointGenerations.remove(generation) != nil else { return }
-            self.metadataFallbackTasks[generation] = nil
-            self.enqueueMetadataCommit(generation: generation,
-                                       descriptor: self.documentDescriptors[generation],
-                                       engineBridge: engineBridge,
-                                       epoch: self.packageEpoch)
-        }
     }
 
     private func enqueueCheckpoint(_ batch: DTCheckpointPayloadBatch,
@@ -106,10 +83,6 @@ final class PreviewDocumentCoordinator {
             reportError("Renderer returned an invalid checkpoint generation.")
             return
         }
-        pendingCheckpointGenerations.remove(generation)
-        metadataFallbackTasks[generation]?.cancel()
-        metadataFallbackTasks[generation] = nil
-
         if documentDescriptors[generation] == nil {
             documentDescriptors[generation] = makeDocumentDescriptor(engineBridge: engineBridge,
                                                                      pageSize: pageSize)
@@ -125,31 +98,6 @@ final class PreviewDocumentCoordinator {
                                                  descriptor: descriptor,
                                                  engineBridge: engineBridge,
                                                  epoch: epoch)
-            } catch {
-                self.reportError(error.localizedDescription)
-            }
-        }
-    }
-
-    private func enqueueMetadataCommit(generation: UInt64,
-                                       descriptor: DTPackageDocumentDescriptor?,
-                                       engineBridge: DTEngineBridge,
-                                       epoch: UUID) {
-        let previous = saveTail
-        saveTail = Task { @MainActor [weak self, weak engineBridge] in
-            _ = await previous?.value
-            guard let self, let engineBridge,
-                  self.packageEpoch == epoch else { return }
-            do {
-                let document = descriptor ?? self.makeDocumentDescriptor(engineBridge: engineBridge,
-                                                                          pageSize: .zero)
-                let snapshot = try await self.packageStore.commit(
-                    document: document,
-                    documentGeneration: generation,
-                    tiles: [],
-                    removedTiles: [],
-                    expectedManifestGeneration: self.latestSnapshot?.manifestGeneration)
-                self.latestSnapshot = snapshot
             } catch {
                 self.reportError(error.localizedDescription)
             }
@@ -231,6 +179,7 @@ final class PreviewDocumentCoordinator {
                                                             tiles: acknowledgements) else {
             throw DTPackageStoreError.invalidManifest
         }
+        documentDescriptors.removeValue(forKey: batch.generation)
     }
 
     // MARK: Package recovery and switching
@@ -279,11 +228,9 @@ final class PreviewDocumentCoordinator {
             packageURL = standardized
             packageStore = candidate
             latestSnapshot = snapshot
+            documentID = snapshot?.document.documentID ?? UUID()
             packageEpoch = UUID()
             documentDescriptors.removeAll(keepingCapacity: true)
-            pendingCheckpointGenerations.removeAll(keepingCapacity: true)
-            metadataFallbackTasks.values.forEach { $0.cancel() }
-            metadataFallbackTasks.removeAll(keepingCapacity: true)
             return load
         } catch {
             if accessed { standardized.stopAccessingSecurityScopedResource() }
@@ -385,7 +332,8 @@ final class PreviewDocumentCoordinator {
                                            width: max(1, Int(pageSize.width.rounded())),
                                            height: max(1, Int(pageSize.height.rounded())),
                                            layers: Array(layers))
-        return DTPackageDocumentDescriptor(title: pageInfo?.name ?? "Drafting Table",
+        return DTPackageDocumentDescriptor(documentID: documentID,
+                                            title: pageInfo?.name ?? "Drafting Table",
                                             pages: [page])
     }
 

@@ -2,7 +2,7 @@ import UniformTypeIdentifiers
 
 extension UTType {
     static let draftingTableDocument = UTType(exportedAs: "com.local.draftingtable.document",
-                                               conformingTo: .data)
+                                               conformingTo: .package)
 }
 
 /// Package-backed document façade for the document coordinator.
