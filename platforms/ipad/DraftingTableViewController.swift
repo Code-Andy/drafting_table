@@ -605,12 +605,10 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             guard (0..<2).contains(index) else { return }
             _ = self.canvas.engineBridge.setLayerVisible(visible, at: UInt(index))
         }
-        layersRail.onOpacity = { [weak self] opacity, index in
-            guard let self else { return }
-            guard (0..<2).contains(index) else { return }
-            _ = self.canvas.engineBridge.setLayerOpacity(opacity, at: UInt(index))
-            self.canvas.setNeedsDisplay()
-        }
+        // The slider updates its own percentage label while dragging. Commit
+        // one document/history operation at gesture end instead of generating
+        // an undo entry and package manifest for every valueChanged event.
+        layersRail.onOpacity = nil
         layersRail.onOpacityCommit = { [weak self] opacity, index in
             guard let self else { return }
             guard (0..<2).contains(index) else { return }

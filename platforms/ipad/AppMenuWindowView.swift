@@ -18,7 +18,7 @@ final class AppMenuWindowView: UIView {
     var onAction: ((Action) -> Void)?
 
     private let windowWidth: CGFloat = 270.0
-    private let windowHeight: CGFloat = 345.0
+    private let windowHeight: CGFloat = 220.0
 
     private let mainContainer = UIView()
     private let exportContainer = UIView()
@@ -143,15 +143,9 @@ final class AppMenuWindowView: UIView {
             stack.bottomAnchor.constraint(equalTo: mainContainer.bottomAnchor)
         ])
 
-        stack.addArrangedSubview(menuRow(title: "Notebooks Gallery", icon: "books.vertical.fill", action: .notebooksGallery))
-        stack.addArrangedSubview(menuRow(title: "Rename Document", icon: "pencil", action: .renameDocument))
-        stack.addArrangedSubview(menuRow(title: "Export & Share...", icon: "square.and.arrow.up", customAction: { [weak self] in
-            self?.showExportMode()
-        }))
-        stack.addArrangedSubview(menuRow(title: "Import Photo...", icon: "photo.on.rectangle", action: .importPhoto))
+        stack.addArrangedSubview(menuRow(title: "Open Drafting Table Package...", icon: "folder", action: .notebooksGallery))
         stack.addArrangedSubview(menuRow(title: "Drawing Settings...", icon: "gearshape.fill", action: .settings))
         stack.addArrangedSubview(menuRow(title: "Reset Canvas View", icon: "arrow.down.right.and.arrow.up.left", action: .resetView))
-        stack.addArrangedSubview(menuRow(title: "Clear Document", icon: "trash.fill", isDestructive: true, action: .clearDocument))
     }
 
     private func setupExportActions() {
