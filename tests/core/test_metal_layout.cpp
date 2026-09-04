@@ -19,6 +19,7 @@ int failures = 0;
 
 void testPortableVersionState() {
     using namespace drafting_table::metal;
+    using drafting_table::TileAddress;
     TileVersionLedger ledger;
     const std::vector<TileAddress> touched{{0, 0}, {1, 0}};
 
@@ -65,6 +66,7 @@ void testPortableVersionState() {
 
 void testBlendAndCheckpointAbi() {
     using namespace drafting_table::metal;
+    using drafting_table::TileAddress;
     CHECK(static_cast<std::uint8_t>(DabBlendMode::SourceOver) == 0);
     CHECK(static_cast<std::uint8_t>(DabBlendMode::DestinationOut) == 1);
     CHECK(DabBlendMode::sourceOver == DabBlendMode::SourceOver);
