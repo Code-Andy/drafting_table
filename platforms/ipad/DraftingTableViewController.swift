@@ -13,6 +13,7 @@ private final class InsetLabel: UILabel {
 /// The iPad shell around the platform-neutral drawing engine. Pages and layers
 /// are retained by the bridge and exposed through the dynamic side rails.
 final class DraftingTableViewController: UIViewController, UIDocumentPickerDelegate {
+    override var prefersHomeIndicatorAutoHidden: Bool { true }
     private static let selectedToolDefaultsKey = "draftingTable.selectedTool"
     private static let gridDefaultsKey = DrawingSettingsViewController.gridKey
     private static let snapDefaultsKey = "draftingTable.snapEnabled"
@@ -1341,7 +1342,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             guard let self else { return }
             switch action {
             case .notebooksGallery:
-                self.showToast("Notebook gallery is deferred in the v0.1 preview")
+                self.openDocument()
             case .renameDocument:
                 self.promptRenameDocument()
             case .exportPNG:
@@ -1382,7 +1383,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let scroll = UIScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.showsVerticalScrollIndicator = false
-        scroll.alwaysBounceVertical = true
+        scroll.alwaysBounceVertical = false
+        scroll.isScrollEnabled = false
         let stack = UIStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
@@ -1415,7 +1417,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         stack.addArrangedSubview(originalRailRule())
         layersToggleButton = originalRailButton("layers", "square.3.layers.3d", "Layers", #selector(toggleLayersRail))
         pagesToggleButton = originalRailButton("pages", "doc.on.doc", "Pages", #selector(togglePagesRail))
-        colorToggleButton = originalRailButton("color", "circle.lefthalf.filled", "Color", #selector(toggleLayersRail))
+        colorToggleButton = originalRailButton("color", "circle.lefthalf.filled", "Color", #selector(toggleColorSection))
         [layersToggleButton, pagesToggleButton, colorToggleButton].forEach(stack.addArrangedSubview)
         stack.addArrangedSubview(originalRailRule())
         let reset = originalRailButton("reset_view", "arrow.down.right.and.arrow.up.left", "Reset view", #selector(resetCanvasView))
@@ -1573,7 +1575,23 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     @objc private func toggleLayersRail() {
-        setInspectorVisible(layersWidthConstraint.constant == 0)
+        if layersWidthConstraint.constant == 0 {
+            layersRail.showsLayersSection = true
+            setInspectorVisible(true)
+            return
+        }
+        layersRail.showsLayersSection.toggle()
+        updateRailToggleButtons()
+    }
+
+    @objc private func toggleColorSection() {
+        if layersWidthConstraint.constant == 0 {
+            layersRail.showsColorSection = true
+            setInspectorVisible(true)
+            return
+        }
+        layersRail.showsColorSection.toggle()
+        updateRailToggleButtons()
     }
 
     private func setPagesVisible(_ visible: Bool) {
@@ -1596,13 +1614,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             pagesToggleButton.layer.borderColor = (active ? DraftingTheme.hot : UIColor.clear).cgColor
         }
         if let layersToggleButton, let layersRail {
-            let active = !layersRail.isHidden
+            let active = !layersRail.isHidden && layersRail.showsLayersSection
             layersToggleButton.isSelected = active
             layersToggleButton.tintColor = active ? DraftingTheme.hot : DraftingTheme.ink
             layersToggleButton.layer.borderColor = (active ? DraftingTheme.hot : UIColor.clear).cgColor
-            colorToggleButton?.isSelected = active
-            colorToggleButton?.tintColor = active ? DraftingTheme.hot : DraftingTheme.ink
-            colorToggleButton?.layer.borderColor = (active ? DraftingTheme.hot : UIColor.clear).cgColor
+            let colorActive = !layersRail.isHidden && layersRail.showsColorSection
+            colorToggleButton?.isSelected = colorActive
+            colorToggleButton?.tintColor = colorActive ? DraftingTheme.hot : DraftingTheme.ink
+            colorToggleButton?.layer.borderColor = (colorActive ? DraftingTheme.hot : UIColor.clear).cgColor
         }
     }
 
@@ -1679,7 +1698,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .horizontal
         stack.alignment = .center
-        stack.spacing = 16
+        stack.spacing = 18
         content.addSubview(stack)
         NSLayoutConstraint.activate([
             hairline.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor), hairline.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor), hairline.topAnchor.constraint(equalTo: statusBar.topAnchor), hairline.heightAnchor.constraint(equalToConstant: 1),
@@ -1703,6 +1722,11 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         statusPageLabel = statusLabel(text: "page 01 / 01")
         [statusDocLabel, statusToolLabel, statusGridChip, statusPixelChip, statusSnapChip,
          statusAngleChip, statusPreviewChip, statusPredictChip, spacer, statusPageLabel].forEach(stack.addArrangedSubview)
+        for disabled in [statusSnapChip, statusAngleChip] {
+            disabled?.isEnabled = false
+            disabled?.setTitleColor(DraftingTheme.inkDisabled, for: .disabled)
+            disabled?.accessibilityHint = "Not available in this preview"
+        }
         updateStatusBar()
     }
 
@@ -1755,7 +1779,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private func statusLabel(text: String) -> UILabel {
         let label = UILabel()
         label.text = text
-        label.font = DraftingTheme.mono(size: 10, weight: .regular)
+        label.font = DraftingTheme.mono(size: 9, weight: .regular)
         label.textColor = DraftingTheme.inkSoft
         label.numberOfLines = 1
         label.lineBreakMode = .byClipping
@@ -1766,7 +1790,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
 
     private func statusChip(action: Selector) -> UIButton {
         let button = UIButton(type: .system)
-        button.titleLabel?.font = DraftingTheme.mono(size: 10, weight: .regular)
+        button.titleLabel?.font = DraftingTheme.mono(size: 9, weight: .regular)
         button.titleLabel?.numberOfLines = 1
         button.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -1788,8 +1812,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         statusToolLabel.text = "◇ \(canvas.activeToolDisplayName)"
         paintChip(statusGridChip, title: canvas.gridVisible ? "grid: on" : "grid: off", on: canvas.gridVisible)
         paintChip(statusPixelChip, title: canvas.pixelGridVisible ? "px: on" : "px: off", on: canvas.pixelGridVisible)
-        paintChip(statusSnapChip, title: canvas.snapToGrid ? "snap: on" : "snap: off", on: canvas.snapToGrid)
-        paintChip(statusAngleChip, title: canvas.angleSnapEnabled ? "angle: on" : "angle: off", on: canvas.angleSnapEnabled)
+        statusSnapChip.setTitle("snap: off", for: .normal)
+        statusAngleChip.setTitle("angle: off", for: .normal)
         paintChip(statusPreviewChip, title: canvas.brushPreviewEnabled ? "preview: on" : "preview: off", on: canvas.brushPreviewEnabled)
         paintChip(statusPredictChip, title: canvas.predictionEnabled ? "predict: on" : "predict: off", on: canvas.predictionEnabled)
 

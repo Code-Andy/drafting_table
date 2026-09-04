@@ -174,11 +174,20 @@ final class LayersRailView: UIView {
     var brushAlpha: CGFloat = 1 { didSet { syncBrushControls() } }
     var brushHardness: CGFloat = 0.8 { didSet { syncBrushControls() } }
     var brushColorRGBA: UInt32 = 0x2A2620FF { didSet { syncColorControls() } }
+    var showsLayersSection: Bool {
+        get { !layerSection.isHidden }
+        set { layerSection.isHidden = !newValue }
+    }
+    var showsColorSection: Bool {
+        get { !(colorSectionView?.isHidden ?? true) }
+        set { colorSectionView?.isHidden = !newValue }
+    }
 
     private let scroll = UIScrollView(), content = UIStackView(), layerSection = UIStackView()
     private let sizeSlider = UISlider(), alphaSlider = UISlider(), hardnessSlider = UISlider()
     private let sizeValue = UILabel(), alphaValue = UILabel(), hardnessValue = UILabel()
     private let activeSwatch = UIButton(type: .custom), hexLabel = UILabel()
+    private var colorSectionView: UIView!
 
     override init(frame: CGRect) { super.init(frame: frame); configure() }
     required init?(coder: NSCoder) { super.init(coder: coder); configure() }
@@ -195,7 +204,8 @@ final class LayersRailView: UIView {
             edge.trailingAnchor.constraint(equalTo: trailingAnchor), edge.topAnchor.constraint(equalTo: topAnchor), edge.bottomAnchor.constraint(equalTo: bottomAnchor), edge.widthAnchor.constraint(equalToConstant: 1)
         ])
         layerSection.axis = .vertical; layerSection.spacing = 0
-        content.addArrangedSubview(layerSection); content.addArrangedSubview(rule()); content.addArrangedSubview(buildBrushSection()); content.addArrangedSubview(rule()); content.addArrangedSubview(buildColorSection())
+        colorSectionView = buildColorSection()
+        content.addArrangedSubview(layerSection); content.addArrangedSubview(rule()); content.addArrangedSubview(buildBrushSection()); content.addArrangedSubview(rule()); content.addArrangedSubview(colorSectionView)
         rebuildLayerSection()
     }
 
@@ -258,7 +268,12 @@ final class LayersRailView: UIView {
         NSLayoutConstraint.activate([activeSwatch.leadingAnchor.constraint(equalTo: activeRow.leadingAnchor, constant: 10), activeSwatch.centerYAnchor.constraint(equalTo: activeRow.centerYAnchor), activeSwatch.widthAnchor.constraint(equalToConstant: 34), activeSwatch.heightAnchor.constraint(equalToConstant: 28), hexLabel.leadingAnchor.constraint(equalTo: activeSwatch.trailingAnchor, constant: 8), hexLabel.centerYAnchor.constraint(equalTo: activeRow.centerYAnchor), picker.trailingAnchor.constraint(equalTo: activeRow.trailingAnchor, constant: -6), picker.centerYAnchor.constraint(equalTo: activeRow.centerYAnchor)])
         section.addArrangedSubview(activeRow)
         let palette = UIStackView(); palette.axis = .vertical; palette.spacing = 3; palette.isLayoutMarginsRelativeArrangement = true; palette.layoutMargins = UIEdgeInsets(top: 0, left: 10, bottom: 10, right: 10)
-        let colors: [UInt32] = [0x000000FF,0x403B35FF,0x80776BFF,0xC8BFA9FF,0xFFFFFFFF,0xB5482EFF,0xD9782DFF,0xD9B44AFF,0x627C3BFF,0x3B7C68FF,0x3A6F8FFF,0x3A4F6BFF,0x654A7CFF,0x8C4A63FF,0x795548FF,0xD9CFB8FF]
+        let colors: [UInt32] = [
+            0x000000FF,0x6E2218FF,0x8A3F0FFF,0x886C18FF,0x3D5E26FF,0x195049FF,0x1A3D60FF,0x4A2A65FF,
+            0x1A1A1AFF,0xB5482EFF,0xC77A1FFF,0xC8A030FF,0x5A8C3AFF,0x2F7E78FF,0x2A5D8FFF,0x6B3A8AFF,
+            0x6E6457FF,0xC07A60FF,0xD0A270FF,0xCAB870FF,0x95B070FF,0x6FA59EFF,0x6F95C0FF,0xA088B5FF,
+            0xFFFFFFFF,0x7A7368FF,0xA89E8AFF,0xD9CFB8FF,0xF2D89AFF,0xF2A48FFF,0x9DB8D8FF,0xC7D2A8FF
+        ]
         for start in stride(from: 0, to: colors.count, by: 8) {
             let row = UIStackView(); row.axis = .horizontal; row.distribution = .fillEqually; row.spacing = 3
             for color in colors[start..<min(start + 8, colors.count)] { let swatch = UIButton(type: .custom); swatch.backgroundColor = uiColor(color); swatch.layer.borderWidth = 0.5; swatch.layer.borderColor = DraftingTheme.rule.cgColor; swatch.heightAnchor.constraint(equalToConstant: 16).isActive = true; swatch.addAction(UIAction { [weak self] _ in self?.onColor?(color) }, for: .touchUpInside); row.addArrangedSubview(swatch) }
