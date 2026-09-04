@@ -321,9 +321,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private func restoreDocument() {
         guard !isRestoringDocument else { return }
         isRestoringDocument = true
+        canvas.isUserInteractionEnabled = false
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.isRestoringDocument = false }
+            defer {
+                self.isRestoringDocument = false
+                self.canvas.isUserInteractionEnabled = true
+            }
             do {
                 let load = try await self.documentCoordinator.recoverDefaultPackage(
                     engineBridge: self.canvas.engineBridge,
@@ -1881,9 +1885,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             return
         }
         isRestoringDocument = true
+        canvas.isUserInteractionEnabled = false
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.isRestoringDocument = false }
+            defer {
+                self.isRestoringDocument = false
+                self.canvas.isUserInteractionEnabled = true
+            }
             do {
                 let load = try await self.documentCoordinator.switchToPackage(
                     at: url,
