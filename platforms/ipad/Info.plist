@@ -68,6 +68,11 @@
 	<array>
 		<string>metal</string>
 	</array>
+	<key>UIAppFonts</key>
+	<array>
+		<string>JetBrainsMono-Variable.ttf</string>
+		<string>Inter-Variable.ttf</string>
+	</array>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
