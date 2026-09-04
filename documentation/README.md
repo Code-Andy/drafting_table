@@ -21,9 +21,11 @@ handoffs belong here.
 
 ## Read this first
 
-1. [2026-09-04-v0.9.8-release-notes.md](2026-09-04-v0.9.8-release-notes.md)
+1. [2026-09-04-v0.9.9-release-notes.md](2026-09-04-v0.9.9-release-notes.md)
+   — Stroke input limit fix, layer drag-to-reorder, vector badges, and 32-cell palette with custom slots.
+2. [2026-09-04-v0.9.8-release-notes.md](2026-09-04-v0.9.8-release-notes.md)
    — Compact page previews/fonts, dynamic subtool menus to right of pages rail, popover color selector, and built-in non-scrolling app menu window.
-2. [2026-09-03-v0.9.7-release-notes.md](2026-09-03-v0.9.7-release-notes.md)
+3. [2026-09-03-v0.9.7-release-notes.md](2026-09-03-v0.9.7-release-notes.md)
    — Gap-closing bucket fill with margin/bleed controls, paper space maximization, and Apple Pencil Pro circular radial wheel menu.
 3. [2026-09-03-current-development-handoff.md](2026-09-03-current-development-handoff.md)
    — exact branch, release, CI, and blocker state as of v0.9.8.
