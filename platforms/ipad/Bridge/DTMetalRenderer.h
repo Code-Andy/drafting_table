@@ -25,6 +25,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)updateGridVisible:(BOOL)visible spacing:(CGFloat)spacing;
 - (void)updatePixelGridVisible:(BOOL)visible;
 - (void)updateCenterMode:(BOOL)centerMode;
+- (void)updatePaperWidth:(CGFloat)width height:(CGFloat)height;
 
 @property(nonatomic, readonly) NSUInteger frameCount;
 

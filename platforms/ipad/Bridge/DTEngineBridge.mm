@@ -172,6 +172,7 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 - (void)setBrushHardness:(CGFloat)hardness { if (_engine) _engine->setBrushHardness((float)hardness); }
 - (BOOL)canUndo { return _engine && _engine->canUndo(); }
 - (BOOL)canRedo { return _engine && _engine->canRedo(); }
+- (BOOL)isStrokeInProgress { return _engine && _engine->strokeInProgress(); }
 - (NSArray<DTPageInfo *> *)pageInfos {
     if (!_engine) return @[]; auto names=_engine->pageNames(); NSUInteger selected=_engine->activePageIndex(); NSMutableArray *r=[NSMutableArray arrayWithCapacity:names.size()];
     for (NSUInteger i=0;i<names.size();++i) [r addObject:[[DTPageInfo alloc] initWithIndex:i name:[NSString stringWithUTF8String:names[i].c_str()] ?: @"" selected:i==selected]]; return r;
@@ -249,7 +250,7 @@ PencilSample toCoreSample(const DTPencilSample& input) {
     // The retained archive can contain millions of samples, but a display
     // frame must remain bounded. Decimation preserves first/last points for
     // shape tools and prevents launch-time deep-copy/NSValue allocation spikes.
-    const auto strokes = _engine->snapshotForDisplay(_engine->activePageIndex(), 4096, 2000000);
+    const auto strokes = _engine->snapshotForDisplay(_engine->activePageIndex(), 2000000, 20000000);
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:strokes.size()];
     for (const Stroke& stroke : strokes) {
         NSMutableArray *polyline = [NSMutableArray arrayWithCapacity:stroke.points.size()];
@@ -272,7 +273,7 @@ PencilSample toCoreSample(const DTPencilSample& input) {
 
 - (NSArray<DTRenderStroke *> *)renderableStrokesForPageAtIndex:(NSUInteger)index {
     if (!_engine) return @[];
-    const auto strokes = _engine->snapshotForDisplay(index, 4096, 2000000);
+    const auto strokes = _engine->snapshotForDisplay(index, 2000000, 20000000);
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:strokes.size()];
     for (const Stroke& stroke : strokes) {
         NSMutableArray *polyline = [NSMutableArray arrayWithCapacity:stroke.points.size()];

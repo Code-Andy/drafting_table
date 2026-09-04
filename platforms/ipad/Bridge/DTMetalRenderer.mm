@@ -32,6 +32,8 @@ struct DTCanvasTransformState {
     float gridSpacing = 32.0f;
     bool pixelGridVisible = false;
     bool centerMode = false;
+    float paperWidth = 1536.0f;
+    float paperHeight = 2048.0f;
 };
 
 static DTCanvasTransformState gCanvasTransform;
@@ -145,6 +147,17 @@ static void addSegmentStyled(std::vector<DTMetalVertex>& out,
     }
 }
 
+static void addQuad(std::vector<DTMetalVertex>& out,
+                    vector_float2 minP, vector_float2 maxP,
+                    vector_float4 color, float opacity) {
+    const vector_float2 a = minP;
+    const vector_float2 b = (vector_float2){maxP.x, minP.y};
+    const vector_float2 c = maxP;
+    const vector_float2 d = (vector_float2){minP.x, maxP.y};
+    addTriangleStyled(out, a, b, c, 1.0f, 0.0f, opacity, 0.0f, color, 1.0f);
+    addTriangleStyled(out, a, c, d, 1.0f, 0.0f, opacity, 0.0f, color, 1.0f);
+}
+
 static void addEllipseOutline(std::vector<DTMetalVertex>& out,
                               vector_float2 center, vector_float2 radii,
                               float radius, float opacity, vector_float4 color,
@@ -153,7 +166,7 @@ static void addEllipseOutline(std::vector<DTMetalVertex>& out,
 static void addShapeOutline(std::vector<DTMetalVertex>& out,
                             uint32_t tool, vector_float2 first, vector_float2 last,
                             float radius, float opacity, vector_float4 color,
-                            float hardness) {
+                            float hardness, bool centerModeActive) {
     if (tool == 2u) { // line
         addSegmentStyled(out, first, last, radius, opacity, 0.0f, color, hardness);
         return;
@@ -172,16 +185,16 @@ static void addShapeOutline(std::vector<DTMetalVertex>& out,
         return;
     }
     if (tool == 4u) { // ellipse
-        const vector_float2 center = gCanvasTransform.centerMode ? first : ((first + last) * 0.5f);
-        const vector_float2 radii = gCanvasTransform.centerMode
+        const vector_float2 center = centerModeActive ? first : ((first + last) * 0.5f);
+        const vector_float2 radii = centerModeActive
             ? (vector_float2){fmaxf(0.5f, fabsf(last.x - first.x)), fmaxf(0.5f, fabsf(last.y - first.y))}
             : (vector_float2){fmaxf(0.5f, fabsf(last.x - first.x) * 0.5f), fmaxf(0.5f, fabsf(last.y - first.y) * 0.5f)};
         addEllipseOutline(out, center, radii, radius, opacity, color, hardness);
         return;
     }
-    if (tool == 5u) { // circle: corner-drag defines the bounding square, center-drag defines radius from center
-        const vector_float2 center = gCanvasTransform.centerMode ? first : ((first + last) * 0.5f);
-        const float circleRadius = gCanvasTransform.centerMode
+    if (tool == 5u) { // circle: corner-drag defines bounding square, center-drag defines radius from center
+        const vector_float2 center = centerModeActive ? first : ((first + last) * 0.5f);
+        const float circleRadius = centerModeActive
             ? fmaxf(0.5f, hypotf(last.x - first.x, last.y - first.y))
             : fmaxf(0.5f, fmaxf(fabsf(last.x - first.x), fabsf(last.y - first.y)) * 0.5f);
         addEllipseOutline(out, center, (vector_float2){circleRadius, circleRadius},
@@ -320,9 +333,8 @@ static DTSampledPoint catmullRom(const DTSampledPoint& p0,
 static std::vector<DTSampledPoint> smoothedPoints(
     const std::vector<DTSampledPoint>& input) {
     if (input.size() < 3) return input;
-    constexpr size_t kMaximumSmoothedPoints = 1024;
     std::vector<DTSampledPoint> output;
-    output.reserve(std::min(kMaximumSmoothedPoints, input.size() * 3));
+    output.reserve(input.size() * 3);
     for (size_t i = 0; i + 1 < input.size(); ++i) {
         const DTSampledPoint& p0 = input[i == 0 ? i : i - 1];
         const DTSampledPoint& p1 = input[i];
@@ -331,11 +343,9 @@ static std::vector<DTSampledPoint> smoothedPoints(
         const float length = simd_length(p2.position - p1.position);
         const int subdivisions = std::max(1, std::min(12, static_cast<int>(ceilf(length / 3.0f))));
         for (int step = 0; step < subdivisions; ++step) {
-            if (output.size() + 1 >= kMaximumSmoothedPoints) break;
             const float t = static_cast<float>(step) / static_cast<float>(subdivisions);
             output.push_back(catmullRom(p0, p1, p2, p3, t));
         }
-        if (output.size() + 1 >= kMaximumSmoothedPoints) break;
     }
     output.push_back(input.back());
     return output;
@@ -343,20 +353,7 @@ static std::vector<DTSampledPoint> smoothedPoints(
 
 static std::vector<DTSampledPoint> boundedInputPoints(
     const std::vector<DTSampledPoint>& input) {
-    constexpr size_t kMaximumInputPoints = 512;
-    if (input.size() <= kMaximumInputPoints) return input;
-    std::vector<DTSampledPoint> output;
-    output.reserve(kMaximumInputPoints);
-    output.push_back(input.front());
-    const double stride = static_cast<double>(input.size() - 1) /
-        static_cast<double>(kMaximumInputPoints - 1);
-    for (size_t index = 1; index + 1 < kMaximumInputPoints; ++index) {
-        const size_t source = std::min(input.size() - 2,
-            static_cast<size_t>(llround(static_cast<double>(index) * stride)));
-        output.push_back(input[source]);
-    }
-    output.push_back(input.back());
-    return output;
+    return input;
 }
 
 // This layout intentionally contains only float4 values. float4 alignment is
@@ -391,7 +388,7 @@ typedef struct {
     if (!self) return nil;
     _view = view;
     _engine = engine;
-    view.clearColor = MTLClearColorMake(0.965, 0.945, 0.900, 1.0);
+    view.clearColor = MTLClearColorMake(0.102, 0.090, 0.078, 1.0);
     id<MTLDevice> device = view.device;
     if (!device) return self;
     _commandQueue = [device newCommandQueue];
@@ -458,6 +455,14 @@ typedef struct {
     gCanvasTransform.centerMode = centerMode;
 }
 
+- (void)updatePaperWidth:(CGFloat)width height:(CGFloat)height {
+    const float safeW = std::isfinite(static_cast<float>(width)) ? std::max(128.0f, static_cast<float>(width)) : 1536.0f;
+    const float safeH = std::isfinite(static_cast<float>(height)) ? std::max(128.0f, static_cast<float>(height)) : 2048.0f;
+    std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
+    gCanvasTransform.paperWidth = safeW;
+    gCanvasTransform.paperHeight = safeH;
+}
+
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
     (void)view; (void)size;
 }
@@ -476,7 +481,7 @@ typedef struct {
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
     if (!pass) return;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.965, 0.945, 0.900, 1.0);
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.102, 0.090, 0.078, 1.0);
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
     if (!commandBuffer) return;
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
@@ -495,6 +500,8 @@ typedef struct {
     bool gridVisible = false;
     float gridSpacing = 32.0f;
     bool pixelGridVisible = false;
+    float paperWidth = 1536.0f;
+    float paperHeight = 2048.0f;
     {
         std::lock_guard<std::mutex> lock(gCanvasTransform.mutex);
         transformScale = gCanvasTransform.scale;
@@ -504,6 +511,8 @@ typedef struct {
         gridVisible = gCanvasTransform.gridVisible;
         gridSpacing = gCanvasTransform.gridSpacing;
         pixelGridVisible = gCanvasTransform.pixelGridVisible;
+        paperWidth = gCanvasTransform.paperWidth;
+        paperHeight = gCanvasTransform.paperHeight;
     }
     DTMetalUniforms uniforms{};
     uniforms.viewportScaleRotation = (vector_float4){
@@ -520,80 +529,37 @@ typedef struct {
     };
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
-    // Draw the optional document-space grid first. Lines are generated in
-    // document coordinates and therefore rotate/scale with the canvas.
-    if (gridVisible) {
-        const float inverseScale = 1.0f / std::max(0.01f, transformScale);
-        const float extentX = static_cast<float>(view.bounds.size.width) * inverseScale + gridSpacing * 2.0f;
-        const float extentY = static_cast<float>(view.bounds.size.height) * inverseScale + gridSpacing * 2.0f;
-        const int maxColumns = 256;
-        const int columns = std::min(maxColumns, static_cast<int>(ceilf(extentX / gridSpacing)) + 1);
-        const int rows = std::min(maxColumns, static_cast<int>(ceilf(extentY / gridSpacing)) + 1);
-        const vector_float4 gridColor = (vector_float4){0.52f, 0.56f, 0.55f, 0.20f};
-        std::vector<DTMetalVertex> grid;
-        grid.reserve(static_cast<size_t>(columns + rows) * 6);
-        const float halfX = columns * gridSpacing;
-        const float halfY = rows * gridSpacing;
-        const float width = std::max(0.35f, 0.75f * inverseScale);
-        for (int i = -columns; i <= columns; ++i) {
-            const float x = static_cast<float>(i) * gridSpacing;
-            addSegmentStyled(grid, (vector_float2){x, -halfY}, (vector_float2){x, halfY},
-                             width, 1.0f, 0.0f, gridColor, 1.0f, false);
-        }
-        for (int i = -rows; i <= rows; ++i) {
-            const float y = static_cast<float>(i) * gridSpacing;
-            addSegmentStyled(grid, (vector_float2){-halfX, y}, (vector_float2){halfX, y},
-                             width, 1.0f, 0.0f, gridColor, 1.0f, false);
-        }
-        if (!grid.empty()) {
-            id<MTLBuffer> gridBuffer = [view.device newBufferWithBytes:grid.data()
-                                                                  length:sizeof(DTMetalVertex) * grid.size()
-                                                                 options:MTLResourceStorageModeShared];
-            if (gridBuffer) {
-                DTMetalFragmentUniforms fragmentUniforms{};
-                fragmentUniforms.color = gridColor;
-                fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
-                [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
-                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
-            }
-        }
-    }
+    // Render the paper sheet with shadow and border in document space before strokes.
+    {
+        std::vector<DTMetalVertex> paperGeometry;
+        paperGeometry.reserve(30);
+        // Soft drop shadow beneath paper sheet
+        const vector_float4 shadowColor = (vector_float4){0.04f, 0.03f, 0.02f, 0.40f};
+        addQuad(paperGeometry, (vector_float2){-3.0f, 4.0f}, (vector_float2){paperWidth + 8.0f, paperHeight + 10.0f},
+                shadowColor, 0.40f);
+        // Paper sheet surface
+        const vector_float4 paperColor = (vector_float4){0.965f, 0.945f, 0.900f, 1.0f};
+        addQuad(paperGeometry, (vector_float2){0.0f, 0.0f}, (vector_float2){paperWidth, paperHeight},
+                paperColor, 1.0f);
+        // Subtle paper border outline
+        const vector_float4 borderColor = (vector_float4){0.851f, 0.812f, 0.722f, 0.85f};
+        const float borderWidth = std::max(0.6f, 1.0f / std::max(0.01f, transformScale));
+        addSegmentStyled(paperGeometry, (vector_float2){0.0f, 0.0f}, (vector_float2){paperWidth, 0.0f}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
+        addSegmentStyled(paperGeometry, (vector_float2){paperWidth, 0.0f}, (vector_float2){paperWidth, paperHeight}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
+        addSegmentStyled(paperGeometry, (vector_float2){paperWidth, paperHeight}, (vector_float2){0.0f, paperHeight}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
+        addSegmentStyled(paperGeometry, (vector_float2){0.0f, paperHeight}, (vector_float2){0.0f, 0.0f}, borderWidth, 1.0f, 0.0f, borderColor, 1.0f, false);
 
-    if (pixelGridVisible && transformScale >= 3.5f) {
-        const float inverseScale = 1.0f / transformScale;
-        const float extentX = static_cast<float>(view.bounds.size.width) * inverseScale + 4.0f;
-        const float extentY = static_cast<float>(view.bounds.size.height) * inverseScale + 4.0f;
-        const int maxCols = 384;
-        const int cols = std::min(maxCols, static_cast<int>(ceilf(extentX)) + 1);
-        const int rows = std::min(maxCols, static_cast<int>(ceilf(extentY)) + 1);
-        const vector_float4 pxColor = (vector_float4){0.40f, 0.44f, 0.43f, 0.12f};
-        std::vector<DTMetalVertex> pxGrid;
-        pxGrid.reserve(static_cast<size_t>(cols + rows) * 6);
-        const float halfX = cols * 1.0f;
-        const float halfY = rows * 1.0f;
-        const float width = std::max(0.25f, 0.5f * inverseScale);
-        for (int i = -cols; i <= cols; ++i) {
-            const float x = static_cast<float>(i);
-            addSegmentStyled(pxGrid, (vector_float2){x, -halfY}, (vector_float2){x, halfY},
-                             width, 1.0f, 0.0f, pxColor, 1.0f, false);
-        }
-        for (int i = -rows; i <= rows; ++i) {
-            const float y = static_cast<float>(i);
-            addSegmentStyled(pxGrid, (vector_float2){-halfX, y}, (vector_float2){halfX, y},
-                             width, 1.0f, 0.0f, pxColor, 1.0f, false);
-        }
-        if (!pxGrid.empty()) {
-            id<MTLBuffer> pxBuffer = [view.device newBufferWithBytes:pxGrid.data()
-                                                              length:sizeof(DTMetalVertex) * pxGrid.size()
-                                                             options:MTLResourceStorageModeShared];
-            if (pxBuffer) {
+        if (!paperGeometry.empty()) {
+            id<MTLBuffer> paperBuffer = [view.device newBufferWithBytes:paperGeometry.data()
+                                                                  length:sizeof(DTMetalVertex) * paperGeometry.size()
+                                                                 options:MTLResourceStorageModeShared];
+            if (paperBuffer) {
                 DTMetalFragmentUniforms fragmentUniforms{};
-                fragmentUniforms.color = pxColor;
+                fragmentUniforms.color = paperColor;
                 fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
                 [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
-                [encoder setVertexBuffer:pxBuffer offset:0 atIndex:0];
-                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:pxGrid.size()];
+                [encoder setVertexBuffer:paperBuffer offset:0 atIndex:0];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:paperGeometry.size()];
             }
         }
     }
@@ -640,9 +606,10 @@ typedef struct {
             size_t lastReal = points.size() - 1;
             while (lastReal > firstReal && points[lastReal].predicted > 0.5f) --lastReal;
             const float radius = fmaxf(0.5f, brushSize * 0.5f);
+            const bool centerModeActive = isLastStroke && self.engine.isStrokeInProgress && gCanvasTransform.centerMode;
             std::vector<DTMetalVertex> geometry;
             addShapeOutline(geometry, tool, points[firstReal].position, points[lastReal].position,
-                            radius, opacity * (0.22f + 0.78f * hardness), strokeColor, hardness);
+                            radius, opacity * (0.22f + 0.78f * hardness), strokeColor, hardness, centerModeActive);
             if (!geometry.empty()) {
                 if (frameVerticesUsed + geometry.size() > frameVertexBudget) {
                     const size_t remaining = frameVertexBudget - frameVerticesUsed;
@@ -796,6 +763,111 @@ typedef struct {
             }
         }
     }
+
+    // Draw document grid AFTER all strokes, strictly bounded to the paper sheet [0, paperWidth] x [0, paperHeight].
+    // Because grid is drawn after strokes, eraser strokes (which restore paper surface) never erase or cut the grid.
+    if (gridVisible) {
+        const float invScale = 1.0f / std::max(0.01f, transformScale);
+        const float viewDiag = hypotf(static_cast<float>(view.bounds.size.width),
+                                      static_cast<float>(view.bounds.size.height)) * invScale * 0.5f + gridSpacing * 2.0f;
+        const float cosR = cosf(transformRotation);
+        const float sinR = sinf(transformRotation);
+        const float viewCenterX = static_cast<float>(view.bounds.size.width) * 0.5f;
+        const float viewCenterY = static_cast<float>(view.bounds.size.height) * 0.5f;
+        const float transX = (viewCenterX - transformX) * invScale;
+        const float transY = (viewCenterY - transformY) * invScale;
+        const float docCenterX = transX * cosR + transY * sinR;
+        const float docCenterY = -transX * sinR + transY * cosR;
+
+        const float visMinX = std::max(0.0f, docCenterX - viewDiag);
+        const float visMaxX = std::min(paperWidth, docCenterX + viewDiag);
+        const float visMinY = std::max(0.0f, docCenterY - viewDiag);
+        const float visMaxY = std::min(paperHeight, docCenterY + viewDiag);
+
+        if (visMinX <= visMaxX && visMinY <= visMaxY) {
+            const vector_float4 gridColor = (vector_float4){0.52f, 0.56f, 0.55f, 0.28f};
+            const float width = std::max(0.35f, 0.75f * invScale);
+            std::vector<DTMetalVertex> grid;
+            const float startX = std::max(0.0f, floorf(visMinX / gridSpacing) * gridSpacing);
+            const float endX = std::min(paperWidth, ceilf(visMaxX / gridSpacing) * gridSpacing);
+            const float startY = std::max(0.0f, floorf(visMinY / gridSpacing) * gridSpacing);
+            const float endY = std::min(paperHeight, ceilf(visMaxY / gridSpacing) * gridSpacing);
+
+            for (float x = startX; x <= endX + 0.1f; x += gridSpacing) {
+                addSegmentStyled(grid, (vector_float2){x, 0.0f}, (vector_float2){x, paperHeight},
+                                 width, 1.0f, 0.0f, gridColor, 1.0f, false);
+            }
+            for (float y = startY; y <= endY + 0.1f; y += gridSpacing) {
+                addSegmentStyled(grid, (vector_float2){0.0f, y}, (vector_float2){paperWidth, y},
+                                 width, 1.0f, 0.0f, gridColor, 1.0f, false);
+            }
+            if (!grid.empty()) {
+                id<MTLBuffer> gridBuffer = [view.device newBufferWithBytes:grid.data()
+                                                                      length:sizeof(DTMetalVertex) * grid.size()
+                                                                     options:MTLResourceStorageModeShared];
+                if (gridBuffer) {
+                    DTMetalFragmentUniforms fragmentUniforms{};
+                    fragmentUniforms.color = gridColor;
+                    fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
+                    [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
+                    [encoder setVertexBuffer:gridBuffer offset:0 atIndex:0];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:grid.size()];
+                }
+            }
+        }
+    }
+
+    if (pixelGridVisible && transformScale >= 3.5f) {
+        const float invScale = 1.0f / transformScale;
+        const float viewDiag = hypotf(static_cast<float>(view.bounds.size.width),
+                                      static_cast<float>(view.bounds.size.height)) * invScale * 0.5f + 4.0f;
+        const float cosR = cosf(transformRotation);
+        const float sinR = sinf(transformRotation);
+        const float viewCenterX = static_cast<float>(view.bounds.size.width) * 0.5f;
+        const float viewCenterY = static_cast<float>(view.bounds.size.height) * 0.5f;
+        const float transX = (viewCenterX - transformX) * invScale;
+        const float transY = (viewCenterY - transformY) * invScale;
+        const float docCenterX = transX * cosR + transY * sinR;
+        const float docCenterY = -transX * sinR + transY * cosR;
+
+        const float visMinX = std::max(0.0f, docCenterX - viewDiag);
+        const float visMaxX = std::min(paperWidth, docCenterX + viewDiag);
+        const float visMinY = std::max(0.0f, docCenterY - viewDiag);
+        const float visMaxY = std::min(paperHeight, docCenterY + viewDiag);
+
+        if (visMinX <= visMaxX && visMinY <= visMaxY) {
+            const vector_float4 pxColor = (vector_float4){0.40f, 0.44f, 0.43f, 0.16f};
+            const float width = std::max(0.25f, 0.5f * invScale);
+            std::vector<DTMetalVertex> pxGrid;
+            const float startX = std::max(0.0f, floorf(visMinX));
+            const float endX = std::min(paperWidth, ceilf(visMaxX));
+            const float startY = std::max(0.0f, floorf(visMinY));
+            const float endY = std::min(paperHeight, ceilf(visMaxY));
+
+            for (float x = startX; x <= endX + 0.1f; x += 1.0f) {
+                addSegmentStyled(pxGrid, (vector_float2){x, 0.0f}, (vector_float2){x, paperHeight},
+                                 width, 1.0f, 0.0f, pxColor, 1.0f, false);
+            }
+            for (float y = startY; y <= endY + 0.1f; y += 1.0f) {
+                addSegmentStyled(pxGrid, (vector_float2){0.0f, y}, (vector_float2){paperWidth, y},
+                                 width, 1.0f, 0.0f, pxColor, 1.0f, false);
+            }
+            if (!pxGrid.empty()) {
+                id<MTLBuffer> pxBuffer = [view.device newBufferWithBytes:pxGrid.data()
+                                                                  length:sizeof(DTMetalVertex) * pxGrid.size()
+                                                                 options:MTLResourceStorageModeShared];
+                if (pxBuffer) {
+                    DTMetalFragmentUniforms fragmentUniforms{};
+                    fragmentUniforms.color = pxColor;
+                    fragmentUniforms.style = (vector_float4){1.0f, 0, 0, 0};
+                    [encoder setFragmentBytes:&fragmentUniforms length:sizeof(fragmentUniforms) atIndex:0];
+                    [encoder setVertexBuffer:pxBuffer offset:0 atIndex:0];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:pxGrid.size()];
+                }
+            }
+        }
+    }
+
     [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];

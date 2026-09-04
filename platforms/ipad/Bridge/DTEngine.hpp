@@ -35,7 +35,7 @@ class Engine final {
 public:
  Engine();
  DTTool tool() const; void setTool(DTTool); float brushSize() const; void setBrushSize(float); float brushOpacity() const; void setBrushOpacity(float); std::uint32_t brushColorRGBA() const; void setBrushColorRGBA(std::uint32_t); float brushHardness() const; void setBrushHardness(float);
- void beginStroke(); void appendSamples(std::span<const PencilSample> real,std::span<const PencilSample> predicted={}); bool updateEstimatedSample(std::uint64_t,const PencilSample&); void endStroke(); void cancelStroke(); void clear(); bool undoLastStroke(); bool redoLastStroke(); bool canUndo() const; bool canRedo() const;
+ void beginStroke(); void appendSamples(std::span<const PencilSample> real,std::span<const PencilSample> predicted={}); bool updateEstimatedSample(std::uint64_t,const PencilSample&); void endStroke(); void cancelStroke(); void clear(); bool undoLastStroke(); bool redoLastStroke(); bool canUndo() const; bool canRedo() const; bool strokeInProgress() const;
  bool moveStrokes(std::span<const std::size_t> indices, float dx, float dy);
  bool scaleStrokes(std::span<const std::size_t> indices, float sx, float sy, float originX, float originY);
  bool rotateStrokes(std::span<const std::size_t> indices, float angleRad, float originX, float originY);

@@ -138,6 +138,14 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     private var shapeStartDocPoint: CGPoint?
     private var lastSnappedAngleIndex: Int = -1
 
+    /// Concrete paper sheet dimensions in document coordinates.
+    var paperSize: CGSize = CGSize(width: 1536, height: 2048) {
+        didSet {
+            renderer?.updatePaperWidth(paperSize.width, height: paperSize.height)
+            setNeedsDisplay()
+        }
+    }
+
     /// Document-to-view viewport transform. Translation is in view points;
     /// scale and rotation are applied around the document origin.
     private(set) var canvasScale: CGFloat = 1.0
@@ -252,6 +260,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         renderer?.updateGridVisible(gridVisible, spacing: 32)
         renderer?.updatePixelGridVisible(pixelGridVisible)
         renderer?.updateCenterMode(shapeCenterMode)
+        renderer?.updatePaperWidth(paperSize.width, height: paperSize.height)
     }
 
     private var activeToolName: String {
@@ -545,7 +554,12 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         }
 
         if currentTool == .line || currentTool == .rectangle || currentTool == .ellipse || currentTool == .circle {
-            shapeStartDocPoint = documentPoint(for: touch.preciseLocation(in: self))
+            var startPt = documentPoint(for: touch.preciseLocation(in: self))
+            if snapToGrid, gridVisible, gridSpacing >= 1 {
+                startPt.x = round(startPt.x / gridSpacing) * gridSpacing
+                startPt.y = round(startPt.y / gridSpacing) * gridSpacing
+            }
+            shapeStartDocPoint = startPt
             lastSnappedAngleIndex = -1
         }
 
@@ -676,20 +690,31 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
 
         if strokeEngaged {
             if (currentTool == .circle || currentTool == .ellipse), shapeCenterMode, let start = shapeStartDocPoint {
-                let end = documentPoint(for: activeTouch.preciseLocation(in: self))
+                var end = documentPoint(for: activeTouch.preciseLocation(in: self))
+                if snapToGrid, gridVisible, gridSpacing >= 1 {
+                    end.x = round(end.x / gridSpacing) * gridSpacing
+                    end.y = round(end.y / gridSpacing) * gridSpacing
+                }
                 engineBridge.cancelStroke()
                 engineBridge.beginStroke()
                 var p0 = DTPencilSample()
                 var p1 = DTPencilSample()
                 if currentTool == .circle {
-                    let r = max(1.0, hypot(end.x - start.x, end.y - start.y))
+                    var r = max(1.0, hypot(end.x - start.x, end.y - start.y))
+                    if snapToGrid, gridVisible, gridSpacing >= 1 {
+                        r = max(Double(gridSpacing), round(r / Double(gridSpacing)) * Double(gridSpacing))
+                    }
                     p0.x = Float(start.x - r)
                     p0.y = Float(start.y - r)
                     p1.x = Float(start.x + r)
                     p1.y = Float(start.y + r)
                 } else {
-                    let rx = max(1.0, abs(end.x - start.x))
-                    let ry = max(1.0, abs(end.y - start.y))
+                    var rx = max(1.0, abs(end.x - start.x))
+                    var ry = max(1.0, abs(end.y - start.y))
+                    if snapToGrid, gridVisible, gridSpacing >= 1 {
+                        rx = max(Double(gridSpacing), round(rx / Double(gridSpacing)) * Double(gridSpacing))
+                        ry = max(Double(gridSpacing), round(ry / Double(gridSpacing)) * Double(gridSpacing))
+                    }
                     p0.x = Float(start.x - rx)
                     p0.y = Float(start.y - ry)
                     p1.x = Float(start.x + rx)
@@ -922,7 +947,7 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     }
 
     private func clampedScale(_ value: CGFloat) -> CGFloat {
-        min(max(value.isFinite ? value : 1.0, 0.1), 8.0)
+        min(max(value.isFinite ? value : 1.0, 0.05), 15.0)
     }
 
     private func publishViewTransform(persist: Bool = false) {
@@ -935,12 +960,23 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
         setNeedsDisplay()
     }
 
-    /// Resets zoom, rotation and pan to the default page viewport.
+    /// Resets zoom, rotation and pan to center and fit the paper sheet in view.
     func resetView() {
         cancelDirectFingerStrokeIfNeeded()
-        canvasScale = 1.0
+        let viewW = bounds.width > 0 ? bounds.width : 1024
+        let viewH = bounds.height > 0 ? bounds.height : 768
+        let margin: CGFloat = 36.0
+        let availW = max(100.0, viewW - margin * 2)
+        let availH = max(100.0, viewH - margin * 2)
+        let scaleW = availW / max(100.0, paperSize.width)
+        let scaleH = availH / max(100.0, paperSize.height)
+        let fitScale = min(scaleW, scaleH, 1.0)
+        canvasScale = clampedScale(fitScale)
         canvasRotation = 0.0
-        canvasTranslation = .zero
+        canvasTranslation = CGPoint(
+            x: (viewW - paperSize.width * canvasScale) * 0.5,
+            y: (viewH - paperSize.height * canvasScale) * 0.5
+        )
         publishViewTransform(persist: true)
     }
 

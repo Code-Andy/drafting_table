@@ -56,11 +56,18 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var selectionCountLabel: UILabel!
     private let persistence = StrokePersistenceStore()
 
-    // Top-left chrome & Sub-tool UI
+    // Top chrome & Sub-tool UI
     private var mainMenuButton: UIButton!
-    private var undoRedoChip: UIView!
+    private var topToolBar: UIView!
     private var chipUndoButton: UIButton!
     private var chipRedoButton: UIButton!
+    private var topActiveColorButton: UIButton!
+    private var quickPaletteButtons: [UIButton] = []
+    private var topBrushSizeSlider: UISlider!
+    private var topBrushSizeLabel: UILabel!
+    private var topBrushOpacitySlider: UISlider!
+    private var topBrushOpacityLabel: UILabel!
+    private var paperSizeButton: UIButton!
     private var bucketSubToolBar: UIView!
     private var gapSegment: UISegmentedControl!
     private var bleedSegment: UISegmentedControl!
@@ -72,7 +79,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var brushHardnessSlider: UISlider!
     private var brushHardnessLabel: UILabel!
 
-    private var undoRedoLeadingConstraint: NSLayoutConstraint?
+    private var topToolBarLeadingConstraint: NSLayoutConstraint?
     private var bucketSubToolBarLeadingConstraint: NSLayoutConstraint?
     private var brushSubToolBarLeadingConstraint: NSLayoutConstraint?
     private var layersRailLeadingConstraint: NSLayoutConstraint?
@@ -118,13 +125,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         toolRail = UIView()
         statusBar = UIView()
         toastLabel = InsetLabel()
-        configureUndoRedoChip()
+        configureTopToolBar()
         configureBucketSubToolBar()
         configureBrushSubToolBar()
         configureSelectionActionBar()
         DTLaunchBreadcrumb("vc:create:rails:done")
         view = root
-        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, undoRedoChip, bucketSubToolBar, brushSubToolBar, selectionActionBar, toastLabel].forEach {
+        [canvas, hoverOverlay, diagnostics, emptyState, pagesRail, layersRail, toolRail, statusBar, topToolBar, bucketSubToolBar, brushSubToolBar, selectionActionBar, toastLabel].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview($0)
         }
@@ -156,16 +163,17 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             layersRail.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -6),
             layersRail.widthAnchor.constraint(equalToConstant: 120),
 
-            // Floating Undo / Redo chip over top-left canvas
-            undoRedoChip.topAnchor.constraint(equalTo: safe.topAnchor, constant: 8),
-            undoRedoChip.heightAnchor.constraint(equalToConstant: 34),
+            // Top Bar (horizontal controls across canvas top)
+            topToolBar.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
+            topToolBar.heightAnchor.constraint(equalToConstant: 44),
+            topToolBar.trailingAnchor.constraint(lessThanOrEqualTo: safe.trailingAnchor, constant: -10),
 
             // Bucket Sub-Tool Menu (gap error margin & bleed)
-            bucketSubToolBar.topAnchor.constraint(equalTo: undoRedoChip.bottomAnchor, constant: 8),
+            bucketSubToolBar.topAnchor.constraint(equalTo: topToolBar.bottomAnchor, constant: 8),
             bucketSubToolBar.widthAnchor.constraint(equalToConstant: 248),
 
             // Brush Sub-Tool Menu (size, opacity, hardness)
-            brushSubToolBar.topAnchor.constraint(equalTo: undoRedoChip.bottomAnchor, constant: 8),
+            brushSubToolBar.topAnchor.constraint(equalTo: topToolBar.bottomAnchor, constant: 8),
             brushSubToolBar.widthAnchor.constraint(equalToConstant: 220),
 
             // Status bar touching true bottom edge
@@ -238,13 +246,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         // the beige launch screen and the first committed frame.
         NSLog("DraftingTable launch: viewDidLoad, deferring restore")
         applyStoredSettings()
-        refreshRails(); updateToolSelection(); updateUndoRedoState(); refreshMySlotsRail()
+        refreshRails(); updateToolSelection(); updateUndoRedoState(); refreshMySlotsRail(); refreshColorSwatch(); refreshBrushSubToolBar()
         updateLaunchBreadcrumb(stage: "viewDidLoad")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             NSLog("DraftingTable launch: deferred restore begin")
             self.restoreDocument()
             self.refreshRails(); self.updateToolSelection(); self.updateUndoRedoState(); self.refreshMySlotsRail()
+            self.refreshColorSwatch(); self.refreshBrushSubToolBar()
             self.canvas.setNeedsDisplay()
             NSLog("DraftingTable launch: deferred restore done strokes=%lu",
                   UInt(self.canvas.engineBridge.strokeCount))
@@ -350,10 +359,26 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private func showSettings() {
         let settings = DrawingSettingsViewController()
         settings.onActivationChanged = { [weak self] value in self?.canvas.activationPressure = value }
-        settings.onBrushSizeChanged = { [weak self] value in self?.canvas.engineBridge.brushSize = value; self?.saveDocument() }
-        settings.onBrushOpacityChanged = { [weak self] value in self?.canvas.engineBridge.brushOpacity = value; self?.saveDocument() }
-        settings.onBrushHardnessChanged = { [weak self] value in self?.canvas.engineBridge.brushHardness = value; self?.saveDocument() }
-        settings.onBrushColorChanged = { [weak self] value in self?.canvas.engineBridge.brushColorRGBA = value; self?.saveDocument() }
+        settings.onBrushSizeChanged = { [weak self] value in
+            self?.canvas.engineBridge.brushSize = value
+            self?.refreshBrushSubToolBar()
+            self?.saveDocument()
+        }
+        settings.onBrushOpacityChanged = { [weak self] value in
+            self?.canvas.engineBridge.brushOpacity = value
+            self?.refreshBrushSubToolBar()
+            self?.saveDocument()
+        }
+        settings.onBrushHardnessChanged = { [weak self] value in
+            self?.canvas.engineBridge.brushHardness = value
+            self?.refreshBrushSubToolBar()
+            self?.saveDocument()
+        }
+        settings.onBrushColorChanged = { [weak self] value in
+            self?.canvas.engineBridge.brushColorRGBA = value
+            self?.refreshColorSwatch()
+            self?.saveDocument()
+        }
         settings.onGridChanged = { [weak self] value in self?.canvas.gridVisible = value; self?.updateStatusBar(); self?.saveDocument() }
         settings.onDiagnosticsChanged = { [weak self] value in self?.diagnostics.isHidden = !value }
         settings.onShapeCenterModeChanged = { [weak self] value in self?.canvas.shapeCenterMode = value; self?.updateStatusBar() }
@@ -391,7 +416,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         if let popover = navigation.popoverPresentationController {
             popover.sourceView = anchor
             popover.sourceRect = anchor?.bounds ?? .zero
-            popover.permittedArrowDirections = [.left, .up]
+            popover.permittedArrowDirections = [.left, .up, .down]
         }
         navigation.preferredContentSize = CGSize(width: 360, height: 580)
         picker.preferredContentSize = CGSize(width: 360, height: 580)
@@ -403,6 +428,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         UserDefaults.standard.set(Int(packed), forKey: DrawingSettingsViewController.brushColorKey)
         saveDocument()
         refreshColorSwatch()
+        refreshMySlotsRail()
     }
 
     private func refreshColorSwatch() {
@@ -415,6 +441,18 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         let ink: UIColor = (0.299 * r + 0.587 * g + 0.114 * b) > 0.5
             ? UIColor(red: 0.16, green: 0.14, blue: 0.11, alpha: 1) : .white
         colorSwatchButton.setTitleColor(ink, for: .normal)
+
+        // Highlight matching quick color swatch
+        let quickColors: [UInt32] = [
+            0x000000FF, 0x2B2926FF, 0x5A3825FF, 0x7A7368FF, 0xD0C8B8FF,
+            0xFFFFFFFF, 0xB5482EFF, 0x2A5D8FFF, 0x3D5E26FF, 0xC8A030FF
+        ]
+        for (idx, btn) in quickPaletteButtons.enumerated() {
+            let isSelected = (idx < quickColors.count && quickColors[idx] == packed)
+            btn.layer.borderWidth = isSelected ? 2.5 : 1.0
+            btn.layer.borderColor = isSelected ? DraftingTheme.ink.cgColor : UIColor(white: 0.2, alpha: 0.3).cgColor
+            btn.transform = isSelected ? CGAffineTransform(scaleX: 1.15, y: 1.15) : .identity
+        }
     }
 
     private func updateDocumentTitleLabel() {
@@ -636,55 +674,265 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         present(alert, animated: true)
     }
 
-    private func configureUndoRedoChip() {
-        undoRedoChip = UIView()
-        undoRedoChip.backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.95)
-        undoRedoChip.layer.cornerRadius = 8
-        undoRedoChip.layer.borderWidth = 1
-        undoRedoChip.layer.borderColor = DraftingTheme.rule.cgColor
-        undoRedoChip.layer.shadowColor = UIColor.black.cgColor
-        undoRedoChip.layer.shadowOpacity = 0.08
-        undoRedoChip.layer.shadowRadius = 4
-        undoRedoChip.layer.shadowOffset = CGSize(width: 0, height: 1.5)
-        undoRedoChip.translatesAutoresizingMaskIntoConstraints = false
+    private func configureTopToolBar() {
+        topToolBar = UIView()
+        topToolBar.backgroundColor = DraftingTheme.paperDeep.withAlphaComponent(0.96)
+        topToolBar.layer.cornerRadius = 10
+        topToolBar.layer.borderWidth = 1
+        topToolBar.layer.borderColor = DraftingTheme.rule.cgColor
+        topToolBar.layer.shadowColor = UIColor.black.cgColor
+        topToolBar.layer.shadowOpacity = 0.10
+        topToolBar.layer.shadowRadius = 6
+        topToolBar.layer.shadowOffset = CGSize(width: 0, height: 2)
+        topToolBar.translatesAutoresizingMaskIntoConstraints = false
+
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.alwaysBounceHorizontal = false
+        topToolBar.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: topToolBar.leadingAnchor, constant: 6),
+            scrollView.trailingAnchor.constraint(equalTo: topToolBar.trailingAnchor, constant: -6),
+            scrollView.topAnchor.constraint(equalTo: topToolBar.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: topToolBar.bottomAnchor)
+        ])
 
         let stack = UIStackView()
         stack.axis = .horizontal
         stack.alignment = .center
-        stack.spacing = 0
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
-        undoRedoChip.addSubview(stack)
+        scrollView.addSubview(stack)
+
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: undoRedoChip.leadingAnchor, constant: 4),
-            stack.trailingAnchor.constraint(equalTo: undoRedoChip.trailingAnchor, constant: -4),
-            stack.topAnchor.constraint(equalTo: undoRedoChip.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: undoRedoChip.bottomAnchor)
+            stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            stack.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor)
         ])
 
-        chipUndoButton = UIButton(type: .system)
+        // 1. Undo & Redo buttons
         let undoCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        chipUndoButton = UIButton(type: .system)
         chipUndoButton.setImage(UIImage(systemName: "arrow.uturn.backward", withConfiguration: undoCfg), for: .normal)
         chipUndoButton.tintColor = DraftingTheme.ink
-        chipUndoButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        chipUndoButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
         chipUndoButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
         chipUndoButton.addTarget(self, action: #selector(undoCanvas), for: .touchUpInside)
         chipUndoButton.accessibilityLabel = "Undo"
-
-        let div = UIView()
-        div.backgroundColor = DraftingTheme.rule
-        div.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        div.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        stack.addArrangedSubview(chipUndoButton)
 
         chipRedoButton = UIButton(type: .system)
-        let redoCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-        chipRedoButton.setImage(UIImage(systemName: "arrow.uturn.forward", withConfiguration: redoCfg), for: .normal)
+        chipRedoButton.setImage(UIImage(systemName: "arrow.uturn.forward", withConfiguration: undoCfg), for: .normal)
         chipRedoButton.tintColor = DraftingTheme.ink
-        chipRedoButton.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        chipRedoButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
         chipRedoButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
         chipRedoButton.addTarget(self, action: #selector(redoCanvas), for: .touchUpInside)
         chipRedoButton.accessibilityLabel = "Redo"
+        stack.addArrangedSubview(chipRedoButton)
 
-        [chipUndoButton, div, chipRedoButton].forEach(stack.addArrangedSubview)
+        stack.addArrangedSubview(createTopDivider())
+
+        // 2. Active Color Swatch Button (Tap opens full HSV Color Picker)
+        topActiveColorButton = UIButton(type: .custom)
+        topActiveColorButton.translatesAutoresizingMaskIntoConstraints = false
+        topActiveColorButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        topActiveColorButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        topActiveColorButton.layer.cornerRadius = 14
+        topActiveColorButton.layer.borderWidth = 2.0
+        topActiveColorButton.layer.borderColor = DraftingTheme.ink.cgColor
+        topActiveColorButton.layer.shadowColor = UIColor.black.cgColor
+        topActiveColorButton.layer.shadowOpacity = 0.18
+        topActiveColorButton.layer.shadowRadius = 2
+        topActiveColorButton.layer.shadowOffset = CGSize(width: 0, height: 1)
+        topActiveColorButton.accessibilityLabel = "Active brush color. Tap to open color picker."
+        topActiveColorButton.addTarget(self, action: #selector(openColorPickerDirect), for: .touchUpInside)
+        colorSwatchButton = topActiveColorButton
+        stack.addArrangedSubview(topActiveColorButton)
+
+        // 3. Quick 1-Tap Color Swatches (10 core drafting colors)
+        let quickColors: [(UInt32, String)] = [
+            (0x000000FF, "Black"),
+            (0x2B2926FF, "Ink"),
+            (0x5A3825FF, "Dark Brown"),
+            (0x7A7368FF, "Charcoal"),
+            (0xD0C8B8FF, "Warm Gray"),
+            (0xFFFFFFFF, "White"),
+            (0xB5482EFF, "Drafting Red"),
+            (0x2A5D8FFF, "Drafting Blue"),
+            (0x3D5E26FF, "Drafting Green"),
+            (0xC8A030FF, "Drafting Amber")
+        ]
+        quickPaletteButtons.removeAll()
+        for (rgba, name) in quickColors {
+            let btn = UIButton(type: .custom)
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            btn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            btn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            btn.layer.cornerRadius = 11
+            btn.backgroundColor = UIColor(
+                red: CGFloat((rgba >> 24) & 0xff) / 255.0,
+                green: CGFloat((rgba >> 16) & 0xff) / 255.0,
+                blue: CGFloat((rgba >> 8) & 0xff) / 255.0,
+                alpha: 1.0
+            )
+            btn.layer.borderWidth = 1.0
+            btn.layer.borderColor = UIColor(white: 0.2, alpha: 0.3).cgColor
+            btn.accessibilityLabel = "1-Tap Color: \(name)"
+            btn.addAction(UIAction { [weak self] _ in
+                self?.applyQuickColor(rgba)
+            }, for: .touchUpInside)
+            quickPaletteButtons.append(btn)
+            stack.addArrangedSubview(btn)
+        }
+
+        stack.addArrangedSubview(createTopDivider(height: 16))
+
+        // 4. My Slots (4 customizable quick slots)
+        slotButtons.removeAll()
+        for index in 0..<4 {
+            let btn = UIButton(type: .custom)
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            btn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            btn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            btn.layer.cornerRadius = 11
+            btn.tag = index
+            btn.addAction(UIAction { [weak self] _ in self?.selectSlot(at: index) }, for: .touchUpInside)
+            let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleSlotLongPress(_:)))
+            longPress.minimumPressDuration = 0.35
+            btn.addGestureRecognizer(longPress)
+            slotButtons.append(btn)
+            stack.addArrangedSubview(btn)
+        }
+        refreshMySlotsRail()
+
+        // 5. Full Color Picker Button
+        let paletteCfg = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        let pickerBtn = UIButton(type: .system)
+        pickerBtn.setImage(UIImage(systemName: "paintpalette", withConfiguration: paletteCfg), for: .normal)
+        pickerBtn.tintColor = DraftingTheme.ink
+        pickerBtn.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        pickerBtn.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        pickerBtn.accessibilityLabel = "Custom Color Picker"
+        pickerBtn.addTarget(self, action: #selector(openColorPickerDirect), for: .touchUpInside)
+        stack.addArrangedSubview(pickerBtn)
+
+        stack.addArrangedSubview(createTopDivider())
+
+        // 6. Brush Size Quick Slider & Label
+        let currentSize = canvas.engineBridge.brushSize
+        topBrushSizeLabel = UILabel()
+        topBrushSizeLabel.text = String(format: "%.1f pt", currentSize)
+        topBrushSizeLabel.font = .systemFont(ofSize: 10, weight: .bold)
+        topBrushSizeLabel.textColor = DraftingTheme.ink
+        topBrushSizeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
+        stack.addArrangedSubview(topBrushSizeLabel)
+
+        topBrushSizeSlider = UISlider()
+        topBrushSizeSlider.minimumValue = 1.0
+        topBrushSizeSlider.maximumValue = 40.0
+        topBrushSizeSlider.value = Float(currentSize)
+        topBrushSizeSlider.tintColor = DraftingTheme.ink
+        topBrushSizeSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        topBrushSizeSlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let val = CGFloat(self.topBrushSizeSlider.value)
+            self.canvas.engineBridge.brushSize = val
+            UserDefaults.standard.set(Float(val), forKey: DrawingSettingsViewController.brushSizeKey)
+            self.topBrushSizeLabel.text = String(format: "%.1f pt", val)
+            self.brushSizeSlider?.value = Float(val)
+            self.brushSizeLabel?.text = String(format: "SIZE: %.1f pt", val)
+            self.saveDocument()
+        }, for: .valueChanged)
+        stack.addArrangedSubview(topBrushSizeSlider)
+
+        // 7. Brush Opacity Quick Slider & Label
+        let currentOpacity = canvas.engineBridge.brushOpacity
+        topBrushOpacityLabel = UILabel()
+        topBrushOpacityLabel.text = String(format: "%d%%", Int(currentOpacity * 100))
+        topBrushOpacityLabel.font = .systemFont(ofSize: 10, weight: .bold)
+        topBrushOpacityLabel.textColor = DraftingTheme.ink
+        topBrushOpacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 34).isActive = true
+        stack.addArrangedSubview(topBrushOpacityLabel)
+
+        topBrushOpacitySlider = UISlider()
+        topBrushOpacitySlider.minimumValue = 0.05
+        topBrushOpacitySlider.maximumValue = 1.0
+        topBrushOpacitySlider.value = Float(currentOpacity)
+        topBrushOpacitySlider.tintColor = DraftingTheme.ink
+        topBrushOpacitySlider.widthAnchor.constraint(equalToConstant: 65).isActive = true
+        topBrushOpacitySlider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let val = CGFloat(self.topBrushOpacitySlider.value)
+            self.canvas.engineBridge.brushOpacity = val
+            UserDefaults.standard.set(Float(val * 100), forKey: DrawingSettingsViewController.brushOpacityKey)
+            self.topBrushOpacityLabel.text = String(format: "%d%%", Int(val * 100))
+            self.brushOpacitySlider?.value = Float(val)
+            self.brushOpacityLabel?.text = String(format: "OPACITY: %d%%", Int(val * 100))
+            self.saveDocument()
+        }, for: .valueChanged)
+        stack.addArrangedSubview(topBrushOpacitySlider)
+
+        stack.addArrangedSubview(createTopDivider())
+
+        // 8. Paper Size Selection Menu Button
+        paperSizeButton = UIButton(type: .system)
+        var paperBtnConfig = UIButton.Configuration.plain()
+        paperBtnConfig.image = UIImage(systemName: "doc.plaintext", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium))
+        paperBtnConfig.title = "Paper"
+        paperBtnConfig.imagePadding = 4
+        paperBtnConfig.baseForegroundColor = DraftingTheme.ink
+        paperSizeButton.configuration = paperBtnConfig
+        paperSizeButton.showsMenuAsPrimaryAction = true
+        paperSizeButton.menu = createPaperSizeMenu()
+        stack.addArrangedSubview(paperSizeButton)
+
+        // 9. Reset View Button
+        let resetBtn = UIButton(type: .system)
+        let resetCfg = UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        resetBtn.setImage(UIImage(systemName: "arrow.counterclockwise", withConfiguration: resetCfg), for: .normal)
+        resetBtn.tintColor = DraftingTheme.ink
+        resetBtn.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        resetBtn.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        resetBtn.accessibilityLabel = "Reset View & Center Paper"
+        resetBtn.addTarget(self, action: #selector(resetCanvasView), for: .touchUpInside)
+        stack.addArrangedSubview(resetBtn)
+    }
+
+    private func createTopDivider(height: CGFloat = 20) -> UIView {
+        let div = UIView()
+        div.backgroundColor = DraftingTheme.rule
+        div.translatesAutoresizingMaskIntoConstraints = false
+        div.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        div.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return div
+    }
+
+    private func createPaperSizeMenu() -> UIMenu {
+        let sizes: [(String, CGSize)] = [
+            ("iPad Native (1536 × 2048)", CGSize(width: 1536, height: 2048)),
+            ("US Letter (1700 × 2200)", CGSize(width: 1700, height: 2200)),
+            ("A4 Drafting (1754 × 2480)", CGSize(width: 1754, height: 2480)),
+            ("Square (2048 × 2048)", CGSize(width: 2048, height: 2048)),
+            ("Wide 16:9 (2560 × 1440)", CGSize(width: 2560, height: 1440))
+        ]
+        let current = canvas.paperSize
+        let actions = sizes.map { name, size in
+            let isCurrent = (abs(current.width - size.width) < 1.0 && abs(current.height - size.height) < 1.0)
+            return UIAction(title: name, state: isCurrent ? .on : .off) { [weak self] _ in
+                guard let self else { return }
+                self.canvas.paperSize = size
+                self.canvas.resetView()
+                self.showToast("Paper: \(name)")
+                self.paperSizeButton?.menu = self.createPaperSizeMenu()
+                HapticFeedbackService.shared.toolSwitched()
+            }
+        }
+        return UIMenu(title: "Paper Size", children: actions)
     }
 
     private func configureBucketSubToolBar() {
@@ -889,12 +1137,12 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             canvasLeftAnchor = toolRail.trailingAnchor
         }
 
-        undoRedoLeadingConstraint?.isActive = false
+        topToolBarLeadingConstraint?.isActive = false
         bucketSubToolBarLeadingConstraint?.isActive = false
         brushSubToolBarLeadingConstraint?.isActive = false
 
-        undoRedoLeadingConstraint = undoRedoChip.leadingAnchor.constraint(equalTo: canvasLeftAnchor, constant: 12)
-        undoRedoLeadingConstraint?.isActive = true
+        topToolBarLeadingConstraint = topToolBar.leadingAnchor.constraint(equalTo: canvasLeftAnchor, constant: 10)
+        topToolBarLeadingConstraint?.isActive = true
 
         bucketSubToolBarLeadingConstraint = bucketSubToolBar.leadingAnchor.constraint(equalTo: canvasLeftAnchor, constant: 12)
         bucketSubToolBarLeadingConstraint?.isActive = true
@@ -987,60 +1235,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         stack.addArrangedSubview(mainMenuButton)
         stack.addArrangedSubview(railRule())
 
-        // Primitive Color Selector & Pen Colors
-        colorSwatchButton = railToolButton(systemName: "circle.fill", label: "Color", action: #selector(openColorPickerDirect))
-        refreshColorSwatch()
-        stack.addArrangedSubview(colorSwatchButton)
-
-        // MY SLOTS (4 user-assignable color slots: tap to pick, long-press to pin active color)
-        stack.addArrangedSubview(railTitle("SLOTS"))
-        stack.addArrangedSubview(createSlotsGrid())
-        refreshMySlotsRail()
-
-        stack.addArrangedSubview(railTitle("PALETTE"))
-        let paletteGrid = UIStackView()
-        paletteGrid.axis = .vertical
-        paletteGrid.spacing = 3
-        paletteGrid.alignment = .center
-
-        let quickColors: [(UInt32, String)] = [
-            (0x000000FF, "Black"), (0x2B2926FF, "Ink"),
-            (0xB5482EFF, "Red"),   (0x2A5D8FFF, "Blue"),
-            (0x3D5E26FF, "Green"), (0xC8A030FF, "Amber"),
-            (0x7A7368FF, "Gray"),  (0xFFFFFFFF, "White")
-        ]
-        for r in 0..<4 {
-            let rowStack = UIStackView()
-            rowStack.axis = .horizontal
-            rowStack.spacing = 4
-            rowStack.alignment = .center
-            for c in 0..<2 {
-                let idx = r * 2 + c
-                let (rgba, name) = quickColors[idx]
-                let btn = UIButton(type: .custom)
-                btn.translatesAutoresizingMaskIntoConstraints = false
-                btn.widthAnchor.constraint(equalToConstant: 18).isActive = true
-                btn.heightAnchor.constraint(equalToConstant: 18).isActive = true
-                btn.layer.cornerRadius = 9
-                btn.backgroundColor = UIColor(
-                    red: CGFloat((rgba >> 24) & 0xff) / 255.0,
-                    green: CGFloat((rgba >> 16) & 0xff) / 255.0,
-                    blue: CGFloat((rgba >> 8) & 0xff) / 255.0,
-                    alpha: 1.0
-                )
-                btn.layer.borderWidth = 1.0
-                btn.layer.borderColor = UIColor(red: 0.35, green: 0.30, blue: 0.22, alpha: 0.35).cgColor
-                btn.accessibilityLabel = name
-                btn.addAction(UIAction { [weak self] _ in
-                    self?.applyQuickColor(rgba)
-                }, for: .touchUpInside)
-                rowStack.addArrangedSubview(btn)
-            }
-            paletteGrid.addArrangedSubview(rowStack)
-        }
-        stack.addArrangedSubview(paletteGrid)
-        stack.addArrangedSubview(railRule())
-
         brushButton = railToolButton(systemName: "pencil.tip", label: "Brush", action: #selector(selectBrush))
         eraserButton = railToolButton(systemName: "eraser", label: "Eraser", action: #selector(selectEraser))
         bucketButton = railToolButton(systemName: "drop.fill", label: "Bucket", action: #selector(selectBucket))
@@ -1084,47 +1278,6 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
         ])
         updateRailToggleButtons()
-    }
-
-    private func createSlotsGrid() -> UIView {
-        let grid = UIStackView()
-        grid.axis = .vertical
-        grid.spacing = 3
-        grid.alignment = .center
-
-        slotButtons.removeAll()
-
-        for r in 0..<2 {
-            let rowStack = UIStackView()
-            rowStack.axis = .horizontal
-            rowStack.spacing = 4
-            rowStack.alignment = .center
-            for c in 0..<2 {
-                let index = r * 2 + c
-                let btn = UIButton(type: .custom)
-                btn.translatesAutoresizingMaskIntoConstraints = false
-                btn.widthAnchor.constraint(equalToConstant: 18).isActive = true
-                btn.heightAnchor.constraint(equalToConstant: 18).isActive = true
-                btn.layer.cornerRadius = 9
-                btn.layer.borderWidth = 1.0
-                btn.layer.borderColor = DraftingTheme.rule.cgColor
-                btn.tag = index
-                btn.accessibilityLabel = "Slot \(index + 1)"
-
-                btn.addAction(UIAction { [weak self] _ in
-                    self?.selectSlot(at: index)
-                }, for: .touchUpInside)
-
-                let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleSlotLongPress(_:)))
-                longPress.minimumPressDuration = 0.35
-                btn.addGestureRecognizer(longPress)
-
-                slotButtons.append(btn)
-                rowStack.addArrangedSubview(btn)
-            }
-            grid.addArrangedSubview(rowStack)
-        }
-        return grid
     }
 
     private func loadSlots() -> [Int] {
@@ -1565,16 +1718,31 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func refreshBrushSubToolBar() {
-        guard brushSizeSlider != nil else { return }
         let size = canvas.engineBridge.brushSize
         let opacity = canvas.engineBridge.brushOpacity
         let hardness = canvas.engineBridge.brushHardness
-        brushSizeSlider.value = Float(size)
-        brushSizeLabel.text = String(format: "SIZE: %.1f pt", size)
-        brushOpacitySlider.value = Float(opacity)
-        brushOpacityLabel.text = String(format: "OPACITY: %d%%", Int(opacity * 100))
-        brushHardnessSlider.value = Float(hardness)
-        brushHardnessLabel.text = String(format: "HARDNESS: %d%%", Int(hardness * 100))
+
+        if let brushSizeSlider, let brushSizeLabel {
+            brushSizeSlider.value = Float(size)
+            brushSizeLabel.text = String(format: "SIZE: %.1f pt", size)
+        }
+        if let brushOpacitySlider, let brushOpacityLabel {
+            brushOpacitySlider.value = Float(opacity)
+            brushOpacityLabel.text = String(format: "OPACITY: %d%%", Int(opacity * 100))
+        }
+        if let brushHardnessSlider, let brushHardnessLabel {
+            brushHardnessSlider.value = Float(hardness)
+            brushHardnessLabel.text = String(format: "HARDNESS: %d%%", Int(hardness * 100))
+        }
+
+        if let topBrushSizeSlider, let topBrushSizeLabel {
+            topBrushSizeSlider.value = Float(size)
+            topBrushSizeLabel.text = String(format: "%.1f pt", size)
+        }
+        if let topBrushOpacitySlider, let topBrushOpacityLabel {
+            topBrushOpacitySlider.value = Float(opacity)
+            topBrushOpacityLabel.text = String(format: "%d%%", Int(opacity * 100))
+        }
     }
 
     private func updateUndoRedoState() {

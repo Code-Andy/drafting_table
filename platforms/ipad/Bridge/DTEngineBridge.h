@@ -98,6 +98,7 @@ typedef NS_ENUM(uint8_t, DTTool) {
 @property(nonatomic) CGFloat brushHardness;
 @property(nonatomic, readonly) BOOL canUndo;
 @property(nonatomic, readonly) BOOL canRedo;
+@property(nonatomic, readonly) BOOL isStrokeInProgress;
 @property(nonatomic, readonly) NSArray<DTPageInfo *> *pageInfos;
 @property(nonatomic, readonly) NSArray<DTLayerInfo *> *layerInfos;
 
