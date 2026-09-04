@@ -91,6 +91,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private var selectButton: UIButton!
     private var lassoButton: UIButton!
     private var colorSwatchButton: UIButton!
+    private var slotButtons: [UIButton] = []
     private var undoButton: UIButton!
     private var redoButton: UIButton!
     private var clearButton: UIButton!
@@ -237,13 +238,13 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         // the beige launch screen and the first committed frame.
         NSLog("DraftingTable launch: viewDidLoad, deferring restore")
         applyStoredSettings()
-        refreshRails(); updateToolSelection(); updateUndoRedoState()
+        refreshRails(); updateToolSelection(); updateUndoRedoState(); refreshMySlotsRail()
         updateLaunchBreadcrumb(stage: "viewDidLoad")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             NSLog("DraftingTable launch: deferred restore begin")
             self.restoreDocument()
-            self.refreshRails(); self.updateToolSelection(); self.updateUndoRedoState()
+            self.refreshRails(); self.updateToolSelection(); self.updateUndoRedoState(); self.refreshMySlotsRail()
             self.canvas.setNeedsDisplay()
             NSLog("DraftingTable launch: deferred restore done strokes=%lu",
                   UInt(self.canvas.engineBridge.strokeCount))
@@ -369,8 +370,17 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private func presentColorPicker(sourceView: UIView? = nil) {
         let picker = ColorPickerViewController()
         picker.initialColorRGBA = canvas.engineBridge.brushColorRGBA
-        picker.onColorChanged = { [weak self] packed in self?.applyBrushColor(packed) }
-        picker.onColorPicked = { [weak self] packed in self?.applyBrushColor(packed) }
+        picker.onColorChanged = { [weak self] packed in
+            self?.applyBrushColor(packed)
+            self?.refreshMySlotsRail()
+        }
+        picker.onColorPicked = { [weak self] packed in
+            self?.applyBrushColor(packed)
+            self?.refreshMySlotsRail()
+        }
+        picker.onDismiss = { [weak self] in
+            self?.refreshMySlotsRail()
+        }
         picker.onEyedropperRequested = { [weak self] in
             self?.dismiss(animated: true)
             self?.showToast("Eyedropper needs the tile sampler (M2)")
@@ -383,8 +393,8 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             popover.sourceRect = anchor?.bounds ?? .zero
             popover.permittedArrowDirections = [.left, .up]
         }
-        navigation.preferredContentSize = CGSize(width: 320, height: 500)
-        picker.preferredContentSize = CGSize(width: 320, height: 500)
+        navigation.preferredContentSize = CGSize(width: 360, height: 580)
+        picker.preferredContentSize = CGSize(width: 360, height: 580)
         present(navigation, animated: true)
     }
 
@@ -507,6 +517,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             self.documentDidChange()
         }
         layersRail.onAdd = { [weak self] in self?.addLayer() }
+        layersRail.onAddVector = { [weak self] in self?.addVectorLayer() }
         layersRail.onRename = { [weak self] index in self?.renameLayer(at: index) }
         layersRail.onDelete = { [weak self] index in self?.deleteLayer(at: index) }
         layersRail.onDuplicate = { [weak self] index in self?.duplicateLayer(at: index) }
@@ -577,7 +588,14 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     }
 
     private func addLayer() {
-        canvas.engineBridge.addLayer()
+        let count = canvas.engineBridge.layerInfos.count + 1
+        _ = canvas.engineBridge.addLayer(withName: "Raster \(count)")
+        documentDidChange()
+    }
+
+    private func addVectorLayer() {
+        let count = canvas.engineBridge.layerInfos.count + 1
+        _ = canvas.engineBridge.addLayer(withName: "Vector \(count)")
         documentDidChange()
     }
 
@@ -896,6 +914,7 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
     private func applyQuickColor(_ rgba: UInt32) {
         canvas.engineBridge.brushColorRGBA = rgba
         UserDefaults.standard.set(Int(rgba), forKey: DrawingSettingsViewController.brushColorKey)
+        saveDocument()
         refreshColorSwatch()
         HapticFeedbackService.shared.toolSwitched()
     }
@@ -973,6 +992,12 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
         refreshColorSwatch()
         stack.addArrangedSubview(colorSwatchButton)
 
+        // MY SLOTS (4 user-assignable color slots: tap to pick, long-press to pin active color)
+        stack.addArrangedSubview(railTitle("SLOTS"))
+        stack.addArrangedSubview(createSlotsGrid())
+        refreshMySlotsRail()
+
+        stack.addArrangedSubview(railTitle("PALETTE"))
         let paletteGrid = UIStackView()
         paletteGrid.axis = .vertical
         paletteGrid.spacing = 3
@@ -1059,6 +1084,105 @@ final class DraftingTableViewController: UIViewController, UIDocumentPickerDeleg
             stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
         ])
         updateRailToggleButtons()
+    }
+
+    private func createSlotsGrid() -> UIView {
+        let grid = UIStackView()
+        grid.axis = .vertical
+        grid.spacing = 3
+        grid.alignment = .center
+
+        slotButtons.removeAll()
+
+        for r in 0..<2 {
+            let rowStack = UIStackView()
+            rowStack.axis = .horizontal
+            rowStack.spacing = 4
+            rowStack.alignment = .center
+            for c in 0..<2 {
+                let index = r * 2 + c
+                let btn = UIButton(type: .custom)
+                btn.translatesAutoresizingMaskIntoConstraints = false
+                btn.widthAnchor.constraint(equalToConstant: 18).isActive = true
+                btn.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                btn.layer.cornerRadius = 9
+                btn.layer.borderWidth = 1.0
+                btn.layer.borderColor = DraftingTheme.rule.cgColor
+                btn.tag = index
+                btn.accessibilityLabel = "Slot \(index + 1)"
+
+                btn.addAction(UIAction { [weak self] _ in
+                    self?.selectSlot(at: index)
+                }, for: .touchUpInside)
+
+                let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleSlotLongPress(_:)))
+                longPress.minimumPressDuration = 0.35
+                btn.addGestureRecognizer(longPress)
+
+                slotButtons.append(btn)
+                rowStack.addArrangedSubview(btn)
+            }
+            grid.addArrangedSubview(rowStack)
+        }
+        return grid
+    }
+
+    private func loadSlots() -> [Int] {
+        (UserDefaults.standard.array(forKey: ColorPickerViewController.slotsKey) as? [Int]) ?? []
+    }
+
+    private func refreshMySlotsRail() {
+        let slots = loadSlots()
+        for (index, btn) in slotButtons.enumerated() {
+            let stored = index < slots.count ? slots[index] : -1
+            if stored >= 0 {
+                let color = ColorPickerViewController.uiColor(rgb: UInt32(stored))
+                btn.backgroundColor = color
+                btn.setTitle(nil, for: .normal)
+                btn.layer.borderWidth = 1.0
+                btn.layer.borderColor = UIColor(red: 0.35, green: 0.30, blue: 0.22, alpha: 0.45).cgColor
+                btn.accessibilityLabel = "My slot \(index + 1): configured"
+            } else {
+                btn.backgroundColor = DraftingTheme.paper.withAlphaComponent(0.6)
+                btn.setTitle("+", for: .normal)
+                btn.setTitleColor(DraftingTheme.inkSoft.withAlphaComponent(0.6), for: .normal)
+                btn.titleLabel?.font = .systemFont(ofSize: 10, weight: .bold)
+                btn.layer.borderWidth = 1.0
+                btn.layer.borderColor = DraftingTheme.rule.cgColor
+                btn.accessibilityLabel = "My slot \(index + 1): empty"
+            }
+        }
+    }
+
+    private func selectSlot(at index: Int) {
+        let slots = loadSlots()
+        if index < slots.count && slots[index] >= 0 {
+            let rgb = UInt32(slots[index])
+            let packed = (rgb << 8) | 0xFF
+            applyBrushColor(packed)
+            showToast("Selected Slot \(index + 1)")
+            HapticFeedbackService.shared.toolSwitched()
+        } else {
+            saveSlot(at: index)
+        }
+    }
+
+    @objc private func handleSlotLongPress(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began, let btn = gesture.view as? UIButton else { return }
+        saveSlot(at: btn.tag)
+    }
+
+    private func saveSlot(at index: Int) {
+        guard index >= 0 && index < 4 else { return }
+        var slots = loadSlots()
+        while slots.count < 4 { slots.append(-1) }
+        let currentPacked = canvas.engineBridge.brushColorRGBA
+        let rgb = Int((currentPacked >> 8) & 0xFFFFFF)
+        slots[index] = rgb
+        UserDefaults.standard.set(slots, forKey: ColorPickerViewController.slotsKey)
+        refreshMySlotsRail()
+        HapticFeedbackService.shared.success()
+        showToast("Saved active color to Slot \(index + 1)")
     }
 
     @objc private func togglePagesRail() {

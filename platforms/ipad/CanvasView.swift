@@ -450,6 +450,9 @@ final class CanvasView: MTKView, UIPencilInteractionDelegate, UIGestureRecognize
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let active = activeTouch, active.phase == .ended || active.phase == .cancelled {
+            activeTouch = nil
+        }
         guard activeTouch == nil, let touch = touches.first(where: accepts) else { return }
         lastTouchPoint = touch.preciseLocation(in: self)
         activeTouch = touch

@@ -29,6 +29,7 @@ final class ColorPickerViewController: UIViewController {
     var onColorChanged: ((UInt32) -> Void)?
     var onColorPicked: ((UInt32) -> Void)?
     var onEyedropperRequested: (() -> Void)?
+    var onDismiss: (() -> Void)?
 
     private var hue: CGFloat = 0
     private var saturation: CGFloat = 0
@@ -54,6 +55,11 @@ final class ColorPickerViewController: UIViewController {
         adopt(color: previousColor)
         buildLayout()
         refreshAll()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        onDismiss?()
     }
 
     private func adopt(color: UIColor) {
@@ -167,15 +173,15 @@ final class ColorPickerViewController: UIViewController {
     private func paletteGrid() -> UIView {
         let grid = UIStackView()
         grid.axis = .vertical
-        grid.spacing = 8
+        grid.spacing = 6
         for row in 0..<4 {
             let rowStack = UIStackView()
             rowStack.axis = .horizontal
-            rowStack.spacing = 8
+            rowStack.spacing = 6
             rowStack.distribution = .fillEqually
             for col in 0..<8 {
                 let rgb = Self.defaultPalette[row * 8 + col]
-                let button = swatchButton(color: Self.uiColor(rgb: rgb), size: 34)
+                let button = swatchButton(color: Self.uiColor(rgb: rgb), size: 32)
                 button.addTarget(self, action: #selector(paletteTapped(_:)), for: .touchUpInside)
                 button.tag = Int(rgb)
                 rowStack.addArrangedSubview(button)
@@ -192,6 +198,7 @@ final class ColorPickerViewController: UIViewController {
         button.layer.borderWidth = 1
         button.layer.borderColor = UIColor.black.withAlphaComponent(0.15).cgColor
         button.heightAnchor.constraint(equalToConstant: size).isActive = true
+        button.widthAnchor.constraint(equalTo: button.heightAnchor).isActive = true
         button.accessibilityLabel = "Color swatch"
         return button
     }
@@ -280,6 +287,7 @@ final class ColorPickerViewController: UIViewController {
                 button.layer.borderWidth = 1
                 button.layer.borderColor = UIColor.black.withAlphaComponent(0.15).cgColor
                 button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+                button.widthAnchor.constraint(equalToConstant: 30).isActive = true
             }
             button.accessibilityLabel = "My color slot \(index + 1)"
             button.accessibilityIdentifier = "slot-\(index)"

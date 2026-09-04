@@ -463,6 +463,7 @@ typedef struct {
 }
 
 - (void)drawInMTKView:(MTKView *)view {
+    @autoreleasepool {
     self.frameCount += 1;
     // v0.7.2: never block launch on a zero-size first layout and never let
     // one pathological retained document exhaust the device heap in a single
@@ -604,12 +605,15 @@ typedef struct {
         NSLog(@"DraftingTable snapshot failed: %@", exception);
         strokes = @[];
     }
-    // Hard per-frame ceiling so one huge retained document degrades to a
-    // partial frame instead of an OOM/watchdog kill after the launch screen.
-    size_t frameVertexBudget = 220000;
+    // Per-frame ceiling scaled for modern Metal workloads.
+    // The active in-progress stroke is always guaranteed to render so the pen never drops input.
+    size_t frameVertexBudget = 5000000;
     size_t frameVerticesUsed = 0;
-    for (DTRenderStroke *stroke in strokes) {
-        if (frameVerticesUsed >= frameVertexBudget) break;
+    const size_t totalStrokeCount = strokes.count;
+    for (size_t sIdx = 0; sIdx < totalStrokeCount; ++sIdx) {
+        DTRenderStroke *stroke = strokes[sIdx];
+        const BOOL isLastStroke = (sIdx + 1 == totalStrokeCount);
+        if (frameVerticesUsed >= frameVertexBudget && !isLastStroke) break;
         NSArray<NSValue *> *strokeValues = stroke.points;
         if (strokeValues.count == 0) continue;
         const uint32_t tool = static_cast<uint32_t>(stroke.tool);
@@ -699,7 +703,7 @@ typedef struct {
         const float fringeRadiusScale = 1.08f + 0.24f * (1.0f - hardness);
         const float fringeOpacity = opacity * (0.12f + 0.30f * (1.0f - hardness));
         for (int pass = 0; pass < (eraser ? 1 : 2); ++pass) {
-            if (frameVerticesUsed >= frameVertexBudget) break;
+            if (frameVerticesUsed >= frameVertexBudget && !isLastStroke) break;
             const bool fringe = pass == 0 && !eraser;
             const float passScale = fringe ? fringeRadiusScale : 1.0f;
             const float passOpacity = fringe ? fringeOpacity : opacity;
@@ -795,6 +799,7 @@ typedef struct {
     [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
+    }
 }
 
 @end

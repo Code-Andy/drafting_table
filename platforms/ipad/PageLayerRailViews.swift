@@ -178,6 +178,7 @@ private final class PageCardButton: UIButton {
 final class LayersRailView: UIView {
     var onSelect: ((Int) -> Void)?
     var onAdd: (() -> Void)?
+    var onAddVector: (() -> Void)?
     var onRename: ((Int) -> Void)?
     var onDelete: ((Int) -> Void)?
     var onDuplicate: ((Int) -> Void)?
@@ -241,28 +242,114 @@ final class LayersRailView: UIView {
         return label
     }
 
+    private var rowViews: [LayerRowView] = []
+    private var draggedRow: LayerRowView?
+    private var dragInitialNativeIndex: Int = -1
+    private var dragCurrentTargetNativeIndex: Int = -1
+
+    private func handleLayerDrag(pan: UIPanGestureRecognizer, row: LayerRowView) {
+        switch pan.state {
+        case .began:
+            draggedRow = row
+            dragInitialNativeIndex = Int(row.info.index)
+            dragCurrentTargetNativeIndex = dragInitialNativeIndex
+            scroll.isScrollEnabled = false
+            stack.bringSubviewToFront(row)
+            row.layer.zPosition = 50
+            UIView.animate(withDuration: 0.15) {
+                row.transform = CGAffineTransform(scaleX: 1.02, y: 1.02)
+                row.layer.shadowOpacity = 0.20
+                row.layer.shadowRadius = 5
+                row.layer.shadowOffset = CGSize(width: 0, height: 2)
+            }
+            HapticFeedbackService.shared.toolSwitched()
+        case .changed:
+            let translation = pan.translation(in: stack)
+            row.transform = CGAffineTransform(translationX: 0, y: translation.y).scaledBy(x: 1.02, y: 1.02)
+            let slotHeight: CGFloat = 33.0
+            let slotDelta = Int(round(translation.y / slotHeight))
+            let count = layerInfos.count
+            let targetNative = max(0, min(count - 1, dragInitialNativeIndex - slotDelta))
+            if targetNative != dragCurrentTargetNativeIndex {
+                dragCurrentTargetNativeIndex = targetNative
+                UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
+                    for other in self.rowViews where other !== row {
+                        let otherNative = Int(other.info.index)
+                        if self.dragInitialNativeIndex < targetNative {
+                            if otherNative > self.dragInitialNativeIndex && otherNative <= targetNative {
+                                other.transform = CGAffineTransform(translationX: 0, y: slotHeight)
+                            } else {
+                                other.transform = .identity
+                            }
+                        } else if self.dragInitialNativeIndex > targetNative {
+                            if otherNative < self.dragInitialNativeIndex && otherNative >= targetNative {
+                                other.transform = CGAffineTransform(translationX: 0, y: -slotHeight)
+                            } else {
+                                other.transform = .identity
+                            }
+                        } else {
+                            other.transform = .identity
+                        }
+                    }
+                }
+            }
+        case .ended, .cancelled:
+            scroll.isScrollEnabled = true
+            let finalTarget = dragCurrentTargetNativeIndex
+            let initial = dragInitialNativeIndex
+            UIView.animate(withDuration: 0.18, animations: {
+                self.rowViews.forEach { $0.transform = .identity }
+                row.layer.shadowOpacity = 0
+            }) { _ in
+                row.layer.zPosition = 0
+                if finalTarget != initial && finalTarget >= 0 {
+                    self.onMove?(initial, finalTarget)
+                    HapticFeedbackService.shared.toolSwitched()
+                }
+            }
+            draggedRow = nil
+        default:
+            break
+        }
+    }
+
     private func reload() {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        rowViews.removeAll()
 
         let headerRow = UIStackView()
         headerRow.axis = .horizontal
         headerRow.alignment = .center
         headerRow.distribution = .fill
-        headerRow.spacing = 4
+        headerRow.spacing = 3
 
         let lbl = titleLabel("LAYERS")
+        lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
         headerRow.addArrangedSubview(lbl)
 
-        let addBtn = UIButton(type: .system)
-        let addCfg = UIImage.SymbolConfiguration(pointSize: 11, weight: .bold)
-        addBtn.setImage(UIImage(systemName: "plus", withConfiguration: addCfg), for: .normal)
-        addBtn.tintColor = .systemBlue
-        addBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.08)
-        addBtn.layer.cornerRadius = 4
-        addBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
-        addBtn.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        addBtn.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
-        headerRow.addArrangedSubview(addBtn)
+        let addRasterBtn = UIButton(type: .system)
+        let addCfg = UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+        addRasterBtn.setImage(UIImage(systemName: "plus", withConfiguration: addCfg), for: .normal)
+        addRasterBtn.tintColor = UIColor(red: 0.25, green: 0.22, blue: 0.18, alpha: 1)
+        addRasterBtn.backgroundColor = UIColor.black.withAlphaComponent(0.06)
+        addRasterBtn.layer.cornerRadius = 4
+        addRasterBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        addRasterBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        addRasterBtn.accessibilityLabel = "Add raster layer"
+        addRasterBtn.addAction(UIAction { [weak self] _ in self?.onAdd?() }, for: .touchUpInside)
+        headerRow.addArrangedSubview(addRasterBtn)
+
+        let addVectorBtn = UIButton(type: .system)
+        addVectorBtn.setTitle("+V", for: .normal)
+        addVectorBtn.titleLabel?.font = .systemFont(ofSize: 9, weight: .bold)
+        addVectorBtn.tintColor = .systemBlue
+        addVectorBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.09)
+        addVectorBtn.layer.cornerRadius = 4
+        addVectorBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        addVectorBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        addVectorBtn.accessibilityLabel = "Add vector layer"
+        addVectorBtn.addAction(UIAction { [weak self] _ in self?.onAddVector?() }, for: .touchUpInside)
+        headerRow.addArrangedSubview(addVectorBtn)
 
         stack.addArrangedSubview(headerRow)
 
@@ -280,6 +367,8 @@ final class LayersRailView: UIView {
             row.onDuplicate = { [weak self] in self?.onDuplicate?(Int(info.index)) }
             row.onMove = { [weak self] offset in self?.onMove?(Int(info.index), Int(info.index) + offset) }
             row.onVisibility = { [weak self] visible in self?.onVisibility?(visible, Int(info.index)) }
+            row.onDragReorder = { [weak self] pan, r in self?.handleLayerDrag(pan: pan, row: r) }
+            rowViews.append(row)
             stack.addArrangedSubview(row)
         }
 
@@ -338,14 +427,15 @@ final class LayersRailView: UIView {
     }
 }
 
-private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
+private final class LayerRowView: UIView, UIContextMenuInteractionDelegate, UIGestureRecognizerDelegate {
     var onSelect: (() -> Void)?
     var onRename: (() -> Void)?
     var onDelete: (() -> Void)?
     var onDuplicate: (() -> Void)?
     var onMove: ((Int) -> Void)?
     var onVisibility: ((Bool) -> Void)?
-    private let info: DTLayerInfo
+    var onDragReorder: ((UIPanGestureRecognizer, LayerRowView) -> Void)?
+    let info: DTLayerInfo
     private let canDelete: Bool
     private let canMoveUp: Bool
     private let canMoveDown: Bool
@@ -353,6 +443,13 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
     private let opacityLabel = UILabel()
     private let visibilityButton = UIButton(type: .system)
     private let accentBar = UIView()
+    private let typeBadge = UILabel()
+    private let dragHandle = UIImageView()
+    private lazy var panGesture: UIPanGestureRecognizer = {
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.delegate = self
+        return pan
+    }()
 
     init(info: DTLayerInfo, canDelete: Bool, canMoveUp: Bool, canMoveDown: Bool) {
         self.info = info
@@ -361,6 +458,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
         self.canMoveDown = canMoveDown
         super.init(frame: .zero)
 
+        let isVector = info.name.lowercased().contains("vector")
         backgroundColor = info.selected ? UIColor.systemBlue.withAlphaComponent(0.12) : UIColor.white.withAlphaComponent(0.65)
         layer.cornerRadius = 5
         layer.borderWidth = info.selected ? 1.5 : 1
@@ -372,7 +470,7 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
         accentBar.translatesAutoresizingMaskIntoConstraints = false
         addSubview(accentBar)
 
-        let eyeCfg = UIImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+        let eyeCfg = UIImage.SymbolConfiguration(pointSize: 10, weight: .medium)
         visibilityButton.setImage(UIImage(systemName: info.visible ? "eye.fill" : "eye.slash", withConfiguration: eyeCfg), for: .normal)
         visibilityButton.tintColor = info.visible ? UIColor(red: 0.22, green: 0.19, blue: 0.15, alpha: 1) : .tertiaryLabel
         visibilityButton.accessibilityLabel = info.visible ? "Hide layer" : "Show layer"
@@ -382,6 +480,16 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
             self.onVisibility?(!self.info.visible)
         }, for: .touchUpInside)
         addSubview(visibilityButton)
+
+        typeBadge.text = isVector ? "V" : "R"
+        typeBadge.font = .systemFont(ofSize: 7.5, weight: .bold)
+        typeBadge.textColor = isVector ? .systemBlue : UIColor(red: 0.38, green: 0.33, blue: 0.27, alpha: 0.8)
+        typeBadge.backgroundColor = isVector ? UIColor.systemBlue.withAlphaComponent(0.12) : UIColor.black.withAlphaComponent(0.06)
+        typeBadge.textAlignment = .center
+        typeBadge.layer.cornerRadius = 2.5
+        typeBadge.layer.masksToBounds = true
+        typeBadge.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(typeBadge)
 
         nameLabel.text = info.name
         nameLabel.font = .systemFont(ofSize: 9.5, weight: info.selected ? .bold : .regular)
@@ -397,35 +505,61 @@ private final class LayerRowView: UIView, UIContextMenuInteractionDelegate {
         opacityLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(opacityLabel)
 
+        let dragCfg = UIImage.SymbolConfiguration(pointSize: 8.5, weight: .regular)
+        dragHandle.image = UIImage(systemName: "line.3.horizontal", withConfiguration: dragCfg)
+        dragHandle.tintColor = UIColor.black.withAlphaComponent(0.25)
+        dragHandle.contentMode = .center
+        dragHandle.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dragHandle)
+
         NSLayoutConstraint.activate([
             accentBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
             accentBar.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             accentBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
             accentBar.widthAnchor.constraint(equalToConstant: 2.5),
 
-            visibilityButton.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 3),
+            visibilityButton.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 2),
             visibilityButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            visibilityButton.widthAnchor.constraint(equalToConstant: 20),
-            visibilityButton.heightAnchor.constraint(equalToConstant: 20),
+            visibilityButton.widthAnchor.constraint(equalToConstant: 18),
+            visibilityButton.heightAnchor.constraint(equalToConstant: 18),
 
-            nameLabel.leadingAnchor.constraint(equalTo: visibilityButton.trailingAnchor, constant: 3),
+            typeBadge.leadingAnchor.constraint(equalTo: visibilityButton.trailingAnchor, constant: 2),
+            typeBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            typeBadge.widthAnchor.constraint(equalToConstant: 13),
+            typeBadge.heightAnchor.constraint(equalToConstant: 13),
+
+            nameLabel.leadingAnchor.constraint(equalTo: typeBadge.trailingAnchor, constant: 2),
             nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: opacityLabel.leadingAnchor, constant: -2),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            opacityLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            opacityLabel.trailingAnchor.constraint(equalTo: dragHandle.leadingAnchor, constant: -2),
             opacityLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 26)
+            opacityLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 22),
+
+            dragHandle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+            dragHandle.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dragHandle.widthAnchor.constraint(equalToConstant: 12),
+            dragHandle.heightAnchor.constraint(equalToConstant: 12)
         ])
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(selected)))
+        addGestureRecognizer(panGesture)
         addInteraction(UIContextMenuInteraction(delegate: self))
-        accessibilityLabel = "Layer \(info.name)"
+        accessibilityLabel = "\(isVector ? "Vector" : "Raster") layer \(info.name)"
         accessibilityValue = "\(info.visible ? "Visible" : "Hidden"), \(opacityLabel.text ?? "")"
         accessibilityTraits = info.selected ? [.button, .selected] : [.button]
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     @objc private func selected() { onSelect?() }
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) { onDragReorder?(gesture, self) }
+
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === panGesture else { return true }
+        guard canMoveUp || canMoveDown else { return false }
+        let velocity = panGesture.velocity(in: self)
+        return abs(velocity.y) > abs(velocity.x) && abs(velocity.y) > 10
+    }
 
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
