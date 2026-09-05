@@ -25,8 +25,8 @@ The inspected upstream source is commit
 * `MainActivity.kt` lines 2418–2527 — status bar and status chip spacing.
 * `app/src/main/res/drawable/ic_*.xml` — the 24×24 VectorDrawable icon paths.
 
-`design/reference/ui-tokens.json` is the machine-readable token snapshot.
-`design/reference/concept-a-v4-component-sheet.svg` is an importable visual
+`design/guides/ui-tokens.json` is the machine-readable token snapshot.
+`design/guides/concept-a-v4-component-sheet.svg` is an importable visual
 reference for Figma.  In Figma, choose **File → Import**, select that SVG, and
 use the labeled component groups as the baseline for screenshots or UI review.
 The sheet includes portrait and landscape iPad frames plus the tool tile, page
@@ -111,4 +111,3 @@ recorded rather than silently “fixing” the upstream source.
 The original repository has no redistribution license.  This port is intended
 for the owner's personal sideloading workflow; no App Store/TestFlight
 distribution or third-party asset redistribution is implied.
-

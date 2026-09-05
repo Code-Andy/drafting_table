@@ -37,8 +37,8 @@ handoffs belong here.
    — visible color tool, smooth six-slice joins, live grid snap for shapes.
 6. [2026-09-03-v0.9.0-prerelease.md](2026-09-03-v0.9.0-prerelease.md)
    — stroke de-dotting, HSV color picker, background page thumbnails.
-7. [2026-09-03-ui-parity-with-original.md](2026-09-03-ui-parity-with-original.md)
-   — original DRAW / SHAPE / SELECT tool rail, bottom status chips, Circle tool.
+7. [`../design/guides/ui-parity-history.md`](../design/guides/ui-parity-history.md)
+   — historical parity record for the original tool rail, status chips, and Circle tool.
 8. [2026-09-03-v0.7.2-launch-watchdog-fix.md](2026-09-03-v0.7.2-launch-watchdog-fix.md)
    — proven ODR namespace fix, on-demand rendering, vertex budget, breadcrumbs.
 9. [2026-09-02-v0.7.1-launch-crash-hotfix.md](2026-09-02-v0.7.1-launch-crash-hotfix.md)
@@ -66,6 +66,8 @@ handoffs belong here.
 
 ## Other source-of-truth documents
 
+- [`../design/guides/README.md`](../design/guides/README.md): canonical visual
+  reference, design tokens, component sheet, browser preview, and UI contract.
 - [`../CLAUDE.md`](../CLAUDE.md): original Android architecture and invariants.
 - [`../IOS_PORT.md`](../IOS_PORT.md): consolidated iPad implementation status.
 - [`../FEATURE_ROADMAP.md`](../FEATURE_ROADMAP.md): milestone dependency graph.
