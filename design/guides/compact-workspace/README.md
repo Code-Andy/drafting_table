@@ -1,65 +1,48 @@
-# Compact workspace · study 02
+# Canvas-first workspace · study 03
 
-Status: **design proposal for review, 2026-09-05**. This is a UI framework and
-interactive visual aid, not an implemented iPad release. It responds to the
-owner's request to design all panels before changing the native app.
+The current design prioritizes drawing space: one thin header, direct tool
+access, anchored left tool windows, a partially exposed corner color wheel,
+and compact Layers/Pages on the right. The second toolbar and bottom status
+strip are removed.
 
-Open [`workspace-preview.html`](workspace-preview.html) in a browser. Its
-editable source is [`workspace-preview.fragment.html`](workspace-preview.fragment.html).
-The preview runs locally; edits disappear when the page reloads. The same
-sample illustration represents every document. No Pencil, file, or renderer
-operation is claimed to work here.
+Open [workspace-preview.html](workspace-preview.html) in a browser.
+The editable source is [workspace-preview.fragment.html](workspace-preview.fragment.html).
+Read [design-spec.md](design-spec.md), [tokens.json](tokens.json), and
+[review-notes.md](review-notes.md) for the current contract and review evidence.
+The supplied visual reference is preserved as
+[palette-wheel-reference.png](palette-wheel-reference.png).
 
-Read [`design-spec.md`](design-spec.md) for the layout decisions, complete
-panel and option inventory, interaction contracts, and implementation order.
-[`tokens.json`](tokens.json) defines the proposed sizes and surface colors.
+## Try the changes
 
-## Explore
+1. Click a tool's small bottom-right arrow. Its settings window opens beside
+   the rail. Tapping the active tool again opens/closes the same window.
+2. Pin the tool window to keep it following tool changes; close it when you
+   want the page unobstructed.
+3. Rotate the bottom-left color arc by dragging, scrolling, or using its
+   arrows. Choose a base or lighter shade.
+4. Press the wheel center to switch to **My colors**. Pick a slot, adjust the
+   hue ring / saturation square or enter hex, then **Replace slot**. Press the
+   center again to return to RGB/Marker.
+5. Use Layers/Pages on the right, or collapse that panel. The wheel also
+   collapses to its center button.
 
-1. Choose any drawing tool on the rail. Its frequent options appear across the
-   top. Open **Options** for the full tool panel.
-2. Switch **Layers / Pages / Color** in the inspector. Add or duplicate a
-   layer/page, toggle visibility, and use Undo/Redo for those structural edits.
-3. Use the Pencil button for mappings and **Try quick palette**. Open **View**
-   for grid/snapping; the share button opens all export formats directly.
-4. Open Preferences for light/dark appearance, mirrored left-handed layout,
-   text/icon sizing, and roomier controls. Files includes simulated save and
-   recovery states. These are design controls, not connected device settings.
-5. Collapse the inspector for a larger canvas. At narrower window widths the
-   inspector overlays the drawing instead of shrinking it.
+## Preview scope
 
-## Relationship to upstream
+Panel navigation, settings, palette selection and editing, wheel rotation,
+layer visibility/opacity, structural page/layer edits, and modal flows are
+interactive. Drawing, native Pencil behavior, real document content,
+persistence, and exports remain simulated. Reload resets local preview state.
 
-The original screenshot, exact Android tokens, and previous parity guide in
-the parent folder remain historical source references. This proposal
-intentionally changes geometry, inspector placement, typography, and menu
-organization under the owner's latest direction. It retains warm paper,
-sienna selection, restrained rules, drafting tools, and document hierarchy.
-It does not silently replace the original reference with a new baseline.
+The original warm-paper design is retained with tighter geometry.
+**Marker** means a small marker-inspired palette, not calibrated COPIC color
+matches. The prior study's design and review are preserved as
+[study-02-design-spec.md](study-02-design-spec.md) and
+[study-02-review-notes.md](study-02-review-notes.md).
 
-## Preview boundaries
+## Updating
 
-Live: panel switching, context controls, tool selection, theme/handedness,
-layer visibility/opacity, structural page/layer edits and undo, selection
-outline, zoom/rotation/grid, color choice, and modal flows.
-
-Simulated: drawing/erasing/filling, actual selection geometry, transforms,
-merging pixels, image placement, individual document contents, persistent
-storage, hardware detection, Pencil squeeze/hover/haptics, export, and recovery.
-The preview labels these actions explicitly. Pixel-grid and hardware switches
-show configuration state; they are not renderer or hardware implementations.
-
-Not introduced: accounts, cloud collaboration, subscriptions, AI drawing
-tools, a new brush marketplace, or extra shape families beyond the app's scope.
-
-## Updating this study
-
-Edit the fragment, then regenerate the standalone copy with the installed
-visualize skill's `scripts/render.py`. Keep both here. Check interactions and
-responsive layouts in a browser; native tests and a new IPA are not necessary
-for a design-only update. Review changes before treating this proposal as the
-native implementation specification.
-
-The orchestrator owns visual judgment and review. Do not delegate visual aids
-to Luna. Future repetitive native coding can be assigned to Luna with bounded
-file ownership and review; Sol may handle independent complex implementation.
+Edit the fragment and regenerate the standalone copy using the installed
+visualize skill's `scripts/render.py`. Keep all design files in this folder.
+Review browser interactions and responsive layouts before native wiring.
+The orchestrator owns visual work; Luna is reserved for later bounded coding
+tasks that can be reviewed.

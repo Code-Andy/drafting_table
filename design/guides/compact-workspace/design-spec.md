@@ -1,227 +1,160 @@
-# Compact workspace design specification
+# Canvas-first workspace · study 03
 
-Date: 2026-09-05. Design owner: Astra / orchestrator. Scope: panels, controls,
-flows, and visual review before native implementation. This document records
-proposals, not completed renderer features.
+Status: interactive design proposal, revised from the owner's color-wheel
+reference and feedback. Native implementation remains a separate step.
+This specification supersedes study 02's layout. The complete earlier feature
+inventory remains in [study-02-design-spec.md](study-02-design-spec.md); its
+panel placements and geometry are historical, not current instructions.
 
-## Review of the existing layout
+## Main changes
 
-Reviewed the upstream app screenshot and current fork files at `d0158a1`:
-`DraftingTableViewController.swift`, `DraftingTheme.swift`,
-`PageLayerRailViews.swift` (component placement via its callers),
-`DrawingSettingsViewController.swift`, `AppMenuWindowView.swift`, and gallery /
-color picker entry points. Source review is not a physical-iPad screenshot audit.
+- Tools and color belong on the left, beside the drawing tools. Neither is a
+  right-inspector tab. The right side contains only **Layers** and **Pages**.
+- Remove the entire second toolbar / context strip. The single header is 36
+  px high in the pointer preview, with 34 px controls and 15 px icons. Coarse
+  input expands the header buttons to 40 px. Native sizing must be reviewed
+  with actual Pencil and finger input.
+- Remove the bottom status strip, including grid / pixel / snap state text.
+  View settings remain available through the existing header View control;
+  there is no replacement bottom menu bar.
+- Use a 208 px right inspector (adjustable 190–230), 6 px content insets,
+  36 px layer rows, 28 × 38 px page thumbnails, and 3–6 px gaps.
+- Keep 10–14 px between the drawing viewport and surrounding chrome. These
+  are deliberate small margins, not an edge-to-edge zero-margin canvas.
+- Tool settings appear in a 220 px anchored window. Color editing appears in
+  a 228 px window above the bottom-left wheel. Both overlay the canvas rather
+  than consuming a permanent column.
 
-| Finding | Consequence | Proposed change |
-| --- | --- | --- |
-| 56 pt tool rail + 84 pt pages + 180 pt inspector can occupy 320 pt before the canvas | Pages consume drawing space even when staying on one page | 48 pt rail and one 244 pt inspector; pages are a tab, inspector can collapse |
-| Tool state, brush controls, settings sheet, and legacy toolbar builders coexist in the controller | Ownership of visible settings is difficult to follow; future drift is likely | One binding per setting, rendered in the context strip and optional full Tool panel |
-| Rail captions use 8 pt, several option labels use 9 pt | Shrinking all fonts further would undermine the user's readability requirement | 12–13 pt controls, 11 pt secondary text, small icons with generous hit targets |
-| Multiple secondary controls are near the canvas, with separate floating toolbar positioning | Changing panels changes available anchors and spacing | Stable top context strip; one inspector anchor and one canvas navigation corner |
-| Fixed menu geometry and long action titles require shrinking or truncation | Risk of wrapping/clipping in smaller windows | Content-sized dialogs, short verb labels, adaptive columns, system pickers at file boundaries |
-| Main menu contains several disabled commands | Users see buttons without a useful completion path | Design the full intended flow now; native implementation must gate unavailable features honestly |
-| Long monospace text dominates some control rows | More width required for ordinary labels | System sans for controls; monospaced figures for numeric values |
+The mockup's fixed 704 px work-area height is for browser comparison. Native
+layout must fill the actual safe area. The illustrated white surface is the
+drawing viewport, not a measured preview of an exported A4 page.
 
-The permanent width changes from 320 to 292 pt with the inspector open, a
-28 pt saving. The large gain comes from closing the inspector: 48 pt remains,
-recovering 272 pt relative to the fully open old layout. These figures compare
-horizontal chrome only; the new header and context strip also consume height.
-Do not present this as a measured percentage increase in total canvas area.
+## Tool windows
 
-## Design principles and standards
+Each tool tile retains direct tool selection. A small bottom-right chevron
+toggles its options. The window appears on the canvas side of the left rail,
+beside the selected tool, and clamps vertically to stay inside the workspace.
+"Beside it on the left" is interpreted as the left side of the app, immediately
+to the right of the rail; there is no screen space outside the left edge.
 
-Preserve the original's paper / ink / sienna character. Use flat opaque
-surfaces, subtle dividers, and restrained corners. Avoid translucent controls
-over artwork, large pill collections, oversized icons, or toolbar animations
-that move drawing targets during a stroke.
+The corner indicator is a small Pencil/pointer affordance, not a full finger
+target. Tapping the already-active tool again opens/closes the same window.
+The main tool target remains 44 px. Native accessibility must expose an
+equivalent Options action, so using the tiny corner is never required.
 
-Frequent actions belong in visible controls. Apple recommends selecting toolbar
-items deliberately, prioritizing primary tasks and grouping commands by
-function: [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars).
-Our choice is an always-visible rail with every existing tool, a contextual
-property strip, and four inspector tabs. No nested tool family menu or
-long-press-only tool is required.
+Window header: tool name, pin toggle, close. Pinned windows follow tool
+changes. Unpinned windows close on a different tool selection. Closing a
+window leaves it closed until the user opens it again. Opening another tool's
+corner selects that tool and opens its window. Only one tool window exists.
 
-Use a 12 pt compact control style, 13 pt ordinary dialog copy, 11 pt secondary
-metadata, and 16 pt dialog titles. Apple's iPad typography guidance lists 17 pt
-as the default and 11 pt as the minimum; this compact professional workspace
-deliberately uses the smaller end of that range and must be judged on the
-physical iPad: [Typography](https://developer.apple.com/design/human-interface-guidelines/typography).
-Do not claim that 12 pt is Apple's default. Do not shrink existing 8–9 pt text.
+Brush / eraser: size, opacity, hardness, pressure, uniform opacity. Secondary
+stabilization and prediction controls use one **Stroke feel** disclosure.
+Shade adds closure. Bucket contains source, tolerance, gap, bleed, opacity.
+Shapes retain width/fill/opacity/constraints and explicit vector-layer creation
+when necessary. Select/lasso retain combine, feather, clipboard and transform.
+Eyedropper retains sampling source. Existing tool options are relocated rather
+than dropped from the design inventory.
 
-Visible icons are 17 pt by default (16–20 pt adjustable in the study). Primary
-touch targets are 44 × 44 pt, without overlapping neighboring targets.
-Roomier mode uses 48 pt controls and larger type. The native version must
-support Dynamic Type and increased contrast, and should reflow into scrolling
-panels when large text exceeds the compact layout. See Apple's
-[Accessibility guidance](https://developer.apple.com/design/human-interface-guidelines/accessibility).
-The study's 12–16 px slider is not a substitute for native Dynamic Type.
+Opening the palette editor closes the tool window. At narrow widths, opening
+a right panel closes left windows, and opening left options collapses the
+right panel. Avoid stacking two opaque inspectors over a small drawing area.
 
-## Layout contract
+## Corner wheel
 
-| Region | Compact proposal | Rule |
-| --- | --- | --- |
-| Document header | 48 pt minimum | Documents + title left; undo/redo; view, Pencil, export, preferences, inspector |
-| Tool property strip | 50 pt minimum | Selected tool, primary parameters, color, full options; reflow at narrow sizes |
-| Tool rail | 48 pt | 17 pt icons, 44 pt targets, separators between raster / vector / selection |
-| Inspector | 244 pt, adjustable 232–280 | Tool, Layers, Pages, Color; one panel at a time |
-| Status line | 28 pt, expands if needed | Tool/layer, page specification, grid/snap state; no tiny tappable chips |
-| Canvas navigation | 44 pt targets | Zoom out, percentage/fit, zoom in, focus toggle |
-| Dividers | 1 pt | Consistent alignment; no doubled borders at panel joins |
-| Dialogs | Up to 560 pt; gallery up to 740 pt | Fit window safe area, scroll long forms, no nested cascading menus |
+The reference's useful idea is a wheel that continues beyond the viewport,
+revealing an arc instead of occupying a full disk of screen space. The study
+uses a clipped 248 × 228 px area beside the bottom of the tool rail, with a
+176 px outer radius and an accessible 56 px center button. Only several hue
+families are visible at a time. Transparent space outside the arc passes
+through to the drawing surface.
 
-At window widths greater than 820 CSS px in this preview, the inspector is
-docked. At 820 and below it overlays the canvas; it never squeezes the drawing
-into a sliver. This is an illustrative breakpoint: native code must calculate
-from available safe-area width, text size, and the minimum usable canvas.
-The compact-phone-sized browser check is a robustness check, not a new iPhone
-product commitment. At 320–500 px, header actions and context controls wrap.
+### Basic palette
 
-Default study shows Layers open to make the design inspectable. Production
-should remember the user's last inspector state, selected tab, and side.
-Right-handed drawing defaults to tools left / inspector right; left-handed
-mirrors both. Keyboard and narrow windows preserve access to every tool.
-Safe-area/home-indicator clearance belongs outside these content measurements.
-The preview uses a 624 px work area for comparison, not a fixed native canvas.
+**RGB** starts with 12 basics: red, orange, yellow, green, cyan, blue, violet,
+magenta, brown, gray, black, and white. Each has base and light shades, giving
+24 swatches total. It intentionally avoids hundreds of labeled swatches.
+The outer band is the base color; the inner band is the lighter shade.
 
-## Tool and option inventory
+Drag the arc, scroll over it, or press its previous/next arrows to rotate.
+The arrows advance 30 degrees, one basic family. Click/tap a visible swatch
+to choose it. Offscreen sectors are not keyboard-focus targets. Named controls
+and the color editor provide alternatives to precise wheel selection.
 
-| Tool | One-tap access / immediate controls | Full Tool panel | Native behavior contract |
-| --- | --- | --- | --- |
-| Brush | Rail; size, opacity, uniform alpha, color | Hardness, pressure response, stabilization, prediction, reset | Remember brush parameters independently; pressure changes width according to response |
-| Eraser | Rail; size, opacity | Hardness, pressure response, uniform alpha, stabilization, prediction, reset | True alpha eraser; reveals lower layers; independent of brush size |
-| Bucket | Rail; close-gap, bleed, boundary source, color | Tolerance, opacity, same gap/bleed/source values, reset | Default active raster layer; visible-layers boundary mode is an explicit extension |
-| Shade | Rail; size, opacity, color | Hardness, pressure, uniform alpha, closure, stabilization, prediction, reset | Fill the closed path on lift; straight chord is the default closure |
-| Line | Rail; stroke width, snap, color | Width, opacity, snap, angle constraint/step | Editable vector; no interior fill for a line |
-| Rectangle | Rail; width, interior fill, snap, color | Width, fill, opacity, constraints | Editable vector; no hidden shape-family menu |
-| Circle | Rail; width, fill, snap, color | Width, fill, opacity, constraints | Exact circular geometry |
-| Ellipse | Rail; width, fill, snap, color | Width, fill, opacity, constraints | Independent axes |
-| Select | Rail; combine mode, select/deselect, transform, copy, paste | Feather, replace/add/subtract/intersect, invert, cut/copy/paste/delete | Active-layer selection; disable geometry edits until a selection exists |
-| Lasso | Rail; same selection controls | Same edit actions and feather | Freehand region, close to start |
-| Eyedropper | Rail or Color panel | Active/visible sampling | Preview loupe; return to previous tool after picking; hover never paints |
+**Marker** offers the same small family structure with muted, marker-inspired
+tones. It reflects the organizational idea of the supplied reference. It is
+not an exact COPIC catalogue, calibrated marker simulation, or verified
+mapping from brand codes to sRGB colors. Exact branded swatches would need an
+appropriate source and a separate color-management decision.
 
-Per-tool settings are a native contract. The study shares some parameter
-values to demonstrate bindings and does not model every tool's saved preset.
-It uses representative size/percentage ranges; engine ranges and document
-units must be mapped during native wiring, not copied blindly from CSS pixels.
+### Custom override
 
-The grid and page background never count as bucket boundaries. For visible
-layers, use the visible drawing composite as read-only input and write only
-to the active raster layer. Mark this as a proposed feature until available;
-it is not a claim about Android parity. Shape tools encountering a raster
-layer must offer a visible “Create vector layer” transition, with Cancel,
-rather than silently converting or mutating the existing layer.
+Pressing the center switches to **My colors** and opens the small palette
+editor. Six initial editable colors replace the basic wheel. Select a custom
+slot, choose a new color, and press **Replace slot**. **Add color** supports up
+to twelve slots. A lighter shade is generated for each custom base color.
 
-## Panel and flow inventory
+Press the center again to restore the last RGB/Marker mode. The editor also
+provides direct RGB / Marker / My colors controls. Custom colors remain in
+preview state when switching modes, but reload resets the preview. Native
+implementation should persist the custom wheel as an app preference.
 
-| Surface | Options / actions | State and dismissal contract |
-| --- | --- | --- |
-| Layers | Add raster/vector, select, visibility, opacity, lock, duplicate | Selected marker plus tint; retain layer names; opacity visibly affects one group |
-| Layer actions | Rename, move up/down, duplicate, lock/unlock, rasterize, merge down, delete | Inapplicable actions disabled; explicit destructive confirmation; undoable commits |
-| Pages | Thumbnail/name, selection, add, setup | One page list, no permanent second sidebar; stable selected page ID |
-| Page actions | Rename, duplicate, move earlier/later, delete | First/last reorder bounds; cannot delete final page; undo after deletion |
-| Page setup | A4/A3/Letter/Square/custom, orientation, resolution, units, dimensions, paper color | Validate positive dimensions and limits; Apply/Cancel transaction |
-| Color | Foreground/previous swap, native color chooser, hex, 32 colors, recents, eyedropper | Hex/RGB validation, current-color ring; 4-column inspector palette preserves touch targets |
-| Custom colors | RGB/hex values, custom slots, save current color | Slot storage local to app; preview only demonstrates four slots / first-slot save |
-| Selection transform | X/Y, width/height, linked aspect, rotation, flip horizontal/vertical | Real app adds live geometry and handles; Apply/Cancel; positive-size validation |
-| Documents | Gallery, open, new, rename, delete | Native Recently Deleted / recovery policy must exist before advertising recoverability |
-| New document | Name and page setup in one form | No separate preset action sheet followed by another naming alert |
-| Document actions | Rename, all documents, page setup, import, export, save copy, clear | No deep submenu; clear entire document requires explicit confirmation |
-| Import / open | Files, Photos, editable document import, legacy one-way import | Native system picker, cancel, invalid/unsupported-file feedback |
-| Image placement | Floating selection, fit, transform, place/cancel | Do not commit an imported image until Place; use new raster layer |
-| Export | PNG/PDF/editable document, page scope, background, PNG scale | One form, then native share sheet; all-pages PNG means a named file set / ZIP |
-| Save copy / backup | Editable document copy, all pages/layers | This study scopes backup to current document; bulk-library backup is deferred |
-| Canvas view | Grid, pixel grid, snap, angle constraint/step, spacing, rotation, fit, 100%, reset rotation | No diagnostics over drawing by default; values reflect document/view scope |
-| Apple Pencil | Hover, haptics, double-tap, squeeze, barrel roll | Gate unsupported hardware; preserve direct rail alternatives |
-| Squeeze palette | Brush, eraser, bucket, lasso, color, undo, line, redo | One-level palette near Pencil; clamp to screen; no dwell menu navigation |
-| Preferences / Workspace | Handedness, appearance, text/icon size, roomier controls | Immediate local preferences; mirror anchors, not drawing coordinates |
-| Preferences / Input | Pencil-only drawing, prediction, activation threshold, stabilization, gestures | System/Pencil tuning belongs here; normal brush edits remain in tool controls |
-| Preferences / Files | Default location, autosave information, Files open, backup | Saving, save failure, retry, save-copy escape route, recovery, missing-image states |
-| Preferences / About | Version, shortcuts, diagnostics entry | Technical data kept outside ordinary drawing flow |
-| Keyboard reference | Tool letters, undo/redo, close, focus | Never hijack typing in fields or ordinary Tab focus navigation |
-| Diagnostics | Input/frame timing, GPU memory/tiles, Pencil sample rates | Real measured values only; preview displays unavailable dashes |
+The center shows the current ink and mode. A small collapse action reduces
+the wheel to its center button; pressing the collapsed center restores the
+arc without unexpectedly changing the palette.
 
-Raster selection transform is still a renderer transaction requirement; this
-design does not weaken tile-generation, grouped-opacity, package-manifest,
-serial ownership, or one-way DTAR import contracts.
+### Continuous color editing
 
-## Interaction and error rules
+The editor has a continuous hue ring and saturation/brightness square, plus
+numeric slider alternatives, hex input, eyedropper, and foreground/previous
+swap. Changing hue or saturation updates current ink. Custom wheel changes
+are explicit slot replacements; dragging a hue must not overwrite the user's
+stored palette automatically.
 
-- Tool switch: one tap. Common property adjustment: direct slider or field.
-  Full properties: one tap on Options. A preset does not require another menu.
-- Inspector tab changes are direct. Selecting a tool updates the strip and
-  Tool panel without forcibly stealing the Layers tab.
-- Page/layer titles stay on one line and truncate at the trailing edge. Full
-  names remain available in rename/actions and accessibility labels.
-- Essential tool names remain accessible through labels, Pencil hover help,
-  and keyboard reference. Add a labeled-tools accessibility layout for users
-  who cannot identify icons reliably; do not depend on hover for all naming.
-- Dialog forms that have Apply/Cancel use draft state. Preferences apply
-  immediately. Escape closes the current modal before closing an inspector.
-- Avoid invisible tap regions extending into neighbors. Color dots can be
-  20 pt inside a 44 pt square; an 8-column panel at 244 pt cannot satisfy that,
-  so it becomes four columns. Native wider color sheets can use eight columns.
-- Locked layers show the lock and stop mutations with a concise explanation.
-  Hidden active layers offer Show; vector/raster mismatch offers a new layer.
-- Save failure preserves current work and exposes Retry / Save a copy.
-  Recovery identifies last saved versus recovered version without implying
-  either is complete until package validation finishes.
-- Export has preparing, cancellation, failure/retry, and share completion
-  states. The preview shows configuration and handoff, not actual file work.
-- Confirmation is reserved for lossy/destructive document actions, not tool
-  switches, panel toggles, or normal parameter edits.
+The ring is a color-selection control, not an illustration-only graphic.
+Its HSV changes and slot replacements are interactive in the preview.
 
-## Remaining design details before production wiring
+## Compact right panels
 
-The major surfaces are represented. The following fine-grained contracts are
-specified here but intentionally not fully simulated: pressure response curve
-editing, color-space conversion, floating-image content, vector node handles,
-linked aspect ratio, long-list drag reordering, per-tool preset memory, Files
-provider conflict selection, large-document export cancellation, and actual
-Pencil radial positioning. They need native interaction review during wiring.
+Layers: add raster/vector, select, show/hide, actions, selected-layer opacity,
+lock, duplicate. Rows use compact icon spacing; long names truncate at the
+trailing edge and remain fully readable in rename/actions.
 
-Do not add a button for a future backend option without its complete state
-contract. The preview can expose proposed controls, but a test IPA must either
-support them or identify them as unavailable.
+Pages: add, setup, thumbnails, selection, rename, duplicate, reorder, delete.
+Actions retain independent width so they cannot squeeze names into awkward
+word wrapping. No permanent page-thumbnail rail is added.
 
-## Implementation sequence after design review
+At widths at or below the preview's 820 px breakpoint, the right inspector
+becomes an overlay and starts collapsed. The breakpoint is illustrative;
+native code must use usable safe-area width and selected text size. Mirrored
+left-handed mode moves the rail, tool windows, and wheel together.
 
-1. Central tokens and reusable toolbar, field, row, swatch, inspector, dialog
-   components. One settings model and stable document IDs. Remove duplicate
-   live UI builders only after their replacements are connected.
-2. Responsive shell and direct tool/context bindings; preserve current Pencil
-   and renderer integration. Review landscape, portrait, split window, and
-   Pencil/finger routing before broad feature wiring.
-3. Layer/page/color inspectors and transactional forms. Wire existing actions
-   first and review before adding missing capabilities.
-4. Document/import/export flows and Pencil preferences; system pickers and
-   failure/recovery surfaces. Enforce backend capability gating.
-5. Selection/vector/fill options as their rendering contracts become ready.
-   Review each major step, produce a sideload test release, and provide a
-   concise physical-device checklist. No new test suite is requested here.
+## What stays available
 
-No native sources or IPA changed in this study. This sequence is not a claim
-that all currently exposed options already have a functioning backend.
+The study retains the existing document gallery, new/open/rename, page setup,
+layer actions, selections/transforms, Files/Photos placement, export forms,
+Pencil mappings, quick palette, preferences, diagnostics, and save/recovery
+flows. These are described in study 02's feature inventory. Their document /
+renderer operations are still simulated; no native source or IPA changes are
+part of this delivery.
 
-## Assumptions and review points
+Tool and palette settings apply to the same future renderer contracts:
+active-raster-layer bucket boundaries by default, explicit visible-layer fill,
+true alpha eraser, grouped layer opacity, serial document mutation and
+versioned save/undo transactions. UI reorganization does not change them.
 
-- Latest direction permits improving the original layout rather than requiring
-  pixel-for-pixel Android geometry; original references remain preserved.
-- All design guides stay beneath `design/guides`. Visual decisions stay with
-  the orchestrator; Luna is for subsequent bounded coding tasks only.
-- Warm light appearance is the default; dark chrome and left-handed mirroring
-  are alternatives available in Preferences.
-- Small visible icons should not mean small touch targets. The user's goal is
-  a compact, usable workspace, not minimum possible text size.
-- iPad Pro landscape is the primary review size; portrait and split windows
-  must work. Exact physical device and preferred type size remain device-review
-  choices, not blockers to making this preview.
-- 11 existing drawing/selection tools stay directly accessible. No new brush
-  marketplace, account system, collaboration feature, or shape catalogue.
-- Side inspector tabs are preferred to permanently reserving a pages column.
-  If frequent page switching proves central, a user-pinned page strip is a
-  later option, not another permanent default panel.
-- Active-layer bucket boundaries remain default. Visible-layer fill is an
-  explicit proposed extension and needs implementation/capability treatment.
-- This delivery is a design preview. Sideload IPA packaging resumes with native
-  implementation; personal distribution scope remains unchanged.
+## Density tradeoff and assumptions
+
+- Page space is the priority. Smaller secondary controls are intentional.
+  Main tool access remains 44 px; header/secondary targets are denser and must
+  be tried on the iPad before native sizes are frozen. Do not claim every
+  control in this compact study is 44 × 44.
+- Essential control labels remain 11–12 px; shrinking empty space gives a
+  larger gain than pushing essential text below that range.
+- The center button means palette override/editing, not a new document action.
+- Use 12 base families with two shades, not a full marker catalogue.
+- The wheel occupies an overlay only. It does not reserve a square of canvas
+  layout, and it can collapse to the center button.
+- The provided image is a visual reference. No labels or instructions inside
+  it are treated as instructions to change application behavior.
+- This is design work by the orchestrator; no Luna visual delegation. All
+  guides remain together under `design/guides/compact-workspace`.
