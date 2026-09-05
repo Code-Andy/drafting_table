@@ -1,0 +1,1604 @@
+<!doctype html>
+<html lang="en" data-visualize-standalone>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src 'unsafe-inline' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Drafting Table · Compact workspace</title>
+<style>:root{color-scheme:light dark;background:light-dark(rgb(255 255 255), rgb(24 24 24))}html,body{margin:0}body{box-sizing:border-box;padding:1rem;background:inherit}iframe{display:block;width:100%;height:calc(100vh - 2rem);margin:0 auto;border:0}</style>
+</head>
+<body>
+<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" title="Drafting Table · Compact workspace" srcdoc="&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot; data-visualize-standalone&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+&lt;meta name=&quot;referrer&quot; content=&quot;no-referrer&quot;&gt;
+&lt;meta http-equiv=&quot;Content-Security-Policy&quot; content=&quot;default-src &#x27;none&#x27;; script-src &#x27;unsafe-inline&#x27; &#x27;unsafe-eval&#x27; &#x27;wasm-unsafe-eval&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src &#x27;unsafe-inline&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src &#x27;none&#x27;; object-src &#x27;none&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;&quot;&gt;
+&lt;title&gt;Drafting Table · Compact workspace&lt;/title&gt;
+&lt;style&gt;:root {
+  color-scheme: light dark;
+  background-color: var(
+    --background,
+    var(--color-background-primary, light-dark(rgb(255 255 255), rgb(24 24 24)))
+  ) !important;
+
+  /* Agent-facing contract; keep in sync with SKILL.md. */
+  --background: var(
+    --color-background-primary,
+    light-dark(rgb(255 255 255), rgb(24 24 24))
+  );
+  --foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --card: color-mix(in oklab, var(--foreground) 5%, var(--background));
+  --card-foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --popover: var(
+    --color-background-secondary,
+    light-dark(rgb(255 255 255), rgb(45 45 45))
+  );
+  --popover-foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --primary: var(
+    --color-text-info,
+    light-dark(rgb(51 156 255), rgb(131 195 255))
+  );
+  --primary-foreground: var(
+    --color-text-inverse,
+    light-dark(rgb(255 255 255), rgb(13 13 13))
+  );
+  --secondary: var(
+    --color-background-secondary,
+    light-dark(rgb(255 255 255 / 96%), rgb(54 54 54 / 96%))
+  );
+  --secondary-foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --muted: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --muted-foreground: var(
+    --color-text-secondary,
+    light-dark(rgb(26 28 31 / 49.4%), rgb(255 255 255 / 49.8%))
+  );
+  --accent: var(
+    --color-background-info,
+    light-dark(rgb(229 242 255), rgb(13 39 63))
+  );
+  --accent-foreground: var(
+    --color-text-info,
+    light-dark(rgb(51 156 255), rgb(131 195 255))
+  );
+  --destructive: var(
+    --color-text-warning,
+    light-dark(rgb(226 85 7), rgb(255 133 73))
+  );
+  --border: var(
+    --color-border-secondary,
+    light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%))
+  );
+  --input: var(
+    --color-border-primary,
+    light-dark(
+      rgb(26 28 31 / 11.8%),
+      color-mix(in oklab, rgb(0 0 0) 10%, transparent)
+    )
+  );
+  --ring: var(
+    --color-ring-primary,
+    light-dark(rgb(51 156 255), rgb(131 195 255 / 76%))
+  );
+  --font-size-base: var(--font-text-md-size, 14px);
+  --blue: light-dark(rgb(51 156 255), rgb(51 156 255));
+  --orange: light-dark(rgb(226 85 7), rgb(251 106 34));
+  --green: light-dark(rgb(0 162 64), rgb(64 201 119));
+  --red: light-dark(rgb(224 46 42), rgb(255 103 100));
+  --purple: light-dark(rgb(146 79 247), rgb(173 123 249));
+  --yellow: light-dark(rgb(255 195 0), rgb(255 210 64));
+  --viz-series-1: var(--primary);
+  --viz-series-2: light-dark(rgb(243 136 59), rgb(245 154 86));
+  --viz-series-3: light-dark(rgb(93 201 119), rgb(116 213 139));
+  --viz-series-4: light-dark(rgb(235 119 177), rgb(240 143 192));
+  --viz-series-5: light-dark(rgb(155 121 236), rgb(170 145 239));
+  --viz-series-6: light-dark(rgb(58 185 177), rgb(90 203 194));
+
+  /* Internal implementation variables; not part of the agent contract. */
+  --font-sans: -apple-system, system-ui, &quot;Segoe UI&quot;, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, &quot;SF Mono&quot;, Menlo, Consolas, &quot;Liberation Mono&quot;,
+    monospace;
+  --font-size-normal: max(11px, var(--font-size-base));
+  --font-size-tooltip: calc(var(--font-size-base) - 1px);
+  --font-size-small: max(11px, calc(var(--font-size-base) - 2px));
+  --font-size-h1: calc(var(--font-size-normal) * 1.7142857143);
+  --font-size-h2: calc(var(--font-size-normal) * 1.4285714286);
+  --font-size-h3: calc(var(--font-size-normal) * 1.2857142857);
+  --font-weight-normal: 430;
+  --font-weight-medium: 500;
+  --icon-size: 16px;
+  --line-height-normal: calc(var(--font-size-normal) * 1.5);
+  --line-height-tooltip: calc(var(--font-size-tooltip) * 1.4285714286);
+  --line-height-small: calc(var(--font-size-small) + 4px);
+  --corner-shape: round;
+  --radius: var(--border-radius-lg, 10px);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-2xl: calc(var(--radius) * 1.6);
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 8%);
+  --checkmark-image: url(&quot;data:image/svg+xml,%3Csvg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 17 17&#x27;%3E%3Cpath d=&#x27;M12.8961 3.64101C13.1297 3.41418 13.4984 3.37523 13.7779 3.56581C14.0571 3.75635 14.1554 4.11331 14.0299 4.41347L13.9615 4.53847L7.71151 13.7045C7.59411 13.8767 7.4063 13.9877 7.19881 14.0072C6.99136 14.0267 6.78564 13.9533 6.63826 13.806L2.88826 10.056L2.79842 9.9457C2.6192 9.67407 2.64927 9.30496 2.88826 9.06581C3.12738 8.82669 3.49647 8.79676 3.76815 8.97597L3.8785 9.06581L7.03084 12.2182L12.8053 3.74941L12.8961 3.64101Z&#x27;/%3E%3C/svg%3E&quot;);
+
+  /* Legacy aliases; not part of the current agent contract. */
+  --viz-bg: transparent;
+  --viz-panel: var(--card);
+  --viz-border: var(--border);
+  --viz-text: var(--foreground);
+  --viz-muted: var(--muted-foreground);
+  --viz-accent: var(--primary);
+  --viz-accent-text: var(--primary-foreground);
+  --viz-accent-bg: var(--accent);
+  --viz-font-size: var(--font-size-base);
+  --viz-warning: var(--destructive);
+}
+
+:root[data-theme=&quot;light&quot;] {
+  color-scheme: light;
+}
+
+:root[data-theme=&quot;dark&quot;] {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html &gt; body {
+  /* Preserve MCP aliases for older inline renderers without creating :root cycles. */
+  --color-background-primary: var(
+    --background,
+    light-dark(rgb(255 255 255), rgb(24 24 24))
+  );
+  --color-text-primary: var(
+    --foreground,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --color-border-secondary: var(
+    --border,
+    light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%))
+  );
+
+  margin: 0;
+  padding: var(--visualize-paint-gutter, 0px);
+  color: var(--foreground);
+  background: transparent !important;
+  font-family: var(--font-sans) !important;
+  font-size: var(--font-size-normal);
+  font-weight: var(--font-weight-normal);
+  line-height: var(--line-height-normal);
+}
+
+a {
+  color: color-mix(in srgb, var(--viz-accent) 80%, var(--viz-text) 20%);
+  cursor: pointer;
+  font-weight: var(--font-weight-medium, 500);
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+
+a:is(:hover, :focus-visible) {
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
+  text-decoration-thickness: 0.5px;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-block: 0;
+}
+
+h1 {
+  font-size: var(--font-size-h1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h3,
+h4,
+h5,
+h6 {
+  font-size: var(--font-size-h3);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.3;
+}
+
+b,
+strong,
+th {
+  font-weight: var(--font-weight-medium);
+}
+
+code:not(pre code) {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  corner-shape: var(--corner-shape);
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  word-break: break-word;
+}
+
+.table-responsive {
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--foreground);
+  font: inherit;
+  text-align: start;
+}
+
+.table :is(th, td) {
+  padding-block: 10px;
+  padding-inline: 0 24px;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--border);
+  text-align: start;
+  vertical-align: top;
+}
+
+.table-responsive &gt; .table :is(th, td) {
+  overflow-wrap: break-word;
+}
+
+.table :is(th, td):last-child {
+  padding-inline-end: 0;
+}
+
+.table :is(caption, thead th) {
+  font-weight: 600;
+}
+
+.table thead th {
+  padding-block: 8px;
+  border-bottom-color: color-mix(in srgb, var(--foreground) 16%, transparent);
+}
+
+.table tbody tr:last-child :is(th, td) {
+  border-bottom: 0;
+}
+
+.table.table-sm :is(th, td) {
+  padding-block: 6px;
+}
+
+.table.table-sm :is(th, td):not(:last-child) {
+  padding-inline-end: 16px;
+}
+
+.table :is(.text-end, [align=&quot;right&quot;]) {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.table :is(.text-center, [align=&quot;center&quot;]) {
+  text-align: center;
+}
+
+.table .text-nowrap {
+  white-space: nowrap;
+}
+
+#widget {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  background: transparent !important;
+}
+
+.card {
+  min-width: 0;
+  padding: 12px;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  border-radius: var(--radius-2xl);
+  corner-shape: var(--corner-shape);
+  color: var(--card-foreground);
+  background: var(--card);
+}
+
+#widget &gt; :not(.card, .progress) {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 50;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: min(
+    20rem,
+    var(--tooltip-available-width, calc(100vw - 10px)),
+    calc(100vw - 10px)
+  );
+  max-height: min(
+    var(--tooltip-available-height, calc(100vh - 10px)),
+    calc(100vh - 10px)
+  );
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  corner-shape: var(--corner-shape);
+  color: var(--popover-foreground);
+  background: var(--popover);
+  box-shadow: none;
+  font-size: var(--font-size-tooltip);
+  line-height: var(--line-height-tooltip);
+  overflow-wrap: break-word;
+  white-space: normal;
+  pointer-events: none;
+  user-select: none;
+}
+
+.viz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(max(180px, 24%), 1fr));
+  gap: 10px;
+}
+
+.viz-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.viz-stat-value {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+.viz-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+hr {
+  width: 100%;
+  height: 1px;
+  margin-block: 6px;
+  border: 0;
+  background: var(--border);
+}
+
+.nav {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.progress {
+  display: flex;
+  height: 8px;
+  margin-block: calc((var(--line-height-normal, 1.5em) - 8px) / 2);
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--muted);
+}
+
+.progress-bar:only-child {
+  border-radius: var(--radius-full);
+}
+
+.progress-bar {
+  height: 100%;
+  flex-shrink: 0;
+  border: 0;
+  background: var(--viz-series-1);
+}
+
+.viz-badge {
+  padding: 3px 8px;
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  background: var(--accent);
+  font-weight: var(--font-weight-medium);
+}
+
+small,
+.text-small,
+.viz-badge {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.text-muted {
+  color: var(--muted-foreground);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.viz-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.viz-controls &gt; .form-label {
+  display: grid;
+  min-width: min(100%, 260px);
+  flex: 1 1 280px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin-bottom: 0;
+}
+
+.viz-controls &gt; .form-label &gt; :is(.form-control, .form-range, .form-select) {
+  grid-column: 1 / -1;
+}
+
+.btn,
+.nav-link,
+.form-check-input,
+.form-control,
+.form-range,
+.form-select {
+  font: inherit;
+}
+
+.btn,
+.nav-link {
+  appearance: button;
+  display: inline-flex;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: var(--corner-shape);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: var(--cursor-interaction, pointer);
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.btn:is(.btn-block, .viz-tile) {
+  inline-size: 100%;
+}
+
+.btn.viz-tile {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+a.btn {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn:not(:disabled):hover,
+.nav-link:not(:disabled):not([aria-disabled=&quot;true&quot;]):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn-primary {
+  border-color: transparent;
+  color: var(--primary-foreground);
+  background: var(--foreground);
+  background-clip: padding-box;
+}
+
+.btn-primary .text-muted {
+  color: color-mix(in srgb, var(--primary-foreground) 50%, transparent);
+}
+
+.btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 80%, transparent);
+  background-clip: padding-box;
+}
+
+.btn-ghost {
+  border-color: transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+.btn-ghost:not(:disabled):hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.nav-pills .nav-link {
+  min-width: 0;
+  border-color: transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+.nav-justified .nav-link {
+  flex: 1 1 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.nav-pills .nav-link.active {
+  color: var(--foreground);
+  background: var(--muted);
+}
+
+.btn:disabled,
+.nav-link:disabled,
+.nav-link[aria-disabled=&quot;true&quot;] {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+[data-lucide] {
+  stroke-width: 1.6;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--foreground);
+}
+
+.form-control {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: var(--corner-shape);
+  color: var(--foreground);
+  background: var(--secondary);
+}
+
+.form-control::placeholder {
+  color: var(--muted-foreground);
+}
+
+.form-control[type=&quot;file&quot;] {
+  padding: 0;
+  overflow: hidden;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control[type=&quot;file&quot;]::file-selector-button {
+  min-height: 26px;
+  margin-right: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--input);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: inherit;
+  font: inherit;
+}
+
+.form-control[type=&quot;file&quot;]:not(:disabled):hover::file-selector-button {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-control-color[type=&quot;color&quot;] {
+  width: 40px;
+  height: 28px;
+  padding: 3px;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch {
+  border: 0;
+  border-radius: calc(var(--radius-lg) - 4px);
+  corner-shape: var(--corner-shape);
+}
+
+textarea.form-control {
+  height: auto;
+  min-height: 72px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.form-control:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-control:disabled,
+.form-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.form-select {
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 32px 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: var(--corner-shape);
+  color: var(--foreground);
+  background-color: var(--secondary);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 10px) 50%;
+  background-repeat: no-repeat;
+  background-size: 4px 4px;
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-select:not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-check {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  gap: 6px;
+}
+
+.form-check-input {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  border: 1px solid var(--input);
+  color: var(--primary-foreground);
+  background-color: transparent;
+  cursor: var(--cursor-interaction, default);
+  transition:
+    background-color 150ms,
+    border-color 150ms,
+    box-shadow 150ms;
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;] {
+  border-color: var(--input);
+  border-radius: var(--radius-sm);
+  corner-shape: var(--corner-shape);
+  background-color: var(--secondary);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input:not(:disabled):not(:checked):hover {
+  background-color: var(--card);
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;]:checked {
+  border-color: var(--primary);
+  background-color: var(--primary);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input[type=&quot;checkbox&quot;]:checked::before {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--primary-foreground);
+  content: &quot;&quot;;
+  mask: var(--checkmark-image) center / 12px 12px no-repeat;
+}
+
+.form-check-input[type=&quot;radio&quot;] {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+}
+
+.form-check-input[type=&quot;radio&quot;]:checked {
+  border: 2px solid var(--primary);
+  background:
+    radial-gradient(circle, var(--primary-foreground) 0 2.5px, transparent 3px),
+    var(--primary);
+}
+
+.form-check:not(.form-switch) .form-check-input:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+}
+
+.form-switch .form-check-input:disabled,
+.form-switch .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.form-check-label {
+  color: var(--foreground);
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-switch .form-check-input {
+  position: relative;
+  width: 32px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--muted);
+  box-shadow: none;
+  transition: background-color 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 1px solid light-dark(var(--primary-foreground), var(--foreground));
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+  box-shadow: var(--shadow-sm);
+  content: &quot;&quot;;
+  transform: translate(2px, -50%);
+  transition: transform 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input:checked {
+  background: var(--primary);
+}
+
+.form-switch .form-check-input:checked::before {
+  transform: translate(14px, -50%);
+}
+
+.form-switch .form-check-input:focus-visible {
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+.form-range {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 28px;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  outline: none;
+  border: 0;
+  accent-color: var(--primary);
+  background: linear-gradient(
+      color-mix(in srgb, var(--foreground) 7%, transparent),
+      color-mix(in srgb, var(--foreground) 7%, transparent)
+    )
+    center / 100% 2px no-repeat;
+}
+
+.form-range::-webkit-slider-runnable-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-webkit-slider-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range::-moz-range-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-moz-range-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.btn:not(.btn-primary, .viz-tile):is(
+  [aria-pressed=&quot;true&quot;],
+  [aria-selected=&quot;true&quot;],
+  .is-selected
+) {
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.btn.viz-tile:is([aria-pressed=&quot;true&quot;], [aria-selected=&quot;true&quot;], .is-selected) {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.btn:focus-visible,
+.nav-link:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .btn,
+  .nav-link,
+  .form-control,
+  .form-select {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Keep small-screen WebKit from zooming when a text field receives focus. */
+  .form-control,
+  .form-select {
+    font-size: max(16px, var(--font-size-normal));
+  }
+
+  .form-control[type=&quot;file&quot;]::file-selector-button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .form-control-color[type=&quot;color&quot;] {
+    width: 44px;
+    height: 44px;
+  }
+
+  .form-control:is(
+    [type=&quot;date&quot;],
+    [type=&quot;datetime-local&quot;],
+    [type=&quot;month&quot;],
+    [type=&quot;time&quot;],
+    [type=&quot;week&quot;]
+  ) {
+    min-width: 0;
+    max-width: 100%;
+    padding-block: 8px;
+  }
+
+  .form-check {
+    min-height: 44px;
+    padding-inline: 15px;
+  }
+
+  .form-check-input {
+    position: relative;
+  }
+
+  .form-check-input::after {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 44px;
+    height: 44px;
+    content: &quot;&quot;;
+    transform: translate(-50%, -50%);
+  }
+
+  .form-check-label {
+    display: inline-flex;
+    min-width: 44px;
+    min-height: 44px;
+    align-items: center;
+  }
+
+  .form-range {
+    height: 44px;
+    touch-action: pan-y;
+  }
+
+  .form-range::-webkit-slider-runnable-track {
+    height: 44px;
+  }
+
+  .form-range::-moz-range-track {
+    height: 44px;
+  }
+
+  .form-range::-webkit-slider-thumb {
+    margin-top: 12px;
+  }
+}
+
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+#widget &gt; svg {
+  width: 100%;
+}
+
+/* Model-authored chart rules can otherwise stretch icons after these styles load. */
+svg.lucide {
+  display: block;
+  width: var(--icon-size) !important;
+  height: var(--icon-size) !important;
+  flex: none;
+  margin: 0 !important;
+  stroke-width: 1.6;
+}
+
+.text-warning,
+.text-destructive {
+  color: var(--destructive);
+}
+
+html&gt;body{padding:0}&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;div id=&quot;dt-workspace-study&quot; aria-label=&quot;Drafting Table compact workspace design preview&quot;&gt;
+&lt;style&gt;
+#dt-workspace-study{--dt-paper:#f7f4ed;--dt-surface:#eeeadf;--dt-raised:#fcfaf5;--dt-ink:#2a2823;--dt-muted:#706a5e;--dt-rule:#d8d2c5;--dt-hot:#ab462f;--dt-wash:#eadbd0;--dt-board:#e2dfd6;--dt-page:#fffdf8;--dt-blue:#47697c;--dt-font:12px;--dt-icon:17px;--dt-hit:44px;--dt-panel:244px;font:400 var(--dt-font)/1.45 -apple-system,BlinkMacSystemFont,&#x27;Segoe UI&#x27;,sans-serif;color:var(--dt-ink);color-scheme:light}
+#dt-workspace-study[data-appearance=&quot;dark&quot;]{--dt-paper:#282824;--dt-surface:#242420;--dt-raised:#30302b;--dt-ink:#eeeadf;--dt-muted:#b8b1a3;--dt-rule:#48473f;--dt-hot:#e29376;--dt-wash:#48392f;--dt-board:#1d1e1c;--dt-page:#eee9dd;--dt-blue:#9bb8c9;color-scheme:dark}
+#dt-workspace-study *{box-sizing:border-box}#dt-workspace-study [hidden]{display:none!important}
+#dt-workspace-study button,#dt-workspace-study input,#dt-workspace-study select{font:inherit;color:inherit}#dt-workspace-study button{min-height:var(--dt-hit);border:0;border-radius:5px;background:transparent;padding:0 10px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}
+#dt-workspace-study button:hover{background:var(--dt-surface)}#dt-workspace-study button:disabled{opacity:.4;cursor:default}#dt-workspace-study button[aria-pressed=&quot;true&quot;],#dt-workspace-study button[aria-selected=&quot;true&quot;]{color:var(--dt-hot);background:var(--dt-wash)}
+#dt-workspace-study button.dt-primary{background:var(--dt-ink);color:var(--dt-paper)}#dt-workspace-study button.dt-danger{color:var(--dt-hot)}#dt-workspace-study .dt-icon{width:var(--dt-hit);flex-shrink:0;padding:0}#dt-workspace-study svg.lucide{width:var(--dt-icon);height:var(--dt-icon);stroke-width:1.6;flex-shrink:0}
+#dt-workspace-study input:not([type=&quot;checkbox&quot;]):not([type=&quot;range&quot;]):not([type=&quot;color&quot;]),#dt-workspace-study select{border:1px solid var(--dt-rule);border-radius:5px;min-height:var(--dt-hit);padding:5px 9px;background:var(--dt-raised);min-width:0;width:100%}#dt-workspace-study input[type=&quot;range&quot;]{accent-color:var(--dt-hot);min-height:var(--dt-hit);width:100%;min-width:45px;margin:0;cursor:pointer}#dt-workspace-study input[type=&quot;checkbox&quot;]{accent-color:var(--dt-hot);width:17px;height:17px;flex-shrink:0}#dt-workspace-study input[type=&quot;color&quot;]{height:var(--dt-hit);width:100%;padding:5px;background:var(--dt-raised);border:1px solid var(--dt-rule);border-radius:5px}
+#dt-workspace-study .dt-app{position:relative;background:var(--dt-paper);border:1px solid var(--dt-rule);border-radius:10px;overflow:clip;isolation:isolate}#dt-workspace-study .dt-top{display:flex;align-items:center;padding:0 6px;min-height:48px;border-bottom:1px solid var(--dt-rule);gap:2px;flex-wrap:wrap;background:var(--dt-raised)}#dt-workspace-study .dt-title{margin-right:auto;min-width:0;max-width:260px;justify-content:flex-start;font-weight:500}#dt-workspace-study .dt-title span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#dt-workspace-study .dt-separator{height:20px;width:1px;background:var(--dt-rule);margin:0 5px;flex-shrink:0}
+#dt-workspace-study .dt-context{display:flex;align-items:center;flex-wrap:wrap;gap:2px 12px;padding:3px 12px;min-height:50px;border-bottom:1px solid var(--dt-rule);background:var(--dt-paper)}#dt-workspace-study .dt-tool-name{font-weight:500;min-width:62px}#dt-workspace-study .dt-quick{display:flex;align-items:center;gap:7px;min-height:44px;white-space:nowrap}#dt-workspace-study .dt-quick input[type=&quot;range&quot;]{width:80px}#dt-workspace-study .dt-quick output{min-width:36px;font-variant-numeric:tabular-nums;text-align:right}#dt-workspace-study .dt-quick select{width:auto;max-width:170px}#dt-workspace-study .dt-context .dt-more{margin-left:auto}
+#dt-workspace-study .dt-workarea{display:grid;grid-template-columns:48px minmax(0,1fr) var(--dt-panel);min-height:624px;position:relative}#dt-workspace-study .dt-app[data-collapsed=&quot;true&quot;] .dt-workarea{grid-template-columns:48px minmax(0,1fr)}#dt-workspace-study .dt-app[data-collapsed=&quot;true&quot;] .dt-inspector{display:none}#dt-workspace-study .dt-rail{display:flex;flex-direction:column;align-items:center;background:var(--dt-surface);border-right:1px solid var(--dt-rule);padding:4px 1px;gap:0;z-index:2}#dt-workspace-study .dt-rail hr{width:24px;border:0;border-top:1px solid var(--dt-rule);margin:5px 0}#dt-workspace-study .dt-rail button{position:relative}#dt-workspace-study .dt-rail button[aria-pressed=&quot;true&quot;]:before{content:&#x27;&#x27;;position:absolute;left:0;top:12px;bottom:12px;width:2px;background:var(--dt-hot)}
+#dt-workspace-study .dt-canvas{min-width:0;background:var(--dt-board);position:relative;display:flex;align-items:center;justify-content:center;padding:45px 26px;overflow:clip}#dt-workspace-study .dt-paper{width:100%;max-width:750px;aspect-ratio:1.15;background:var(--dt-page);box-shadow:0 2px 9px #00000015;position:relative;transform:rotate(var(--dt-rotation,0deg));transition:transform .16s ease}#dt-workspace-study .dt-paper.dt-grid{background-image:linear-gradient(#8b897815 1px,transparent 1px),linear-gradient(90deg,#8b897815 1px,transparent 1px);background-size:20px 20px}#dt-workspace-study .dt-drawing{width:100%;height:100%;display:block;touch-action:none}#dt-workspace-study .dt-canvas-meta{position:absolute;left:16px;top:12px;color:var(--dt-muted);font-size:11px;letter-spacing:.07em;text-transform:uppercase}#dt-workspace-study .dt-canvas-tools{position:absolute;right:10px;bottom:10px;background:var(--dt-raised);border:1px solid var(--dt-rule);border-radius:6px;display:flex;align-items:center}#dt-workspace-study .dt-canvas-tools button{min-width:44px}#dt-workspace-study .dt-selection{display:none}#dt-workspace-study .dt-selection.on{display:block}
+#dt-workspace-study .dt-inspector{background:var(--dt-paper);border-left:1px solid var(--dt-rule);min-width:0;max-height:624px;overflow:auto}#dt-workspace-study .dt-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));padding:3px;gap:2px;border-bottom:1px solid var(--dt-rule);background:var(--dt-raised);position:sticky;top:0;z-index:2}#dt-workspace-study .dt-tabs button{padding:0 3px;font-size:var(--dt-font)}#dt-workspace-study .dt-panel{padding:12px;min-width:0}#dt-workspace-study .dt-section{margin:0 0 15px}#dt-workspace-study .dt-section-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:500;margin:0 0 8px;font-size:var(--dt-font)}#dt-workspace-study .dt-kicker{font-size:11px;color:var(--dt-muted);letter-spacing:.08em;text-transform:uppercase}#dt-workspace-study .dt-subtle{color:var(--dt-muted);font-size:11px;line-height:1.5}#dt-workspace-study .dt-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:44px;min-width:0}#dt-workspace-study .dt-row &gt;span:first-child{flex:1}#dt-workspace-study .dt-field{display:block;margin:8px 0}#dt-workspace-study .dt-field&gt;span{display:block;margin-bottom:4px;color:var(--dt-muted);font-size:11px}#dt-workspace-study .dt-range{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;column-gap:8px}#dt-workspace-study .dt-range input{grid-column:1/-1}#dt-workspace-study .dt-range output{font-variant-numeric:tabular-nums}#dt-workspace-study .dt-check{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:44px;cursor:pointer}#dt-workspace-study .dt-check span{flex:1}#dt-workspace-study .dt-two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}#dt-workspace-study .dt-three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}#dt-workspace-study .dt-button-row{display:flex;gap:4px;flex-wrap:wrap}#dt-workspace-study .dt-button-row button{border:1px solid var(--dt-rule);flex:1;padding:0 8px}#dt-workspace-study hr{border:0;border-top:1px solid var(--dt-rule);margin:12px 0}
+#dt-workspace-study .dt-layer{display:flex;align-items:center;margin:0 -8px;min-height:48px;border-radius:5px;border:1px solid transparent}#dt-workspace-study .dt-layer.active{background:var(--dt-wash);border-color:var(--dt-rule)}#dt-workspace-study .dt-layer-name{flex:1!important;justify-content:flex-start!important;padding:0 3px!important;min-width:0;overflow:hidden}#dt-workspace-study .dt-layer-name&gt;span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#dt-workspace-study .dt-type{font-size:11px;color:var(--dt-muted);border:1px solid var(--dt-rule);border-radius:3px;padding:0 3px;flex-shrink:0}#dt-workspace-study .dt-palette{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:2px}#dt-workspace-study .dt-swatch{min-width:44px;padding:0!important}#dt-workspace-study .dt-swatch:before{content:&#x27;&#x27;;background:var(--swatch);width:20px;height:20px;border:1px solid #77777755;border-radius:50%}#dt-workspace-study .dt-swatch[aria-pressed=&quot;true&quot;]:before{outline:2px solid var(--dt-hot);outline-offset:3px}#dt-workspace-study .dt-page-row{display:flex;align-items:center;gap:8px;margin:3px 0;border:1px solid var(--dt-rule);border-radius:5px;padding:5px}#dt-workspace-study .dt-page-row.active{border-color:var(--dt-hot);background:var(--dt-wash)}#dt-workspace-study .dt-page-row&gt;button{flex:1;justify-content:flex-start;min-width:0;white-space:normal;text-align:left}#dt-workspace-study .dt-thumb{width:40px;height:52px;border:1px solid #cfc7b7;background:repeating-linear-gradient(0deg,#fffdf7 0 10px,#d8d2c7 11px,#fffdf7 12px);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#6d6557;font-size:11px}
+#dt-workspace-study .dt-footer{display:flex;align-items:center;flex-wrap:wrap;gap:4px 16px;min-height:28px;padding:4px 12px;background:var(--dt-surface);border-top:1px solid var(--dt-rule);font-size:11px;color:var(--dt-muted)}#dt-workspace-study .dt-footer .dt-state{margin-left:auto;color:var(--dt-hot)}#dt-workspace-study .dt-toast{position:absolute;left:60px;right:16px;bottom:66px;margin:auto;width:max-content;max-width:calc(100% - 84px);padding:10px 14px;border:1px solid var(--dt-rule);border-radius:7px;background:var(--dt-raised);color:var(--dt-ink);z-index:15;box-shadow:0 5px 20px #00000015;pointer-events:none}
+#dt-workspace-study .dt-page-row&gt;.dt-icon{flex:0 0 var(--dt-hit)}#dt-workspace-study .dt-page-row&gt;button:not(.dt-icon){padding:0 3px;gap:8px}#dt-workspace-study .dt-page-row&gt;button:not(.dt-icon)&gt;span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#dt-workspace-study .dt-toast{z-index:30}#dt-workspace-study .dt-dialog p{font-size:13px}#dt-workspace-study .dt-dialog p.dt-subtle{font-size:11px}
+#dt-workspace-study .dt-overlay{position:absolute;inset:0;z-index:20;background:#16171235;padding:22px;display:flex;align-items:flex-start;justify-content:center;overflow:auto}#dt-workspace-study .dt-dialog{width:min(100%,560px);margin:auto;background:var(--dt-paper);border:1px solid var(--dt-rule);border-radius:12px;box-shadow:0 16px 65px #00000026;padding:0 18px 18px;min-width:0;max-height:100%;overflow:auto}#dt-workspace-study .dt-dialog.wide{width:min(100%,740px)}#dt-workspace-study .dt-dialog-head{display:flex;justify-content:space-between;align-items:center;min-height:58px;border-bottom:1px solid var(--dt-rule);margin-bottom:14px;gap:12px}#dt-workspace-study .dt-dialog-head h2{font-size:16px;font-weight:500;margin:0}#dt-workspace-study .dt-dialog-footer{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;border-top:1px solid var(--dt-rule);padding-top:12px}#dt-workspace-study .dt-dialog p{margin:8px 0 14px}#dt-workspace-study .dt-settings-tabs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:14px}#dt-workspace-study .dt-settings-tabs button{flex:1;border:1px solid var(--dt-rule)}#dt-workspace-study .dt-doc-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:14px 0}#dt-workspace-study .dt-doc{border:1px solid var(--dt-rule);border-radius:7px;overflow:hidden;min-width:0}#dt-workspace-study .dt-doc&gt;button{width:100%;display:flex;flex-direction:column;align-items:flex-start;padding:12px;white-space:normal;text-align:left;min-height:170px;gap:8px}#dt-workspace-study .dt-doc-art{height:85px;width:100%;background:var(--dt-surface);display:flex;align-items:center;justify-content:center;color:var(--dt-muted);border-radius:3px}#dt-workspace-study .dt-doc-art svg{width:32px;height:32px}#dt-workspace-study .dt-progress{height:4px;background:var(--dt-rule);margin:16px 0}#dt-workspace-study .dt-progress&gt;span{height:100%;display:block;width:66%;background:var(--dt-hot)}
+#dt-workspace-study .dt-squeeze{width:min(270px,100%);margin:18px auto;display:grid;grid-template-columns:repeat(3,1fr);gap:5px;padding:12px;background:var(--dt-surface);border-radius:24px}#dt-workspace-study .dt-squeeze button{flex-direction:column;min-height:62px;font-size:11px}#dt-workspace-study .dt-squeeze .dt-center{background:var(--dt-paper);border-radius:100%;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--dt-muted)}
+#dt-workspace-study[data-hand=&quot;left&quot;] .dt-workarea{grid-template-columns:var(--dt-panel) minmax(0,1fr) 48px}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-rail{grid-column:3;grid-row:1;border-left:1px solid var(--dt-rule);border-right:0}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-canvas{grid-column:2;grid-row:1}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-inspector{grid-column:1;grid-row:1;border-left:0;border-right:1px solid var(--dt-rule)}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-app[data-collapsed=&quot;true&quot;] .dt-workarea{grid-template-columns:minmax(0,1fr) 48px}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-app[data-collapsed=&quot;true&quot;] .dt-canvas{grid-column:1}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-app[data-collapsed=&quot;true&quot;] .dt-rail{grid-column:2}
+@media(max-width:820px){#dt-workspace-study .dt-workarea{grid-template-columns:48px minmax(0,1fr)}#dt-workspace-study .dt-inspector{position:absolute;right:0;top:0;bottom:0;width:min(var(--dt-panel),calc(100% - 48px));z-index:5;overflow:auto;box-shadow:-8px 0 24px #00000012}#dt-workspace-study .dt-canvas{padding:36px 20px}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-workarea{grid-template-columns:minmax(0,1fr) 48px}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-canvas{grid-column:1}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-rail{grid-column:2}#dt-workspace-study[data-hand=&quot;left&quot;] .dt-inspector{right:auto;left:0}#dt-workspace-study .dt-title{max-width:200px}#dt-workspace-study .dt-top-label{display:none}}
+@media(max-width:500px){#dt-workspace-study .dt-top{gap:0}#dt-workspace-study .dt-title{max-width:calc(100% - 55px);flex:1}#dt-workspace-study .dt-top .dt-separator{display:none}#dt-workspace-study .dt-context{padding:4px 8px;gap:0 8px}#dt-workspace-study .dt-quick input[type=&quot;range&quot;]{width:62px}#dt-workspace-study .dt-canvas{padding:25px 12px}#dt-workspace-study .dt-overlay{padding:8px}#dt-workspace-study .dt-dialog{padding:0 12px 12px}#dt-workspace-study .dt-doc-grid{grid-template-columns:1fr}#dt-workspace-study .dt-doc&gt;button{min-height:110px}#dt-workspace-study .dt-doc-art{height:45px}#dt-workspace-study .dt-three{grid-template-columns:1fr}#dt-workspace-study .dt-canvas-meta{max-width:calc(100% - 20px);left:10px;font-size:11px}#dt-workspace-study .dt-canvas-tools{right:5px;bottom:8px}#dt-workspace-study .dt-footer .dt-state{margin-left:0}}
+@media(pointer:coarse){#dt-workspace-study input:not([type=&quot;checkbox&quot;]):not([type=&quot;range&quot;]),#dt-workspace-study select{font-size:16px}}
+@media(max-width:500px){#dt-workspace-study .dt-top .dt-title{flex:1 0 calc(100% - 52px);max-width:calc(100% - 48px)}}
+@media(prefers-reduced-motion:reduce){#dt-workspace-study *{transition:none!important}}
+&lt;/style&gt;
+&lt;div class=&quot;dt-app&quot; data-collapsed=&quot;false&quot;&gt;
+ &lt;header class=&quot;dt-top&quot; aria-label=&quot;Document and workspace controls&quot;&gt;
+  &lt;button class=&quot;dt-icon&quot; data-action=&quot;documents&quot; aria-label=&quot;Documents&quot;&gt;&lt;i data-lucide=&quot;library&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+  &lt;button class=&quot;dt-title&quot; data-action=&quot;document&quot;&gt;&lt;span data-document-title&gt;Desk lamp · studies&lt;/span&gt;&lt;i data-lucide=&quot;chevron-down&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+  &lt;button class=&quot;dt-icon&quot; data-action=&quot;undo&quot; aria-label=&quot;Undo&quot;&gt;&lt;i data-lucide=&quot;undo-2&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;&lt;button class=&quot;dt-icon&quot; data-action=&quot;redo&quot; aria-label=&quot;Redo&quot;&gt;&lt;i data-lucide=&quot;redo-2&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+  &lt;span class=&quot;dt-separator&quot;&gt;&lt;/span&gt;
+  &lt;button data-action=&quot;view&quot; aria-label=&quot;Canvas view and snapping&quot;&gt;&lt;i data-lucide=&quot;grid-2x2&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;span class=&quot;dt-top-label&quot;&gt;View&lt;/span&gt;&lt;/button&gt;
+  &lt;button class=&quot;dt-icon&quot; data-action=&quot;pencil&quot; aria-label=&quot;Apple Pencil settings and shortcuts&quot;&gt;&lt;i data-lucide=&quot;pencil-ruler&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+  &lt;button class=&quot;dt-icon&quot; data-action=&quot;export&quot; aria-label=&quot;Export&quot;&gt;&lt;i data-lucide=&quot;upload&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+  &lt;button class=&quot;dt-icon&quot; data-action=&quot;settings&quot; aria-label=&quot;Preferences&quot;&gt;&lt;i data-lucide=&quot;settings-2&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+  &lt;button class=&quot;dt-icon&quot; data-action=&quot;inspector&quot; aria-label=&quot;Toggle inspector&quot; aria-pressed=&quot;true&quot;&gt;&lt;i data-lucide=&quot;panel-right&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;
+ &lt;/header&gt;
+ &lt;div class=&quot;dt-context&quot; aria-label=&quot;Current tool options&quot;&gt;&lt;/div&gt;
+ &lt;div class=&quot;dt-workarea&quot;&gt;
+  &lt;nav class=&quot;dt-rail&quot; aria-label=&quot;Drawing tools&quot;&gt;&lt;/nav&gt;
+  &lt;main class=&quot;dt-canvas&quot; aria-label=&quot;Illustrative drawing canvas&quot;&gt;
+   &lt;span class=&quot;dt-canvas-meta&quot;&gt;01 / Form studies&lt;/span&gt;
+   &lt;div class=&quot;dt-paper dt-grid&quot;&gt;
+    &lt;svg class=&quot;dt-drawing&quot; viewBox=&quot;0 0 600 520&quot; role=&quot;img&quot; aria-label=&quot;Technical desk lamp drawing with construction guides, vector outlines, and shaded form&quot;&gt;
+     &lt;defs&gt;&lt;pattern id=&quot;dt-hatch&quot; width=&quot;6&quot; height=&quot;6&quot; patternTransform=&quot;rotate(25)&quot; patternUnits=&quot;userSpaceOnUse&quot;&gt;&lt;path d=&quot;M0 0 V6&quot; stroke=&quot;#aa7e64&quot; stroke-width=&quot;.65&quot;/&gt;&lt;/pattern&gt;&lt;/defs&gt;
+     &lt;g data-art-layer=&quot;Construction&quot; fill=&quot;none&quot; stroke=&quot;#a69d8d&quot; stroke-width=&quot;.7&quot; stroke-dasharray=&quot;4 5&quot;&gt;&lt;path d=&quot;M80 420H510 M305 65V452 M142 185H487 M200 102L420 417 M152 360L430 87&quot;/&gt;&lt;ellipse cx=&quot;301&quot; cy=&quot;412&quot; rx=&quot;113&quot; ry=&quot;32&quot;/&gt;&lt;path d=&quot;M236 126L230 423 M385 126L385 423&quot;/&gt;&lt;/g&gt;
+     &lt;g data-art-layer=&quot;Shading&quot;&gt;&lt;path d=&quot;M190 179L346 91L430 187L282 241Z&quot; fill=&quot;#e2c9ae&quot; opacity=&quot;.8&quot;/&gt;&lt;path d=&quot;M282 241L430 187L429 204L285 258Z&quot; fill=&quot;#c29774&quot; opacity=&quot;.7&quot;/&gt;&lt;path d=&quot;M288 248L304 243L354 341L342 347Z&quot; fill=&quot;#b3a18c&quot;/&gt;&lt;ellipse cx=&quot;301&quot; cy=&quot;418&quot; rx=&quot;100&quot; ry=&quot;26&quot; fill=&quot;#ddd4c4&quot;/&gt;&lt;path d=&quot;M206 416Q302 445 399 416L399 425Q301 456 206 425Z&quot; fill=&quot;#cabaa2&quot;/&gt;&lt;path d=&quot;M197 180L346 98L418 183L283 231Z&quot; fill=&quot;url(#dt-hatch)&quot;/&gt;&lt;/g&gt;
+     &lt;g data-art-layer=&quot;Ink&quot; fill=&quot;none&quot; stroke=&quot;#37372f&quot; stroke-width=&quot;1.6&quot; stroke-linecap=&quot;round&quot; stroke-linejoin=&quot;round&quot;&gt;&lt;path d=&quot;M190 179L346 91L430 187L282 241Z M190 179L195 196L285 258L429 204L430 187 M282 241L285 258 M288 248L342 347L354 341L304 243 M342 347L286 404 M354 341L300 409 M286 404Q291 414 300 409&quot;/&gt;&lt;ellipse cx=&quot;301&quot; cy=&quot;413&quot; rx=&quot;98&quot; ry=&quot;25&quot;/&gt;&lt;path d=&quot;M203 413V423C203 457 399 457 399 423V413&quot;/&gt;&lt;circle cx=&quot;347&quot; cy=&quot;342&quot; r=&quot;11&quot; fill=&quot;#f4efe4&quot;/&gt;&lt;circle cx=&quot;347&quot; cy=&quot;342&quot; r=&quot;3&quot;/&gt;&lt;path d=&quot;M286 172Q329 144 363 134 M293 183L371 143 M300 194L379 153&quot; stroke-width=&quot;.8&quot;/&gt;&lt;path d=&quot;M264 437C258 465 393 458 424 469&quot; stroke-width=&quot;1&quot;/&gt;&lt;/g&gt;
+     &lt;g fill=&quot;#837a6c&quot; font-family=&quot;monospace&quot; font-size=&quot;11&quot;&gt;&lt;text x=&quot;54&quot; y=&quot;63&quot; letter-spacing=&quot;2&quot;&gt;LAMP / 03&lt;/text&gt;&lt;text x=&quot;54&quot; y=&quot;80&quot; font-size=&quot;11&quot;&gt;Form + articulation&lt;/text&gt;&lt;text x=&quot;430&quot; y=&quot;332&quot;&gt;Ø 22&lt;/text&gt;&lt;text x=&quot;401&quot; y=&quot;132&quot;&gt;01&lt;/text&gt;&lt;text x=&quot;434&quot; y=&quot;459&quot;&gt;1:5&lt;/text&gt;&lt;/g&gt;
+     &lt;g fill=&quot;none&quot; stroke=&quot;#ad785f&quot; stroke-width=&quot;.8&quot;&gt;&lt;path d=&quot;M369 124L398 125 M361 334L421 328 M203 467H399 M203 463V471 M399 463V471&quot;/&gt;&lt;/g&gt;
+     &lt;g class=&quot;dt-selection&quot; fill=&quot;#fffdf8&quot; stroke=&quot;#ab462f&quot; stroke-width=&quot;1.2&quot;&gt;&lt;rect x=&quot;182&quot; y=&quot;82&quot; width=&quot;257&quot; height=&quot;185&quot; fill=&quot;none&quot; stroke-dasharray=&quot;5 3&quot;/&gt;&lt;rect x=&quot;178&quot; y=&quot;78&quot; width=&quot;8&quot; height=&quot;8&quot;/&gt;&lt;rect x=&quot;435&quot; y=&quot;78&quot; width=&quot;8&quot; height=&quot;8&quot;/&gt;&lt;rect x=&quot;178&quot; y=&quot;263&quot; width=&quot;8&quot; height=&quot;8&quot;/&gt;&lt;rect x=&quot;435&quot; y=&quot;263&quot; width=&quot;8&quot; height=&quot;8&quot;/&gt;&lt;path d=&quot;M310 82V60&quot;/&gt;&lt;circle cx=&quot;310&quot; cy=&quot;55&quot; r=&quot;5&quot;/&gt;&lt;/g&gt;
+    &lt;/svg&gt;
+   &lt;/div&gt;
+   &lt;div class=&quot;dt-canvas-tools&quot;&gt;&lt;button data-action=&quot;zoomout&quot; aria-label=&quot;Zoom out&quot;&gt;−&lt;/button&gt;&lt;button data-action=&quot;fit&quot; aria-label=&quot;Fit page&quot;&gt;&lt;span data-zoom&gt;100%&lt;/span&gt;&lt;/button&gt;&lt;button data-action=&quot;zoomin&quot; aria-label=&quot;Zoom in&quot;&gt;+&lt;/button&gt;&lt;button class=&quot;dt-icon&quot; data-action=&quot;focus&quot; aria-label=&quot;Focus canvas&quot;&gt;&lt;i data-lucide=&quot;maximize&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;&lt;/button&gt;&lt;/div&gt;
+  &lt;/main&gt;
+  &lt;aside class=&quot;dt-inspector&quot; aria-label=&quot;Workspace inspector&quot;&gt;
+   &lt;div class=&quot;dt-tabs&quot; role=&quot;tablist&quot; aria-label=&quot;Inspector panels&quot;&gt;&lt;button role=&quot;tab&quot; id=&quot;dt-tab-tool&quot; data-tab=&quot;tool&quot; aria-controls=&quot;dt-panel-content&quot; aria-selected=&quot;false&quot;&gt;Tool&lt;/button&gt;&lt;button role=&quot;tab&quot; id=&quot;dt-tab-layers&quot; data-tab=&quot;layers&quot; aria-controls=&quot;dt-panel-content&quot; aria-selected=&quot;true&quot;&gt;Layers&lt;/button&gt;&lt;button role=&quot;tab&quot; id=&quot;dt-tab-pages&quot; data-tab=&quot;pages&quot; aria-controls=&quot;dt-panel-content&quot; aria-selected=&quot;false&quot;&gt;Pages&lt;/button&gt;&lt;button role=&quot;tab&quot; id=&quot;dt-tab-color&quot; data-tab=&quot;color&quot; aria-controls=&quot;dt-panel-content&quot; aria-selected=&quot;false&quot;&gt;Color&lt;/button&gt;&lt;/div&gt;
+   &lt;div class=&quot;dt-panel&quot; id=&quot;dt-panel-content&quot; role=&quot;tabpanel&quot; aria-labelledby=&quot;dt-tab-layers&quot;&gt;&lt;/div&gt;
+  &lt;/aside&gt;
+ &lt;/div&gt;
+ &lt;footer class=&quot;dt-footer&quot;&gt;&lt;span data-foot-tool&gt;Brush · Ink&lt;/span&gt;&lt;span data-foot-page&gt;A4 · 300 dpi&lt;/span&gt;&lt;span data-foot-grid&gt;Grid 10 mm · Snap on&lt;/span&gt;&lt;span class=&quot;dt-state&quot;&gt;Design preview · simulated document&lt;/span&gt;&lt;/footer&gt;
+ &lt;div class=&quot;dt-toast&quot; role=&quot;status&quot; aria-live=&quot;polite&quot; hidden&gt;&lt;/div&gt;
+ &lt;div class=&quot;dt-overlay&quot; hidden&gt;&lt;section class=&quot;dt-dialog&quot; role=&quot;dialog&quot; aria-modal=&quot;true&quot; aria-labelledby=&quot;dt-dialog-title&quot;&gt;&lt;/section&gt;&lt;/div&gt;
+&lt;/div&gt;
+&lt;script&gt;
+(()=&gt;{
+const root=document.getElementById(&#x27;dt-workspace-study&#x27;);
+const q=s=&gt;root.querySelector(s), qa=s=&gt;Array.from(root.querySelectorAll(s));
+const state={tool:&#x27;Brush&#x27;,tab:&#x27;layers&#x27;,collapsed:false,color:&#x27;#2a2823&#x27;,previous:&#x27;#ab462f&#x27;,size:8,opacity:100,hardness:85,pressure:75,uniform:true,gap:4,bleed:2,tolerance:16,fillSource:&#x27;Active layer&#x27;,shadeClose:&#x27;Straight chord&#x27;,width:2,shapeFill:&#x27;None&#x27;,feather:0,selectionMode:&#x27;Replace&#x27;,grid:true,snap:true,pixel:false,angle:true,angleStep:&#x27;15°&#x27;,gridStep:10,rotation:0,zoom:100,hover:true,predict:true,pencilOnly:true,haptics:true,doubleTap:&#x27;Brush / eraser&#x27;,squeeze:&#x27;Quick palette&#x27;,barrel:&#x27;Shade orientation&#x27;,activation:3,stabilize:15,hand:&#x27;right&#x27;,appearance:&#x27;light&#x27;,textSize:12,iconSize:17,panelWidth:244,comfort:false,docName:&#x27;Desk lamp · studies&#x27;,preset:&#x27;A4&#x27;,orientation:&#x27;Portrait&#x27;,dpi:300,page:1,layer:2,settingTab:&#x27;Workspace&#x27;,exportFormat:&#x27;PNG&#x27;,exportScope:&#x27;Current page&#x27;,background:true,exportScale:&#x27;1×&#x27;,copySelection:false,selected:false,layerCounter:4,pages:[{id:1,name:&#x27;Form studies&#x27;},{id:2,name:&#x27;Joint detail&#x27;},{id:3,name:&#x27;Color variations&#x27;}],layers:[{id:1,name:&#x27;Construction&#x27;,type:&#x27;V&#x27;,visible:true,locked:false,opacity:35},{id:2,name:&#x27;Ink&#x27;,type:&#x27;R&#x27;,visible:true,locked:false,opacity:100},{id:3,name:&#x27;Shading&#x27;,type:&#x27;R&#x27;,visible:true,locked:false,opacity:80}],history:[],redo:[],docs:[&#x27;Desk lamp · studies&#x27;,&#x27;Workshop details&#x27;,&#x27;Perspective warmups&#x27;],errorMode:&#x27;Saved&#x27;};
+const tools=[[&#x27;Brush&#x27;,&#x27;pen-tool&#x27;,&#x27;B&#x27;],[&#x27;Eraser&#x27;,&#x27;eraser&#x27;,&#x27;E&#x27;],[&#x27;Bucket&#x27;,&#x27;paint-bucket&#x27;,&#x27;F&#x27;],[&#x27;Shade&#x27;,&#x27;blend&#x27;,&#x27;H&#x27;],[&#x27;Line&#x27;,&#x27;slash&#x27;,&#x27;L&#x27;],[&#x27;Rectangle&#x27;,&#x27;square&#x27;,&#x27;R&#x27;],[&#x27;Circle&#x27;,&#x27;circle&#x27;,&#x27;C&#x27;],[&#x27;Ellipse&#x27;,&#x27;circle-ellipsis&#x27;,&#x27;O&#x27;],[&#x27;Select&#x27;,&#x27;scan&#x27;,&#x27;V&#x27;],[&#x27;Lasso&#x27;,&#x27;lasso&#x27;,&#x27;Q&#x27;],[&#x27;Eyedropper&#x27;,&#x27;pipette&#x27;,&#x27;I&#x27;]];
+const palette=[&#x27;#000000&#x27;,&#x27;#6E2218&#x27;,&#x27;#8A3F0F&#x27;,&#x27;#886C18&#x27;,&#x27;#3D5E26&#x27;,&#x27;#195049&#x27;,&#x27;#1A3D60&#x27;,&#x27;#4A2A65&#x27;,&#x27;#1A1A1A&#x27;,&#x27;#B5482E&#x27;,&#x27;#C77A1F&#x27;,&#x27;#C8A030&#x27;,&#x27;#5A8C3A&#x27;,&#x27;#2F7E78&#x27;,&#x27;#2A5D8F&#x27;,&#x27;#6B3A8A&#x27;,&#x27;#6E6457&#x27;,&#x27;#C07A60&#x27;,&#x27;#D0A270&#x27;,&#x27;#CAB870&#x27;,&#x27;#95B070&#x27;,&#x27;#6FA59E&#x27;,&#x27;#6F95C0&#x27;,&#x27;#A088B5&#x27;,&#x27;#FFFFFF&#x27;,&#x27;#7A7368&#x27;,&#x27;#A89E8A&#x27;,&#x27;#D9CFB8&#x27;,&#x27;#F2D89A&#x27;,&#x27;#F2A48F&#x27;,&#x27;#9DB8D8&#x27;,&#x27;#C7D2A8&#x27;];
+const escape=s=&gt;String(s).replace(/[&amp;&lt;&gt;&quot;&#x27;]/g,c=&gt;({&#x27;&amp;&#x27;:&#x27;&amp;amp;&#x27;,&#x27;&lt;&#x27;:&#x27;&amp;lt;&#x27;,&#x27;&gt;&#x27;:&#x27;&amp;gt;&#x27;,&#x27;&quot;&#x27;:&#x27;&amp;quot;&#x27;,&quot;&#x27;&quot;:&#x27;&amp;#39;&#x27;}[c]));
+const ico=n=&gt;`&lt;i data-lucide=&quot;${n}&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;`;
+const btn=(a,label,icon=&#x27;&#x27;,cl=&#x27;&#x27;,disabled=false)=&gt;`&lt;button data-action=&quot;${a}&quot; class=&quot;${cl}&quot; ${disabled?&#x27;disabled&#x27;:&#x27;&#x27;}&gt;${icon?ico(icon):&#x27;&#x27;}${label}&lt;/button&gt;`;
+const ibtn=(a,label,icon,disabled=false)=&gt;`&lt;button class=&quot;dt-icon&quot; data-action=&quot;${a}&quot; aria-label=&quot;${escape(label)}&quot; ${disabled?&#x27;disabled&#x27;:&#x27;&#x27;}&gt;${ico(icon)}&lt;/button&gt;`;
+const check=(key,label)=&gt;`&lt;label class=&quot;dt-check&quot;&gt;&lt;span&gt;${label}&lt;/span&gt;&lt;input type=&quot;checkbox&quot; data-key=&quot;${key}&quot; ${state[key]?&#x27;checked&#x27;:&#x27;&#x27;}&gt;&lt;/label&gt;`;
+const range=(key,label,min,max,unit=&#x27;&#x27;,step=1)=&gt;`&lt;label class=&quot;dt-range&quot;&gt;&lt;span&gt;${label}&lt;/span&gt;&lt;output data-value=&quot;${key}&quot;&gt;${state[key]}${unit}&lt;/output&gt;&lt;input type=&quot;range&quot; data-key=&quot;${key}&quot; min=&quot;${min}&quot; max=&quot;${max}&quot; step=&quot;${step}&quot; value=&quot;${state[key]}&quot; data-unit=&quot;${unit}&quot; aria-label=&quot;${label}&quot;&gt;&lt;/label&gt;`;
+const select=(key,label,options)=&gt;`&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;${label}&lt;/span&gt;&lt;select data-key=&quot;${key}&quot; aria-label=&quot;${label}&quot;&gt;${options.map(v=&gt;`&lt;option ${String(state[key])===String(v)?&#x27;selected&#x27;:&#x27;&#x27;}&gt;${escape(v)}&lt;/option&gt;`).join(&#x27;&#x27;)}&lt;/select&gt;&lt;/label&gt;`;
+const input=(key,label,type=&#x27;text&#x27;)=&gt;`&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;${label}&lt;/span&gt;&lt;input data-key=&quot;${key}&quot; aria-label=&quot;${label}&quot; type=&quot;${type}&quot; value=&quot;${escape(state[key])}&quot;&gt;&lt;/label&gt;`;
+const section=(title,html)=&gt;`&lt;section class=&quot;dt-section&quot;&gt;&lt;h3 class=&quot;dt-section-title&quot;&gt;${title}&lt;/h3&gt;${html}&lt;/section&gt;`;
+const currentLayer=()=&gt;state.layers.find(l=&gt;l.id===state.layer)||state.layers[0];
+const icons=()=&gt;{if(globalThis.lucide)globalThis.lucide.createIcons({attrs:{width:17,height:17}})};
+let toastTimer,returnFocus;
+function toast(text){q(&#x27;.dt-toast&#x27;).textContent=text;q(&#x27;.dt-toast&#x27;).hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=&gt;q(&#x27;.dt-toast&#x27;).hidden=true,3500)}
+function history(){state.history.push(JSON.stringify({layers:state.layers,pages:state.pages,layer:state.layer,page:state.page}));state.redo=[]}
+function applyDesign(){root.dataset.hand=state.hand;root.dataset.appearance=state.appearance;root.style.setProperty(&#x27;--dt-font&#x27;,state.textSize+&#x27;px&#x27;);root.style.setProperty(&#x27;--dt-icon&#x27;,state.iconSize+&#x27;px&#x27;);root.style.setProperty(&#x27;--dt-panel&#x27;,state.panelWidth+&#x27;px&#x27;);root.style.setProperty(&#x27;--dt-hit&#x27;,state.comfort?&#x27;48px&#x27;:&#x27;44px&#x27;)}
+function sync(){
+ applyDesign();q(&#x27;.dt-app&#x27;).dataset.collapsed=String(state.collapsed);q(&#x27;[data-action=&quot;inspector&quot;]&#x27;).setAttribute(&#x27;aria-pressed&#x27;,String(!state.collapsed));q(&#x27;[data-document-title]&#x27;).textContent=state.docName;q(&#x27;[data-foot-tool]&#x27;).textContent=state.tool+&#x27; · &#x27;+currentLayer().name;q(&#x27;[data-foot-page]&#x27;).textContent=state.preset+&#x27; · &#x27;+state.dpi+&#x27; dpi&#x27;;q(&#x27;[data-foot-grid]&#x27;).textContent=(state.grid?&#x27;Grid &#x27;+state.gridStep+&#x27; mm&#x27;:&#x27;Grid off&#x27;)+&#x27; · Snap &#x27;+(state.snap?&#x27;on&#x27;:&#x27;off&#x27;);q(&#x27;[data-zoom]&#x27;).textContent=state.zoom+&#x27;%&#x27;;q(&#x27;.dt-canvas-meta&#x27;).textContent=String(state.page).padStart(2,&#x27;0&#x27;)+&#x27; / &#x27;+(state.pages.find(p=&gt;p.id===state.page)?.name||&#x27;Untitled&#x27;);q(&#x27;.dt-paper&#x27;).classList.toggle(&#x27;dt-grid&#x27;,state.grid);q(&#x27;.dt-paper&#x27;).style.setProperty(&#x27;--dt-rotation&#x27;,state.rotation+&#x27;deg&#x27;);q(&#x27;.dt-paper&#x27;).style.scale=state.zoom/100;q(&#x27;.dt-selection&#x27;).classList.toggle(&#x27;on&#x27;,state.selected);q(&#x27;[data-action=&quot;undo&quot;]&#x27;).disabled=!state.history.length;q(&#x27;[data-action=&quot;redo&quot;]&#x27;).disabled=!state.redo.length;
+ q(&#x27;.dt-paper&#x27;).style.backgroundSize=(state.gridStep*2)+&#x27;px &#x27;+(state.gridStep*2)+&#x27;px&#x27;;
+ qa(&#x27;[data-art-layer]&#x27;).forEach(el=&gt;{const l=state.layers.find(l=&gt;(l.artName||l.name)===el.dataset.artLayer);el.style.opacity=l&amp;&amp;l.visible?l.opacity/100:0});
+ qa(&#x27;[data-tool]&#x27;).forEach(b=&gt;b.setAttribute(&#x27;aria-pressed&#x27;,String(state.tool===b.dataset.tool)));qa(&#x27;[data-tab]&#x27;).forEach(b=&gt;b.setAttribute(&#x27;aria-selected&#x27;,String(state.tab===b.dataset.tab)));q(&#x27;#dt-panel-content&#x27;).setAttribute(&#x27;aria-labelledby&#x27;,&#x27;dt-tab-&#x27;+state.tab);
+}
+function quickRange(key,label,max,unit){return `&lt;label class=&quot;dt-quick&quot;&gt;&lt;span&gt;${label}&lt;/span&gt;&lt;input type=&quot;range&quot; data-key=&quot;${key}&quot; min=&quot;${key===&#x27;size&#x27;?1:0}&quot; max=&quot;${max}&quot; value=&quot;${state[key]}&quot; data-unit=&quot;${unit}&quot; aria-label=&quot;${label}&quot;&gt;&lt;output data-value=&quot;${key}&quot;&gt;${state[key]}${unit}&lt;/output&gt;&lt;/label&gt;`}
+function context(){
+ let html=`&lt;span class=&quot;dt-tool-name&quot;&gt;${state.tool}&lt;/span&gt;`;
+ if([&#x27;Brush&#x27;,&#x27;Eraser&#x27;,&#x27;Shade&#x27;].includes(state.tool)){html+=quickRange(&#x27;size&#x27;,&#x27;Size&#x27;,80,&#x27; px&#x27;)+quickRange(&#x27;opacity&#x27;,&#x27;Opacity&#x27;,100,&#x27;%&#x27;);if(state.tool===&#x27;Brush&#x27;)html+=`&lt;button data-action=&quot;uniform&quot; aria-pressed=&quot;${state.uniform}&quot;&gt;Uniform α&lt;/button&gt;`}
+ else if(state.tool===&#x27;Bucket&#x27;)html+=quickRange(&#x27;gap&#x27;,&#x27;Close gap&#x27;,20,&#x27; px&#x27;)+quickRange(&#x27;bleed&#x27;,&#x27;Bleed&#x27;,12,&#x27; px&#x27;)+`&lt;label class=&quot;dt-quick&quot;&gt;&lt;select data-key=&quot;fillSource&quot; aria-label=&quot;Fill boundaries&quot;&gt;&lt;option ${state.fillSource===&#x27;Active layer&#x27;?&#x27;selected&#x27;:&#x27;&#x27;}&gt;Active layer&lt;/option&gt;&lt;option ${state.fillSource===&#x27;Visible layers&#x27;?&#x27;selected&#x27;:&#x27;&#x27;}&gt;Visible layers&lt;/option&gt;&lt;/select&gt;&lt;/label&gt;`;
+ else if([&#x27;Line&#x27;,&#x27;Rectangle&#x27;,&#x27;Circle&#x27;,&#x27;Ellipse&#x27;].includes(state.tool))html+=quickRange(&#x27;width&#x27;,&#x27;Stroke&#x27;,20,&#x27; px&#x27;)+(state.tool===&#x27;Line&#x27;?&#x27;&#x27;:`&lt;button data-action=&quot;shapeFill&quot; aria-pressed=&quot;${state.shapeFill!==&#x27;None&#x27;}&quot;&gt;Fill ${state.shapeFill===&#x27;None&#x27;?&#x27;off&#x27;:&#x27;on&#x27;}&lt;/button&gt;`)+`&lt;button data-action=&quot;snap&quot; aria-pressed=&quot;${state.snap}&quot;&gt;${ico(&#x27;magnet&#x27;)}Snap&lt;/button&gt;`;
+ else if([&#x27;Select&#x27;,&#x27;Lasso&#x27;].includes(state.tool))html+=`&lt;label class=&quot;dt-quick&quot;&gt;&lt;select data-key=&quot;selectionMode&quot; aria-label=&quot;Selection mode&quot;&gt;${[&#x27;Replace&#x27;,&#x27;Add&#x27;,&#x27;Subtract&#x27;,&#x27;Intersect&#x27;].map(x=&gt;`&lt;option ${state.selectionMode===x?&#x27;selected&#x27;:&#x27;&#x27;}&gt;${x}&lt;/option&gt;`).join(&#x27;&#x27;)}&lt;/select&gt;&lt;/label&gt;`+btn(&#x27;selectSample&#x27;,state.selected?&#x27;Clear selection&#x27;:&#x27;Select sample&#x27;)+btn(&#x27;transform&#x27;,&#x27;Transform&#x27;,&#x27;move&#x27;, &#x27;&#x27;,!state.selected)+btn(&#x27;copy&#x27;,&#x27;Copy&#x27;,&#x27;copy&#x27;,&#x27;&#x27;,!state.selected)+btn(&#x27;paste&#x27;,&#x27;Paste&#x27;,&#x27;clipboard&#x27;,&#x27;&#x27;,!state.copySelection);
+ else html+=`&lt;span class=&quot;dt-subtle&quot;&gt;Sample the canvas · return to previous tool&lt;/span&gt;`;
+ if(![&#x27;Eraser&#x27;,&#x27;Select&#x27;,&#x27;Lasso&#x27;].includes(state.tool))html+=`&lt;button class=&quot;dt-swatch&quot; style=&quot;--swatch:${state.color}&quot; data-action=&quot;color&quot; aria-label=&quot;Current color; open color panel&quot;&gt;&lt;/button&gt;`;
+ html+=`&lt;button class=&quot;dt-more&quot; data-action=&quot;toolPanel&quot; aria-label=&quot;Show all current tool options&quot;&gt;${ico(&#x27;sliders-horizontal&#x27;)}Options&lt;/button&gt;`;q(&#x27;.dt-context&#x27;).innerHTML=html;icons();
+}
+function renderTool(){
+ const t=state.tool;let body=&#x27;&#x27;;
+ if([&#x27;Brush&#x27;,&#x27;Eraser&#x27;,&#x27;Shade&#x27;].includes(t)){body+=section(t+&#x27; settings&#x27;,range(&#x27;size&#x27;,&#x27;Size&#x27;,1,80,&#x27; px&#x27;)+range(&#x27;opacity&#x27;,&#x27;Opacity&#x27;,0,100,&#x27;%&#x27;)+range(&#x27;hardness&#x27;,&#x27;Hardness&#x27;,0,100,&#x27;%&#x27;)+range(&#x27;pressure&#x27;,&#x27;Pressure response&#x27;,0,100,&#x27;%&#x27;)+check(&#x27;uniform&#x27;,&#x27;Uniform opacity&#x27;));if(t===&#x27;Shade&#x27;)body+=select(&#x27;shadeClose&#x27;,&#x27;Open-path closure&#x27;,[&#x27;Straight chord&#x27;,&#x27;Close to start&#x27;])+`&lt;div class=&quot;dt-subtle&quot;&gt;The enclosed area fills when you lift the Pencil.&lt;/div&gt;`;body+=section(&#x27;Stroke feel&#x27;,range(&#x27;stabilize&#x27;,&#x27;Stabilization&#x27;,0,100,&#x27;%&#x27;)+check(&#x27;predict&#x27;,&#x27;Motion prediction&#x27;))}
+ else if(t===&#x27;Bucket&#x27;){body+=section(&#x27;Fill boundaries&#x27;,select(&#x27;fillSource&#x27;,&#x27;Sample&#x27;,[&#x27;Active layer&#x27;,&#x27;Visible layers&#x27;])+range(&#x27;tolerance&#x27;,&#x27;Color tolerance&#x27;,0,100,&#x27;%&#x27;)+range(&#x27;gap&#x27;,&#x27;Close gaps up to&#x27;,0,20,&#x27; px&#x27;)+range(&#x27;bleed&#x27;,&#x27;Bleed past edge&#x27;,0,12,&#x27; px&#x27;)+range(&#x27;opacity&#x27;,&#x27;Fill opacity&#x27;,0,100,&#x27;%&#x27;))+`&lt;p class=&quot;dt-subtle&quot;&gt;Fills write to the active raster layer. Visible layers excludes the grid and page background.&lt;/p&gt;`}
+ else if([&#x27;Line&#x27;,&#x27;Rectangle&#x27;,&#x27;Circle&#x27;,&#x27;Ellipse&#x27;].includes(t)){body+=section(&#x27;Shape style&#x27;,range(&#x27;width&#x27;,&#x27;Stroke width&#x27;,1,20,&#x27; px&#x27;)+(t===&#x27;Line&#x27;?&#x27;&#x27;:select(&#x27;shapeFill&#x27;,&#x27;Interior&#x27;,[&#x27;None&#x27;,&#x27;Current color&#x27;]))+range(&#x27;opacity&#x27;,&#x27;Opacity&#x27;,0,100,&#x27;%&#x27;))+section(&#x27;Constraints&#x27;,check(&#x27;snap&#x27;,&#x27;Snap to grid / objects&#x27;)+check(&#x27;angle&#x27;,&#x27;Angle constraint&#x27;)+select(&#x27;angleStep&#x27;,&#x27;Angle increment&#x27;,[&#x27;5°&#x27;,&#x27;15°&#x27;,&#x27;30°&#x27;,&#x27;45°&#x27;,&#x27;90°&#x27;]))+(currentLayer().type===&#x27;R&#x27;?`&lt;p class=&quot;dt-subtle&quot;&gt;Shapes need a vector layer.&lt;/p&gt;`+btn(&#x27;shapeLayer&#x27;,&#x27;Create vector layer&#x27;,&#x27;plus&#x27;): `&lt;p class=&quot;dt-subtle&quot;&gt;Editable shapes · ${escape(currentLayer().name)}&lt;/p&gt;`)}
+ else if([&#x27;Select&#x27;,&#x27;Lasso&#x27;].includes(t)){body+=section(&#x27;Selection&#x27;,select(&#x27;selectionMode&#x27;,&#x27;Combine&#x27;,[&#x27;Replace&#x27;,&#x27;Add&#x27;,&#x27;Subtract&#x27;,&#x27;Intersect&#x27;])+range(&#x27;feather&#x27;,&#x27;Feather edge&#x27;,0,20,&#x27; px&#x27;)+`&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;selectSample&#x27;,state.selected?&#x27;Deselect&#x27;:&#x27;Select sample&#x27;)}${btn(&#x27;invert&#x27;,&#x27;Invert&#x27;,&#x27;&#x27;, &#x27;&#x27;,!state.selected)}&lt;/div&gt;`)+section(&#x27;Edit&#x27;,`&lt;div class=&quot;dt-two&quot;&gt;${btn(&#x27;cut&#x27;,&#x27;Cut&#x27;,&#x27;scissors&#x27;,&#x27;&#x27;,!state.selected)}${btn(&#x27;copy&#x27;,&#x27;Copy&#x27;,&#x27;copy&#x27;,&#x27;&#x27;,!state.selected)}${btn(&#x27;paste&#x27;,&#x27;Paste&#x27;,&#x27;clipboard&#x27;,&#x27;&#x27;,!state.copySelection)}${btn(&#x27;deleteSelection&#x27;,&#x27;Delete&#x27;,&#x27;trash-2&#x27;,&#x27;dt-danger&#x27;,!state.selected)}&lt;/div&gt;`)+btn(&#x27;transform&#x27;,&#x27;Transform selection&#x27;,&#x27;move&#x27;,&#x27;&#x27;,!state.selected)}
+ else body=section(&#x27;Eyedropper&#x27;,select(&#x27;fillSource&#x27;,&#x27;Sample&#x27;,[&#x27;Active layer&#x27;,&#x27;Visible layers&#x27;])+`&lt;p class=&quot;dt-subtle&quot;&gt;Tap the sample illustration to pick its ink color. The production loupe shows the previous and sampled colors side by side.&lt;/p&gt;`)+btn(&#x27;sampleColor&#x27;,&#x27;Sample ink color&#x27;,&#x27;pipette&#x27;);
+ return body+`&lt;hr&gt;&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;resetTool&#x27;,&#x27;Reset &#x27;+t.toLowerCase())}&lt;/div&gt;`;
+}
+function renderLayers(){const l=currentLayer();return section(&#x27;Layers&#x27;,`&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;addRaster&#x27;,&#x27;Raster +&#x27;)}${btn(&#x27;addVector&#x27;,&#x27;Vector +&#x27;)}&lt;/div&gt;&lt;div style=&quot;margin:10px 0&quot;&gt;${state.layers.map(x=&gt;`&lt;div class=&quot;dt-layer ${x.id===l.id?&#x27;active&#x27;:&#x27;&#x27;}&quot;&gt;${ibtn(&#x27;visible:&#x27;+x.id,(x.visible?&#x27;Hide &#x27;:&#x27;Show &#x27;)+x.name,x.visible?&#x27;eye&#x27;:&#x27;eye-off&#x27;)}&lt;button class=&quot;dt-layer-name&quot; data-action=&quot;layer:${x.id}&quot; aria-label=&quot;Select layer ${escape(x.name)}&quot;&gt;&lt;span&gt;${escape(x.name)}&lt;/span&gt;&lt;/button&gt;&lt;span class=&quot;dt-type&quot;&gt;${x.locked?&#x27;L&#x27;:x.type}&lt;/span&gt;${ibtn(&#x27;layerMenu:&#x27;+x.id,&#x27;Actions for &#x27;+x.name,&#x27;ellipsis&#x27;)}&lt;/div&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;`)+section(escape(l.name),`&lt;label class=&quot;dt-range&quot;&gt;&lt;span&gt;Layer opacity&lt;/span&gt;&lt;output data-value=&quot;layerOpacity&quot;&gt;${l.opacity}%&lt;/output&gt;&lt;input type=&quot;range&quot; data-key=&quot;layerOpacity&quot; min=&quot;0&quot; max=&quot;100&quot; value=&quot;${l.opacity}&quot; data-unit=&quot;%&quot; aria-label=&quot;Layer opacity&quot;&gt;&lt;/label&gt;&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;lock&#x27;,l.locked?&#x27;Unlock&#x27;:&#x27;Lock&#x27;,l.locked?&#x27;lock-open&#x27;:&#x27;lock&#x27;)}${btn(&#x27;duplicateLayer&#x27;,&#x27;Duplicate&#x27;,&#x27;copy&#x27;)}&lt;/div&gt;`)+`&lt;hr&gt;&lt;div class=&quot;dt-subtle&quot;&gt;${l.type===&#x27;V&#x27;?&#x27;Vector · editable shapes&#x27;:&#x27;Raster · pixels&#x27;}${l.locked?&#x27; · locked&#x27;:&#x27;&#x27;}&lt;/div&gt;`}
+function renderPages(){return section(&#x27;Pages&#x27;,`&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;addPage&#x27;,&#x27;Add page&#x27;,&#x27;plus&#x27;)}${btn(&#x27;pageSetup&#x27;,&#x27;Setup&#x27;,&#x27;sliders-horizontal&#x27;)}&lt;/div&gt;&lt;div style=&quot;margin:10px 0&quot;&gt;${state.pages.map((p,i)=&gt;`&lt;div class=&quot;dt-page-row ${p.id===state.page?&#x27;active&#x27;:&#x27;&#x27;}&quot;&gt;&lt;button data-action=&quot;page:${p.id}&quot;&gt;&lt;span class=&quot;dt-thumb&quot;&gt;${String(i+1).padStart(2,&#x27;0&#x27;)}&lt;/span&gt;&lt;span&gt;${escape(p.name)}&lt;/span&gt;&lt;/button&gt;${ibtn(&#x27;pageMenu:&#x27;+p.id,&#x27;Actions for page &#x27;+(i+1),&#x27;ellipsis&#x27;)}&lt;/div&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;&lt;p class=&quot;dt-subtle&quot;&gt;${state.pages.length} pages · ${state.preset} · ${state.orientation.toLowerCase()}&lt;/p&gt;`)}
+function renderColor(){return section(&#x27;Ink color&#x27;,`&lt;div class=&quot;dt-row&quot;&gt;&lt;button class=&quot;dt-swatch&quot; data-action=&quot;swap&quot; style=&quot;--swatch:${state.previous}&quot; aria-label=&quot;Swap foreground and previous color&quot;&gt;&lt;/button&gt;${ibtn(&#x27;swap&#x27;,&#x27;Swap colors&#x27;,&#x27;arrow-left-right&#x27;)}&lt;button class=&quot;dt-swatch&quot; style=&quot;--swatch:${state.color}&quot; aria-label=&quot;Selected color&quot; data-action=&quot;colorDetails&quot; aria-pressed=&quot;true&quot;&gt;&lt;/button&gt;${ibtn(&#x27;eyedropper&#x27;,&#x27;Eyedropper&#x27;,&#x27;pipette&#x27;)}&lt;/div&gt;&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;Color picker&lt;/span&gt;&lt;input type=&quot;color&quot; data-key=&quot;color&quot; value=&quot;${state.color}&quot; aria-label=&quot;Choose ink color&quot;&gt;&lt;/label&gt;&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;Hex&lt;/span&gt;&lt;input data-key=&quot;hex&quot; value=&quot;${state.color.toUpperCase()}&quot; aria-label=&quot;Hex color&quot; maxlength=&quot;7&quot;&gt;&lt;/label&gt;`)+section(&#x27;Drafting palette · 32&#x27;,`&lt;div class=&quot;dt-palette&quot;&gt;${palette.map(c=&gt;`&lt;button class=&quot;dt-swatch&quot; data-color=&quot;${c}&quot; style=&quot;--swatch:${c}&quot; aria-label=&quot;Color ${c}&quot; aria-pressed=&quot;${c.toLowerCase()===state.color.toLowerCase()}&quot;&gt;&lt;/button&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;`)+section(&#x27;Recent&#x27;,`&lt;div class=&quot;dt-palette&quot;&gt;${[state.previous,&#x27;#C77A1F&#x27;,&#x27;#2F7E78&#x27;,&#x27;#2A5D8F&#x27;].map(c=&gt;`&lt;button class=&quot;dt-swatch&quot; data-color=&quot;${c}&quot; style=&quot;--swatch:${c}&quot; aria-label=&quot;Recent color ${c}&quot;&gt;&lt;/button&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;`)+btn(&#x27;colorDetails&#x27;,&#x27;RGB &amp; custom slots&#x27;,&#x27;palette&#x27;)}
+function panel(){q(&#x27;#dt-panel-content&#x27;).innerHTML=({tool:renderTool,layers:renderLayers,pages:renderPages,color:renderColor}[state.tab])();sync();icons()}
+function openPanel(tab){state.tab=tab;state.collapsed=false;panel()}
+function close(){if(state.setupBefore){Object.assign(state,state.setupBefore);state.setupBefore=null;sync()}q(&#x27;.dt-overlay&#x27;).hidden=true;q(&#x27;.dt-top&#x27;).inert=false;q(&#x27;.dt-context&#x27;).inert=false;q(&#x27;.dt-workarea&#x27;).inert=false;returnFocus?.focus();returnFocus=null}
+function dialog(title,body,footer=&#x27;&#x27;,wide=false){if(q(&#x27;.dt-overlay&#x27;).hidden)returnFocus=document.activeElement;const d=q(&#x27;.dt-dialog&#x27;);d.classList.toggle(&#x27;wide&#x27;,wide);d.innerHTML=`&lt;div class=&quot;dt-dialog-head&quot;&gt;&lt;h2 id=&quot;dt-dialog-title&quot;&gt;${title}&lt;/h2&gt;${ibtn(&#x27;close&#x27;,&#x27;Close dialog&#x27;,&#x27;x&#x27;)}&lt;/div&gt;${body}${footer?`&lt;div class=&quot;dt-dialog-footer&quot;&gt;${footer}&lt;/div&gt;`:&#x27;&#x27;}`;q(&#x27;.dt-overlay&#x27;).hidden=false;q(&#x27;.dt-top&#x27;).inert=true;q(&#x27;.dt-context&#x27;).inert=true;q(&#x27;.dt-workarea&#x27;).inert=true;icons();d.querySelector(&#x27;button,input,select&#x27;)?.focus()}
+function confirm(title,message,action,label=&#x27;Delete&#x27;){dialog(title,`&lt;p&gt;${message}&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Cancel&#x27;)+btn(action,label,&#x27;&#x27;,&#x27;dt-primary&#x27;))}
+function documents(){dialog(&#x27;Documents&#x27;,`&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;newDocument&#x27;,&#x27;New document&#x27;,&#x27;plus&#x27;)}${btn(&#x27;import&#x27;,&#x27;Import / open&#x27;,&#x27;folder-open&#x27;)}&lt;/div&gt;&lt;div class=&quot;dt-doc-grid&quot;&gt;${state.docs.map((d,i)=&gt;`&lt;div class=&quot;dt-doc&quot;&gt;&lt;button data-action=&quot;openDoc:${i}&quot;&gt;&lt;span class=&quot;dt-doc-art&quot;&gt;${ico([&#x27;pen-tool&#x27;,&#x27;component&#x27;,&#x27;ruler&#x27;][i%3])}&lt;/span&gt;&lt;span&gt;${escape(d)}&lt;/span&gt;&lt;span class=&quot;dt-subtle&quot;&gt;${i===0?state.pages.length:2} pages · Local preview&lt;/span&gt;&lt;/button&gt;&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;docRename:&#x27;+i,&#x27;Rename&#x27;)}${btn(&#x27;docDelete:&#x27;+i,&#x27;Delete&#x27;,&#x27;&#x27;,&#x27;dt-danger&#x27;)}&lt;/div&gt;&lt;/div&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;`, &#x27;&#x27;,true)}
+function pageSetup(isNew=false){if(!state.setupBefore)state.setupBefore=Object.fromEntries([&#x27;preset&#x27;,&#x27;orientation&#x27;,&#x27;dpi&#x27;,&#x27;pageUnit&#x27;,&#x27;pageWidth&#x27;,&#x27;pageHeight&#x27;,&#x27;paperColor&#x27;].map(k=&gt;[k,state[k]]));dialog(isNew?&#x27;New document&#x27;:&#x27;Page setup&#x27;,`${isNew?input(&#x27;newName&#x27;,&#x27;Document name&#x27;):&#x27;&#x27;}&lt;div class=&quot;dt-two&quot;&gt;${select(&#x27;preset&#x27;,&#x27;Page size&#x27;,[&#x27;A4&#x27;,&#x27;A3&#x27;,&#x27;Letter&#x27;,&#x27;Square&#x27;,&#x27;Custom&#x27;])}${select(&#x27;orientation&#x27;,&#x27;Orientation&#x27;,[&#x27;Portrait&#x27;,&#x27;Landscape&#x27;])}&lt;/div&gt;&lt;div class=&quot;dt-two&quot;&gt;${select(&#x27;dpi&#x27;,&#x27;Resolution&#x27;,[150,300,600])}${select(&#x27;pageUnit&#x27;,&#x27;Units&#x27;,[&#x27;mm&#x27;,&#x27;in&#x27;,&#x27;px&#x27;])}&lt;/div&gt;${state.preset===&#x27;Custom&#x27;?`&lt;div class=&quot;dt-two&quot;&gt;${input(&#x27;pageWidth&#x27;,&#x27;Width&#x27;,&#x27;number&#x27;)}${input(&#x27;pageHeight&#x27;,&#x27;Height&#x27;,&#x27;number&#x27;)}&lt;/div&gt;`:&#x27;&#x27;}&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;Paper color&lt;/span&gt;&lt;input type=&quot;color&quot; data-key=&quot;paperColor&quot; value=&quot;${state.paperColor||&#x27;#fffdf8&#x27;}&quot; aria-label=&quot;Paper color&quot;&gt;&lt;/label&gt;`,btn(&#x27;close&#x27;,&#x27;Cancel&#x27;)+btn(isNew?&#x27;createDocument&#x27;:&#x27;applyPageSetup&#x27;,isNew?&#x27;Create&#x27;:&#x27;Apply&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))}
+function layerMenu(id){state.layer=id;const l=currentLayer();panel();dialog(&#x27;Layer · &#x27;+escape(l.name),`&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;Name&lt;/span&gt;&lt;input data-key=&quot;layerName&quot; value=&quot;${escape(l.name)}&quot; aria-label=&quot;Layer name&quot;&gt;&lt;/label&gt;&lt;div class=&quot;dt-two&quot;&gt;${btn(&#x27;moveLayerUp&#x27;,&#x27;Move up&#x27;,&#x27;arrow-up&#x27;,&#x27;&#x27;,state.layers[0].id===id)}${btn(&#x27;moveLayerDown&#x27;,&#x27;Move down&#x27;,&#x27;arrow-down&#x27;,&#x27;&#x27;,state.layers.at(-1).id===id)}${btn(&#x27;duplicateLayer&#x27;,&#x27;Duplicate&#x27;,&#x27;copy&#x27;)}${btn(&#x27;lock&#x27;,l.locked?&#x27;Unlock&#x27;:&#x27;Lock&#x27;,l.locked?&#x27;lock-open&#x27;:&#x27;lock&#x27;)}${btn(&#x27;rasterize&#x27;,&#x27;Rasterize&#x27;,&#x27;layers&#x27;,&#x27;&#x27;,l.type!==&#x27;V&#x27;)}${btn(&#x27;merge&#x27;,&#x27;Merge down&#x27;,&#x27;combine&#x27;,&#x27;&#x27;,state.layers.at(-1).id===id)}&lt;/div&gt;&lt;hr&gt;${btn(&#x27;deleteLayer&#x27;,&#x27;Delete layer&#x27;,&#x27;trash-2&#x27;,&#x27;dt-danger&#x27;,state.layers.length===1)}`,btn(&#x27;saveLayer&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))}
+function settings(){let content=&#x27;&#x27;;const tab=state.settingTab;
+ if(tab===&#x27;Workspace&#x27;)content=select(&#x27;hand&#x27;,&#x27;Drawing hand&#x27;,[&#x27;right&#x27;,&#x27;left&#x27;])+select(&#x27;appearance&#x27;,&#x27;Appearance&#x27;,[&#x27;light&#x27;,&#x27;dark&#x27;])+range(&#x27;textSize&#x27;,&#x27;Control text&#x27;,12,16,&#x27; px&#x27;)+range(&#x27;iconSize&#x27;,&#x27;Icon size&#x27;,16,20,&#x27; px&#x27;)+check(&#x27;comfort&#x27;,&#x27;Roomier controls&#x27;)+`&lt;p class=&quot;dt-subtle&quot;&gt;Right-handed: tools on the left. Left-handed: mirrored workspace. Changes apply to this preview.&lt;/p&gt;`;
+ if(tab===&#x27;Input&#x27;)content=check(&#x27;pencilOnly&#x27;,&#x27;Only Pencil draws&#x27;)+check(&#x27;predict&#x27;,&#x27;Motion prediction&#x27;)+range(&#x27;activation&#x27;,&#x27;Light-touch threshold&#x27;,0,20,&#x27;%&#x27;)+range(&#x27;stabilize&#x27;,&#x27;Stroke stabilization&#x27;,0,100,&#x27;%&#x27;)+`&lt;hr&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Pan / zoom / rotate&lt;/span&gt;&lt;span&gt;Two fingers&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Undo / redo&lt;/span&gt;&lt;span&gt;Two / three-finger tap&lt;/span&gt;&lt;/div&gt;`;
+ if(tab===&#x27;Files&#x27;)content=`&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Default location&lt;/span&gt;&lt;span&gt;On My iPad&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Autosave&lt;/span&gt;&lt;span&gt;After edits&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;import&#x27;,&#x27;Open from Files&#x27;,&#x27;folder-open&#x27;)}${btn(&#x27;backup&#x27;,&#x27;Backup document&#x27;,&#x27;archive&#x27;)}&lt;/div&gt;&lt;hr&gt;${select(&#x27;errorMode&#x27;,&#x27;Preview document state&#x27;,[&#x27;Saved&#x27;,&#x27;Saving&#x27;,&#x27;Save failed&#x27;,&#x27;Recovery available&#x27;,&#x27;Missing resource&#x27;])}${btn(&#x27;previewState&#x27;,&#x27;Show state&#x27;,&#x27;circle-alert&#x27;)}`;
+ if(tab===&#x27;About&#x27;)content=`&lt;p&gt;Drafting Table · Compact workspace study 02&lt;/p&gt;&lt;p class=&quot;dt-subtle&quot;&gt;Design preview. Drawing, document storage, Pencil hardware, and exports are simulated.&lt;/p&gt;&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;shortcuts&#x27;,&#x27;Keyboard shortcuts&#x27;,&#x27;keyboard&#x27;)}${btn(&#x27;diagnostics&#x27;,&#x27;Diagnostics&#x27;,&#x27;activity&#x27;)}&lt;/div&gt;`;
+ dialog(&#x27;Preferences&#x27;,`&lt;div class=&quot;dt-settings-tabs&quot;&gt;${[&#x27;Workspace&#x27;,&#x27;Input&#x27;,&#x27;Files&#x27;,&#x27;About&#x27;].map(t=&gt;`&lt;button data-action=&quot;settingTab:${t}&quot; aria-pressed=&quot;${t===tab}&quot;&gt;${t}&lt;/button&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;${content}`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;));
+}
+function pencil(){dialog(&#x27;Apple Pencil&#x27;,check(&#x27;hover&#x27;,&#x27;Hover brush preview&#x27;)+check(&#x27;haptics&#x27;,&#x27;Tool / snap haptics&#x27;)+select(&#x27;doubleTap&#x27;,&#x27;Double tap&#x27;,[&#x27;Brush / eraser&#x27;,&#x27;Previous tool&#x27;,&#x27;Color panel&#x27;,&#x27;Off&#x27;])+select(&#x27;squeeze&#x27;,&#x27;Squeeze · Pencil Pro&#x27;,[&#x27;Quick palette&#x27;,&#x27;Brush / eraser&#x27;,&#x27;Color panel&#x27;,&#x27;Off&#x27;])+select(&#x27;barrel&#x27;,&#x27;Barrel roll · Pencil Pro&#x27;,[&#x27;Shade orientation&#x27;,&#x27;Off&#x27;])+`&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;quickPalette&#x27;,&#x27;Try quick palette&#x27;,&#x27;grip&#x27;)}${btn(&#x27;inputSettings&#x27;,&#x27;Input settings&#x27;,&#x27;sliders-horizontal&#x27;)}&lt;/div&gt;&lt;p class=&quot;dt-subtle&quot;&gt;Hardware-dependent options appear only for a compatible connected Pencil. This preview exposes all configurations.&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))}
+function quickPalette(){dialog(&#x27;Pencil squeeze palette&#x27;,`&lt;div class=&quot;dt-squeeze&quot;&gt;${btn(&#x27;quick:Brush&#x27;,&#x27;Brush&#x27;,&#x27;pen-tool&#x27;)}${btn(&#x27;quick:Eraser&#x27;,&#x27;Eraser&#x27;,&#x27;eraser&#x27;)}${btn(&#x27;quick:Bucket&#x27;,&#x27;Bucket&#x27;,&#x27;paint-bucket&#x27;)}${btn(&#x27;quick:Lasso&#x27;,&#x27;Lasso&#x27;,&#x27;lasso&#x27;)}&lt;span class=&quot;dt-center&quot;&gt;Squeeze&lt;/span&gt;${btn(&#x27;color&#x27;,&#x27;Color&#x27;,&#x27;palette&#x27;)}${btn(&#x27;undo&#x27;,&#x27;Undo&#x27;,&#x27;undo-2&#x27;)}${btn(&#x27;quick:Line&#x27;,&#x27;Line&#x27;,&#x27;slash&#x27;)}${btn(&#x27;redo&#x27;,&#x27;Redo&#x27;,&#x27;redo-2&#x27;)}&lt;/div&gt;&lt;p class=&quot;dt-subtle&quot;&gt;Production: anchored near the Pencil, clamped inside the window. Tap a tool or squeeze again to dismiss.&lt;/p&gt;`)}
+function view(){dialog(&#x27;Canvas &amp; snapping&#x27;,`&lt;div class=&quot;dt-two&quot;&gt;&lt;div&gt;${check(&#x27;grid&#x27;,&#x27;Drafting grid&#x27;)}${check(&#x27;pixel&#x27;,&#x27;Pixel grid&#x27;)}${check(&#x27;snap&#x27;,&#x27;Snap to grid / objects&#x27;)}&lt;/div&gt;&lt;div&gt;${check(&#x27;angle&#x27;,&#x27;Angle constraint&#x27;)}${select(&#x27;angleStep&#x27;,&#x27;Angle step&#x27;,[&#x27;5°&#x27;,&#x27;15°&#x27;,&#x27;30°&#x27;,&#x27;45°&#x27;,&#x27;90°&#x27;])}&lt;/div&gt;&lt;/div&gt;${range(&#x27;gridStep&#x27;,&#x27;Grid spacing&#x27;,1,50,&#x27; mm&#x27;)}${range(&#x27;rotation&#x27;,&#x27;Canvas rotation&#x27;,-180,180,&#x27;°&#x27;)}&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;fit&#x27;,&#x27;Fit page&#x27;,&#x27;scan&#x27;)}${btn(&#x27;actual&#x27;,&#x27;100%&#x27;,&#x27;maximize&#x27;)}${btn(&#x27;resetRotation&#x27;,&#x27;Reset rotation&#x27;,&#x27;rotate-ccw&#x27;)}&lt;/div&gt;`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))}
+function exportDialog(){const archive=state.exportFormat===&#x27;.drafttable&#x27;;dialog(&#x27;Export&#x27;,`&lt;div class=&quot;dt-three&quot;&gt;${[&#x27;PNG&#x27;,&#x27;PDF&#x27;,&#x27;.drafttable&#x27;].map(f=&gt;`&lt;button data-action=&quot;format:${f}&quot; aria-pressed=&quot;${state.exportFormat===f}&quot; style=&quot;border:1px solid var(--dt-rule)&quot;&gt;${f}&lt;/button&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;${archive?&#x27;&lt;p class=&quot;dt-subtle&quot;&gt;Editable document copy · all pages and layers.&lt;/p&gt;&#x27;:select(&#x27;exportScope&#x27;,&#x27;Pages&#x27;,[&#x27;Current page&#x27;,&#x27;All pages&#x27;])+check(&#x27;background&#x27;,&#x27;Include paper background&#x27;)+(state.exportFormat===&#x27;PNG&#x27;?select(&#x27;exportScale&#x27;,&#x27;Image scale&#x27;,[&#x27;1×&#x27;,&#x27;2×&#x27;,&#x27;4×&#x27;]):&#x27;&#x27;)}&lt;hr&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;File&lt;/span&gt;&lt;span&gt;${archive?&#x27;Desk lamp.drafttable&#x27;:state.exportFormat===&#x27;PNG&#x27;?&#x27;Form studies.png&#x27;:&#x27;Desk lamp.pdf&#x27;}&lt;/span&gt;&lt;/div&gt;&lt;p class=&quot;dt-subtle&quot;&gt;UI preview only · no file is generated.&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Cancel&#x27;)+btn(&#x27;prepareExport&#x27;,&#x27;Export…&#x27;,&#x27;upload&#x27;,&#x27;dt-primary&#x27;))}
+function render(){context();panel();sync()}
+ const actions={
+ close,documents,pencil,settings,view,export:exportDialog,quickPalette,pageSetup:()=&gt;pageSetup(false),
+ inspector:()=&gt;{state.collapsed=!state.collapsed;sync()},focus:()=&gt;{state.collapsed=!state.collapsed;sync()},toolPanel:()=&gt;openPanel(&#x27;tool&#x27;),color:()=&gt;{close();openPanel(&#x27;color&#x27;)},
+ uniform:()=&gt;{state.uniform=!state.uniform;render()},snap:()=&gt;{state.snap=!state.snap;render()},shapeFill:()=&gt;{state.shapeFill=state.shapeFill===&#x27;None&#x27;?&#x27;Current color&#x27;:&#x27;None&#x27;;render()},
+ zoomin:()=&gt;{state.zoom=Math.min(200,state.zoom+25);sync()},zoomout:()=&gt;{state.zoom=Math.max(25,state.zoom-25);sync()},fit:()=&gt;{state.zoom=100;state.rotation=0;sync()},actual:()=&gt;{state.zoom=100;sync()},resetRotation:()=&gt;{state.rotation=0;sync();view()},
+ document:()=&gt;dialog(&#x27;Document&#x27;,input(&#x27;docName&#x27;,&#x27;Name&#x27;)+`&lt;div class=&quot;dt-two&quot;&gt;${btn(&#x27;documents&#x27;,&#x27;All documents&#x27;,&#x27;library&#x27;)}${btn(&#x27;pageSetup&#x27;,&#x27;Page setup&#x27;,&#x27;ruler&#x27;)}${btn(&#x27;import&#x27;,&#x27;Import image&#x27;,&#x27;image&#x27;)}${btn(&#x27;export&#x27;,&#x27;Export&#x27;,&#x27;upload&#x27;)}${btn(&#x27;backup&#x27;,&#x27;Save a copy&#x27;,&#x27;copy&#x27;)}${btn(&#x27;clearDocument&#x27;,&#x27;Clear document&#x27;,&#x27;trash-2&#x27;,&#x27;dt-danger&#x27;)}&lt;/div&gt;`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;)),
+ newDocument:()=&gt;{state.newName=&#x27;Untitled notebook&#x27;;state.pageUnit=&#x27;mm&#x27;;state.pageWidth=210;state.pageHeight=297;pageSetup(true)},
+ createDocument:()=&gt;{if(!String(state.newName).trim()){toast(&#x27;Enter a document name.&#x27;);return}state.docs.unshift(state.newName.trim());state.docName=state.newName.trim();state.pages=[{id:1,name:&#x27;Page 1&#x27;}];state.page=1;state.setupBefore=null;close();render();toast(&#x27;Preview document created. Illustration remains a design fixture.&#x27;)},
+ applyPageSetup:()=&gt;{if(state.preset===&#x27;Custom&#x27;&amp;&amp;(!(Number(state.pageWidth)&gt;0)||!(Number(state.pageHeight)&gt;0))){toast(&#x27;Page dimensions must be greater than zero.&#x27;);return}state.setupBefore=null;close();render();toast(&#x27;Preview page setup updated&#x27;)},
+ addPage:()=&gt;{history();const id=Math.max(...state.pages.map(x=&gt;x.id))+1;state.pages.push({id,name:&#x27;Page &#x27;+id});state.page=id;panel()},
+ addRaster:()=&gt;{history();const id=state.layerCounter++;state.layers.unshift({id,name:&#x27;Raster &#x27;+id,type:&#x27;R&#x27;,visible:true,locked:false,opacity:100});state.layer=id;panel()},
+ addVector:()=&gt;{history();const id=state.layerCounter++;state.layers.unshift({id,name:&#x27;Vector &#x27;+id,type:&#x27;V&#x27;,visible:true,locked:false,opacity:100});state.layer=id;panel()},
+ shapeLayer:()=&gt;{actions.addVector();toast(&#x27;Vector layer created for &#x27;+state.tool.toLowerCase())},
+ lock:()=&gt;{history();currentLayer().locked=!currentLayer().locked;close();panel()},
+ duplicateLayer:()=&gt;{history();const l={...currentLayer(),id:state.layerCounter++,name:currentLayer().name+&#x27; copy&#x27;};state.layers.splice(state.layers.findIndex(x=&gt;x.id===state.layer),0,l);state.layer=l.id;close();panel()},
+ saveLayer:()=&gt;{if(state.layerName?.trim()){history();currentLayer().name=state.layerName.trim();state.layerName=null}close();panel()},
+ moveLayerUp:()=&gt;moveLayer(-1),moveLayerDown:()=&gt;moveLayer(1),
+ rasterize:()=&gt;confirm(&#x27;Rasterize layer?&#x27;,&#x27;The shapes become pixels. Undo will restore the vector layer.&#x27;,&#x27;doRasterize&#x27;,&#x27;Rasterize&#x27;),
+ doRasterize:()=&gt;{history();currentLayer().type=&#x27;R&#x27;;close();panel();toast(&#x27;Preview: layer type changed to raster&#x27;)},
+ merge:()=&gt;confirm(&#x27;Merge with layer below?&#x27;,&#x27;Appearance is flattened into the lower layer. This preview demonstrates the confirmation flow.&#x27;,&#x27;doMerge&#x27;,&#x27;Merge&#x27;),
+ doMerge:()=&gt;{history();const i=state.layers.findIndex(x=&gt;x.id===state.layer);if(i&lt;state.layers.length-1){state.layers.splice(i,1);state.layer=state.layers[i].id}close();panel();toast(&#x27;Preview: layer list merged; pixel compositing is not simulated&#x27;)},
+ deleteLayer:()=&gt;confirm(&#x27;Delete layer?&#x27;,&#x27;Delete “&#x27;+escape(currentLayer().name)+&#x27;”? This can be undone.&#x27;,&#x27;doDeleteLayer&#x27;),
+ doDeleteLayer:()=&gt;{if(state.layers.length&gt;1){history();state.layers=state.layers.filter(x=&gt;x.id!==state.layer);state.layer=state.layers[0].id}close();panel()},
+ clearDocument:()=&gt;confirm(&#x27;Clear all pages?&#x27;,&#x27;All drawing content in this document will be removed. Keep a backup before proceeding.&#x27;,&#x27;doClear&#x27;,&#x27;Clear&#x27;),doClear:()=&gt;{close();toast(&#x27;Preview: clear confirmed. Sample artwork preserved.&#x27;)},
+ swap:()=&gt;{[state.color,state.previous]=[state.previous,state.color];render()},eyedropper:()=&gt;chooseTool(&#x27;Eyedropper&#x27;),sampleColor:()=&gt;{state.previous=state.color;state.color=&#x27;#37372f&#x27;;chooseTool(state.previousTool||&#x27;Brush&#x27;);toast(&#x27;Sampled ink · #37372F&#x27;)},
+ colorDetails:()=&gt;dialog(&#x27;Color values &amp; custom slots&#x27;,`&lt;div class=&quot;dt-two&quot;&gt;&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;RGB&lt;/span&gt;&lt;input aria-label=&quot;RGB value&quot; data-key=&quot;rgb&quot; value=&quot;${[1,3,5].map(i=&gt;parseInt(state.color.slice(i,i+2),16)).join(&#x27;, &#x27;)}&quot;&gt;&lt;/label&gt;&lt;label class=&quot;dt-field&quot;&gt;&lt;span&gt;Hex&lt;/span&gt;&lt;input aria-label=&quot;Hex value&quot; data-key=&quot;hex&quot; value=&quot;${state.color.toUpperCase()}&quot;&gt;&lt;/label&gt;&lt;/div&gt;&lt;div class=&quot;dt-palette&quot;&gt;${(state.slots||[&#x27;#B5482E&#x27;,&#x27;#3A4F6B&#x27;,&#x27;#5A8C3A&#x27;,&#x27;#C77A1F&#x27;]).map((c,i)=&gt;`&lt;button class=&quot;dt-swatch&quot; data-color=&quot;${c}&quot; style=&quot;--swatch:${c}&quot; aria-label=&quot;Custom slot ${i+1}&quot;&gt;&lt;/button&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;${btn(&#x27;saveSlot&#x27;,&#x27;Save current to first slot&#x27;,&#x27;plus&#x27;)}`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;)),
+ saveSlot:()=&gt;{state.slots=state.slots||[&#x27;#B5482E&#x27;,&#x27;#3A4F6B&#x27;,&#x27;#5A8C3A&#x27;,&#x27;#C77A1F&#x27;];state.slots[0]=state.color;actions.colorDetails();toast(&#x27;Color saved to first preview slot&#x27;)},
+ selectSample:()=&gt;{state.selected=!state.selected;render()},invert:()=&gt;toast(&#x27;Preview: selection boundary inverted&#x27;),copy:()=&gt;{state.copySelection=true;render();toast(&#x27;Selection copied inside preview&#x27;)},cut:()=&gt;{state.copySelection=true;state.selected=false;render();toast(&#x27;Preview: selection cut&#x27;)},paste:()=&gt;{state.selected=true;render();toast(&#x27;Preview: pasted as floating selection&#x27;)},deleteSelection:()=&gt;{state.selected=false;render();toast(&#x27;Preview: selection deleted&#x27;)},
+ transform:()=&gt;{state.transformX=182;state.transformY=82;state.transformW=257;state.transformH=185;state.transformAngle=0;state.keepAspect=true;dialog(&#x27;Transform selection&#x27;,`&lt;div class=&quot;dt-two&quot;&gt;${input(&#x27;transformX&#x27;,&#x27;X · px&#x27;,&#x27;number&#x27;)}${input(&#x27;transformY&#x27;,&#x27;Y · px&#x27;,&#x27;number&#x27;)}${input(&#x27;transformW&#x27;,&#x27;Width · px&#x27;,&#x27;number&#x27;)}${input(&#x27;transformH&#x27;,&#x27;Height · px&#x27;,&#x27;number&#x27;)}&lt;/div&gt;${check(&#x27;keepAspect&#x27;,&#x27;Keep aspect ratio&#x27;)}${range(&#x27;transformAngle&#x27;,&#x27;Rotation&#x27;,-180,180,&#x27;°&#x27;)}&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;flipH&#x27;,&#x27;Flip horizontal&#x27;,&#x27;flip-horizontal&#x27;)}${btn(&#x27;flipV&#x27;,&#x27;Flip vertical&#x27;,&#x27;flip-vertical&#x27;)}&lt;/div&gt;`,btn(&#x27;close&#x27;,&#x27;Cancel&#x27;)+btn(&#x27;applyTransform&#x27;,&#x27;Apply&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))},
+ applyTransform:()=&gt;{if(!(Number(state.transformW)&gt;0&amp;&amp;Number(state.transformH)&gt;0)){toast(&#x27;Width and height must be greater than zero.&#x27;);return}close();toast(&#x27;Preview: transform committed. Artwork is an illustrative fixture.&#x27;)},flipH:()=&gt;toast(&#x27;Preview: horizontal flip selected&#x27;),flipV:()=&gt;toast(&#x27;Preview: vertical flip selected&#x27;),
+ resetTool:()=&gt;{Object.assign(state,{size:8,opacity:100,hardness:85,pressure:75,uniform:true,gap:4,bleed:2,tolerance:16,width:2,feather:0});render()},
+ import:()=&gt;dialog(&#x27;Import / open&#x27;,`&lt;div class=&quot;dt-two&quot;&gt;${btn(&#x27;systemFiles&#x27;,&#x27;Files&#x27;,&#x27;folder-open&#x27;)}${btn(&#x27;systemPhotos&#x27;,&#x27;Photos&#x27;,&#x27;image&#x27;)}&lt;/div&gt;&lt;p class=&quot;dt-subtle&quot;&gt;Images become a floating selection with Place / Cancel. Editable .drafttable files open as documents; legacy Android files use a one-way importer.&lt;/p&gt;`,btn(&#x27;importSample&#x27;,&#x27;Try image placement&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;)),
+ systemFiles:()=&gt;toast(&#x27;Preview handoff: iPadOS Files picker&#x27;),systemPhotos:()=&gt;toast(&#x27;Preview handoff: iPadOS Photos picker&#x27;),
+ importSample:()=&gt;{close();state.selected=true;chooseTool(&#x27;Select&#x27;);dialog(&#x27;Place imported image&#x27;,`&lt;p&gt;Imported image · 1200 × 900 px&lt;/p&gt;&lt;div class=&quot;dt-button-row&quot;&gt;${btn(&#x27;fit&#x27;,&#x27;Fit page&#x27;,&#x27;scan&#x27;)}${btn(&#x27;transform&#x27;,&#x27;Transform&#x27;,&#x27;move&#x27;)}&lt;/div&gt;`,btn(&#x27;cancelImport&#x27;,&#x27;Cancel&#x27;)+btn(&#x27;placeImport&#x27;,&#x27;Place&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))},cancelImport:()=&gt;{state.selected=false;close();render()},placeImport:()=&gt;{state.selected=false;close();render();toast(&#x27;Preview: image placed on a new raster layer&#x27;)},
+ backup:()=&gt;{state.exportFormat=&#x27;.drafttable&#x27;;exportDialog()},prepareExport:()=&gt;dialog(&#x27;Ready to share&#x27;,`&lt;p&gt;${state.exportFormat} · ${state.exportScope}&lt;/p&gt;&lt;p class=&quot;dt-subtle&quot;&gt;The native app hands the completed file to the iPadOS share sheet. No file was generated in this design preview.&lt;/p&gt;`,btn(&#x27;export&#x27;,&#x27;Back&#x27;)+btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;)),
+ inputSettings:()=&gt;{state.settingTab=&#x27;Input&#x27;;settings()},
+ diagnostics:()=&gt;dialog(&#x27;Diagnostics&#x27;,`&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Input / frame timing&lt;/span&gt;&lt;span&gt;—&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;GPU memory / tiles&lt;/span&gt;&lt;span&gt;—&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Pencil sample rate&lt;/span&gt;&lt;span&gt;—&lt;/span&gt;&lt;/div&gt;&lt;p class=&quot;dt-subtle&quot;&gt;Unavailable in the design preview. Production values appear here, not over the canvas by default.&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;)),
+ shortcuts:()=&gt;dialog(&#x27;Keyboard shortcuts&#x27;,`&lt;div class=&quot;dt-two&quot;&gt;${tools.map(t=&gt;`&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;${t[0]}&lt;/span&gt;&lt;span&gt;${t[2]}&lt;/span&gt;&lt;/div&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;&lt;hr&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Undo / redo&lt;/span&gt;&lt;span&gt;⌘Z / ⇧⌘Z&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Close panel or dialog&lt;/span&gt;&lt;span&gt;Esc&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;dt-row&quot;&gt;&lt;span&gt;Focus canvas&lt;/span&gt;&lt;span&gt;Backslash&lt;/span&gt;&lt;/div&gt;`,btn(&#x27;close&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;)),
+ previewState:()=&gt;{const m=state.errorMode;if(m===&#x27;Saved&#x27;){close();toast(&#x27;Preview: all changes saved&#x27;)}else if(m===&#x27;Saving&#x27;)dialog(&#x27;Saving document&#x27;,`&lt;div class=&quot;dt-progress&quot;&gt;&lt;span&gt;&lt;/span&gt;&lt;/div&gt;&lt;p&gt;Finishing recent changes…&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Keep drawing&#x27;));else if(m===&#x27;Save failed&#x27;)dialog(&#x27;Couldn’t save to this location&#x27;,`&lt;p&gt;Your current work is still open. Retry or save a copy to another location.&lt;/p&gt;`,btn(&#x27;backup&#x27;,&#x27;Save a copy&#x27;)+btn(&#x27;retrySave&#x27;,&#x27;Retry&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;));else if(m===&#x27;Recovery available&#x27;)dialog(&#x27;Recover unsaved changes?&#x27;,`&lt;p&gt;A newer local recovery copy is available for this document.&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Keep last saved&#x27;)+btn(&#x27;recover&#x27;,&#x27;Recover&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;));else dialog(&#x27;Missing image resource&#x27;,`&lt;p&gt;A linked image could not be loaded. Keep editing other layers or locate the original.&lt;/p&gt;`,btn(&#x27;close&#x27;,&#x27;Keep editing&#x27;)+btn(&#x27;systemFiles&#x27;,&#x27;Locate image&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;))},retrySave:()=&gt;{close();toast(&#x27;Preview: retry requested&#x27;)},recover:()=&gt;{close();toast(&#x27;Preview: recovery copy opened&#x27;)}
+};
+function moveLayer(delta){const i=state.layers.findIndex(x=&gt;x.id===state.layer),j=i+delta;if(j&lt;0||j&gt;=state.layers.length)return;history();[state.layers[i],state.layers[j]]=[state.layers[j],state.layers[i]];layerMenu(state.layer)}
+function chooseTool(t){if(t===&#x27;Eyedropper&#x27;&amp;&amp;state.tool!==&#x27;Eyedropper&#x27;)state.previousTool=state.tool;state.tool=t;state.selected=[&#x27;Select&#x27;,&#x27;Lasso&#x27;].includes(t);context();if(state.tab===&#x27;tool&#x27;)panel();sync();icons()}
+function action(a){
+ if(a===&#x27;undo&#x27;||a===&#x27;redo&#x27;){const source=a===&#x27;undo&#x27;?state.history:state.redo,target=a===&#x27;undo&#x27;?state.redo:state.history;if(source.length){target.push(JSON.stringify({layers:state.layers,pages:state.pages,layer:state.layer,page:state.page}));Object.assign(state,JSON.parse(source.pop()));render()}return}
+ if(a.startsWith(&#x27;quick:&#x27;)){close();chooseTool(a.slice(6));return}
+ if(a.startsWith(&#x27;visible:&#x27;)){history();const l=state.layers.find(x=&gt;x.id===+a.split(&#x27;:&#x27;)[1]);l.visible=!l.visible;panel();return}
+ if(a.startsWith(&#x27;layer:&#x27;)){state.layer=+a.split(&#x27;:&#x27;)[1];panel();return}
+ if(a.startsWith(&#x27;layerMenu:&#x27;)){state.layerName=null;layerMenu(+a.split(&#x27;:&#x27;)[1]);return}
+ if(a.startsWith(&#x27;page:&#x27;)){state.page=+a.split(&#x27;:&#x27;)[1];panel();return}
+ if(a.startsWith(&#x27;pageMenu:&#x27;)){state.page=+a.split(&#x27;:&#x27;)[1];const p=state.pages.find(p=&gt;p.id===state.page);state.pageName=p.name;dialog(&#x27;Page · &#x27;+escape(p.name),input(&#x27;pageName&#x27;,&#x27;Name&#x27;)+`&lt;div class=&quot;dt-two&quot;&gt;${btn(&#x27;pageDuplicate&#x27;,&#x27;Duplicate&#x27;,&#x27;copy&#x27;)}${btn(&#x27;pageDelete&#x27;,&#x27;Delete&#x27;,&#x27;trash-2&#x27;,&#x27;dt-danger&#x27;,state.pages.length===1)}${btn(&#x27;pageUp&#x27;,&#x27;Move earlier&#x27;,&#x27;arrow-up&#x27;,&#x27;&#x27;,state.pages[0].id===p.id)}${btn(&#x27;pageDown&#x27;,&#x27;Move later&#x27;,&#x27;arrow-down&#x27;,&#x27;&#x27;,state.pages.at(-1).id===p.id)}&lt;/div&gt;`,btn(&#x27;pageRename&#x27;,&#x27;Done&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;));return}
+ if([&#x27;pageDuplicate&#x27;,&#x27;pageDelete&#x27;,&#x27;pageUp&#x27;,&#x27;pageDown&#x27;,&#x27;pageRename&#x27;,&#x27;doPageDelete&#x27;].includes(a)){const i=state.pages.findIndex(p=&gt;p.id===state.page);if(a===&#x27;pageDelete&#x27;){confirm(&#x27;Delete page?&#x27;,&#x27;Delete this page and all its layers? This can be undone.&#x27;,&#x27;doPageDelete&#x27;);return}history();if(a===&#x27;pageDuplicate&#x27;){const p={...state.pages[i],id:Math.max(...state.pages.map(x=&gt;x.id))+1,name:state.pages[i].name+&#x27; copy&#x27;};state.pages.splice(i+1,0,p);state.page=p.id}if(a===&#x27;doPageDelete&#x27;&amp;&amp;state.pages.length&gt;1){state.pages.splice(i,1);state.page=state.pages[Math.min(i,state.pages.length-1)].id}if(a===&#x27;pageRename&#x27;)state.pages[i].name=state.pageName.trim()||state.pages[i].name;if(a===&#x27;pageUp&#x27;||a===&#x27;pageDown&#x27;){const j=i+(a===&#x27;pageUp&#x27;?-1:1);if(j&gt;=0&amp;&amp;j&lt;state.pages.length)[state.pages[i],state.pages[j]]=[state.pages[j],state.pages[i]]}close();panel();return}
+ if(a.startsWith(&#x27;settingTab:&#x27;)){state.settingTab=a.split(&#x27;:&#x27;)[1];settings();return}
+ if(a.startsWith(&#x27;format:&#x27;)){state.exportFormat=a.split(&#x27;:&#x27;)[1];exportDialog();return}
+ if(a.startsWith(&#x27;openDoc:&#x27;)){state.docName=state.docs[+a.split(&#x27;:&#x27;)[1]];close();render();toast(&#x27;Preview document selected · shared sample artwork&#x27;);return}
+ if(a.startsWith(&#x27;docRename:&#x27;)){state.docIndex=+a.split(&#x27;:&#x27;)[1];state.renameDoc=state.docs[state.docIndex];dialog(&#x27;Rename document&#x27;,input(&#x27;renameDoc&#x27;,&#x27;Name&#x27;),btn(&#x27;documents&#x27;,&#x27;Cancel&#x27;)+btn(&#x27;saveDocName&#x27;,&#x27;Rename&#x27;,&#x27;&#x27;,&#x27;dt-primary&#x27;));return}
+ if(a===&#x27;saveDocName&#x27;){if(!state.renameDoc.trim()){toast(&#x27;Enter a name.&#x27;);return}if(state.docName===state.docs[state.docIndex])state.docName=state.renameDoc.trim();state.docs[state.docIndex]=state.renameDoc.trim();sync();documents();return}
+ if(a.startsWith(&#x27;docDelete:&#x27;)){state.docIndex=+a.split(&#x27;:&#x27;)[1];confirm(&#x27;Delete document?&#x27;,&#x27;Delete “&#x27;+escape(state.docs[state.docIndex])+&#x27;”? The native app should move it to Recently Deleted.&#x27;,&#x27;deleteDoc&#x27;);return}
+ if(a===&#x27;deleteDoc&#x27;){state.docs.splice(state.docIndex,1);documents();return}
+ if(actions[a])actions[a]();
+}
+root.addEventListener(&#x27;click&#x27;,e=&gt;{const b=e.target.closest(&#x27;button&#x27;);if(!b||b.disabled)return;if(b.dataset.tool){chooseTool(b.dataset.tool);return}if(b.dataset.tab){openPanel(b.dataset.tab);return}if(b.dataset.color){state.previous=state.color;state.color=b.dataset.color.toLowerCase();render();return}if(b.dataset.action)action(b.dataset.action)});
+root.addEventListener(&#x27;input&#x27;,e=&gt;{const el=e.target,key=el.dataset.key;if(!key)return;if(key===&#x27;layerOpacity&#x27;){currentLayer().opacity=+el.value}else if(key===&#x27;hex&#x27;){if(/^#[0-9a-f]{6}$/i.test(el.value))state.color=el.value.toLowerCase();else return}else if(key===&#x27;rgb&#x27;){const c=el.value.split(&#x27;,&#x27;).map(x=&gt;Number(x.trim()));if(c.length!==3||c.some(x=&gt;!Number.isInteger(x)||x&lt;0||x&gt;255))return;state.color=&#x27;#&#x27;+c.map(x=&gt;x.toString(16).padStart(2,&#x27;0&#x27;)).join(&#x27;&#x27;)}else state[key]=el.type===&#x27;checkbox&#x27;?el.checked:[&#x27;range&#x27;,&#x27;number&#x27;].includes(el.type)?+el.value:el.value;qa(`[data-value=&quot;${key}&quot;]`).forEach(o=&gt;o.textContent=(key===&#x27;layerOpacity&#x27;?currentLayer().opacity:state[key])+(el.dataset.unit||&#x27;&#x27;));qa(`[data-key=&quot;${key}&quot;]`).forEach(other=&gt;{if(other!==el){if(el.type===&#x27;checkbox&#x27;)other.checked=el.checked;else other.value=el.value}});sync()});
+root.addEventListener(&#x27;change&#x27;,e=&gt;{const key=e.target.dataset.key;if([&#x27;color&#x27;,&#x27;hex&#x27;,&#x27;rgb&#x27;].includes(key)){context();if(state.tab===&#x27;color&#x27;)panel()}if(key===&#x27;preset&#x27;)pageSetup(q(&#x27;#dt-dialog-title&#x27;)?.textContent===&#x27;New document&#x27;);if(state.keepAspect&amp;&amp;[&#x27;transformW&#x27;,&#x27;transformH&#x27;].includes(key)){const other=key===&#x27;transformW&#x27;?&#x27;transformH&#x27;:&#x27;transformW&#x27;;state[other]=Math.round(state[key]*(key===&#x27;transformW&#x27;?185/257:257/185));q(`[data-key=&quot;${other}&quot;]`).value=state[other]}});
+root.addEventListener(&#x27;pointerdown&#x27;,e=&gt;{if(e.target.dataset.key===&#x27;layerOpacity&#x27;)history()});
+q(&#x27;.dt-overlay&#x27;).addEventListener(&#x27;click&#x27;,e=&gt;{if(e.target===q(&#x27;.dt-overlay&#x27;))close()});
+root.addEventListener(&#x27;keydown&#x27;,e=&gt;{if(!q(&#x27;.dt-overlay&#x27;).hidden&amp;&amp;e.key===&#x27;Tab&#x27;){const focusables=Array.from(q(&#x27;.dt-dialog&#x27;).querySelectorAll(&#x27;button:not(:disabled),input,select&#x27;));const first=focusables[0],last=focusables.at(-1);if(e.shiftKey&amp;&amp;document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&amp;&amp;document.activeElement===last){e.preventDefault();first.focus()}return}if(e.key===&#x27;Escape&#x27;){if(!q(&#x27;.dt-overlay&#x27;).hidden)close();else{state.collapsed=true;sync()}return}if(e.target.dataset.tab&amp;&amp;[&#x27;ArrowLeft&#x27;,&#x27;ArrowRight&#x27;].includes(e.key)){e.preventDefault();const tabs=qa(&#x27;[data-tab]&#x27;),i=tabs.indexOf(e.target),next=tabs[(i+(e.key===&#x27;ArrowRight&#x27;?1:3))%4];openPanel(next.dataset.tab);next.focus();return}if(e.target.matches(&#x27;input,select,textarea&#x27;)||!q(&#x27;.dt-overlay&#x27;).hidden)return;if(e.code===&#x27;Backslash&#x27;){e.preventDefault();actions.focus();return}if((e.metaKey||e.ctrlKey)&amp;&amp;e.key.toLowerCase()===&#x27;z&#x27;){e.preventDefault();action(e.shiftKey?&#x27;redo&#x27;:&#x27;undo&#x27;);return}const t=tools.find(t=&gt;t[2].toLowerCase()===e.key.toLowerCase());if(t&amp;&amp;!e.metaKey&amp;&amp;!e.ctrlKey){chooseTool(t[0])}});
+q(&#x27;.dt-drawing&#x27;).addEventListener(&#x27;click&#x27;,()=&gt;{if(state.tool===&#x27;Eyedropper&#x27;)actions.sampleColor();else if([&#x27;Select&#x27;,&#x27;Lasso&#x27;].includes(state.tool)){state.selected=!state.selected;render()}else toast(&#x27;Design canvas · use the panels to explore tool options&#x27;)});
+q(&#x27;.dt-rail&#x27;).innerHTML=tools.map((t,i)=&gt;`${i===4||i===8||i===10?&#x27;&lt;hr&gt;&#x27;:&#x27;&#x27;}&lt;button class=&quot;dt-icon&quot; data-tool=&quot;${t[0]}&quot; aria-label=&quot;${t[0]} (${t[2]})&quot; data-tooltip=&quot;${t[0]} · ${t[2]}&quot; aria-pressed=&quot;${t[0]===state.tool}&quot;&gt;${ico(t[1])}&lt;/button&gt;`).join(&#x27;&#x27;);
+state.pageUnit=&#x27;mm&#x27;;state.pageWidth=210;state.pageHeight=297;state.layers.forEach(l=&gt;l.artName=l.name);
+render();
+if(globalThis.Tweak){const tweak=new Tweak({container:root,onChange:()=&gt;{applyDesign();sync()}});tweak.addSlider(state,&#x27;iconSize&#x27;,{label:&#x27;Icon size&#x27;,min:16,max:20,unit:&#x27;px&#x27;});tweak.addSlider(state,&#x27;textSize&#x27;,{label:&#x27;Control text&#x27;,min:12,max:16,unit:&#x27;px&#x27;});tweak.addSlider(state,&#x27;panelWidth&#x27;,{label:&#x27;Inspector width&#x27;,min:232,max:280,unit:&#x27;px&#x27;});tweak.addToggle(state,&#x27;collapsed&#x27;,{label:&#x27;Hide inspector&#x27;});tweak.addToggle(state,&#x27;comfort&#x27;,{label:&#x27;Roomier controls&#x27;});tweak.addSelect(state,&#x27;appearance&#x27;,{label:&#x27;Appearance&#x27;,options:[&#x27;light&#x27;,&#x27;dark&#x27;]});tweak.addSelect(state,&#x27;hand&#x27;,{label:&#x27;Drawing hand&#x27;,options:[&#x27;right&#x27;,&#x27;left&#x27;]})}
+})();
+&lt;/script&gt;
+&lt;/div&gt;
+
+&lt;script src=&quot;https://unpkg.com/@floating-ui/core@1.7.3/dist/floating-ui.core.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script src=&quot;https://unpkg.com/@floating-ui/dom@1.7.4/dist/floating-ui.dom.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  if (window.FloatingUIDOM == null) {
+    return;
+  }
+  const { autoUpdate, computePosition, flip, offset, shift, size } =
+    window.FloatingUIDOM;
+  const tooltipPlacements = new Set([&quot;top&quot;, &quot;right&quot;, &quot;bottom&quot;, &quot;left&quot;]);
+  const tooltipId = `codex-visualization-tooltip-${
+    window.crypto?.randomUUID?.() ?? Date.now().toString(36)
+  }`;
+  const tooltipGap = 5;
+  const hoverDelay = 700;
+  const skipDelay = 300;
+  let activeTrigger = null;
+  let pendingTrigger = null;
+  let tooltip = null;
+  let openTimeout = null;
+  let autoUpdateCleanup = null;
+  let positionRequest = 0;
+  let skipDelayUntil = 0;
+  let lastPointerWasTouch = false;
+  let pinnedByTouch = false;
+
+  const getTrigger = (target) =&gt;
+    target?.nodeType === Node.ELEMENT_NODE
+      ? target.closest(&quot;[data-tooltip]&quot;)
+      : null;
+  const containsTarget = (trigger, target) =&gt;
+    target?.nodeType != null &amp;&amp; trigger.contains(target);
+  const getContent = (trigger) =&gt;
+    trigger.getAttribute(&quot;data-tooltip&quot;)?.trim() ?? &quot;&quot;;
+  const getPlacement = (trigger) =&gt; {
+    const placement = trigger.getAttribute(&quot;data-tooltip-placement&quot;);
+    return tooltipPlacements.has(placement) ? placement : &quot;top&quot;;
+  };
+  const getTooltip = () =&gt; {
+    if (tooltip == null) {
+      tooltip = document.createElement(&quot;div&quot;);
+      tooltip.id = tooltipId;
+      tooltip.className = &quot;tooltip&quot;;
+      tooltip.setAttribute(&quot;role&quot;, &quot;tooltip&quot;);
+    }
+    return tooltip;
+  };
+  const setDescribedBy = (trigger, described) =&gt; {
+    const ids = new Set(
+      (trigger.getAttribute(&quot;aria-describedby&quot;) ?? &quot;&quot;)
+        .split(/\s+/)
+        .filter(Boolean),
+    );
+    if (described) {
+      ids.add(tooltipId);
+    } else {
+      ids.delete(tooltipId);
+    }
+    if (ids.size === 0) {
+      trigger.removeAttribute(&quot;aria-describedby&quot;);
+    } else {
+      trigger.setAttribute(&quot;aria-describedby&quot;, [...ids].join(&quot; &quot;));
+    }
+  };
+  const clearOpenTimeout = () =&gt; {
+    if (openTimeout != null) {
+      window.clearTimeout(openTimeout);
+      openTimeout = null;
+    }
+    pendingTrigger = null;
+  };
+  const closeTooltip = (activateSkipDelay = true) =&gt; {
+    clearOpenTimeout();
+    pinnedByTouch = false;
+    positionRequest += 1;
+    autoUpdateCleanup?.();
+    autoUpdateCleanup = null;
+    if (activeTrigger == null) {
+      return;
+    }
+    setDescribedBy(activeTrigger, false);
+    activeTrigger = null;
+    tooltip?.remove();
+    if (activateSkipDelay) {
+      skipDelayUntil = Date.now() + skipDelay;
+    }
+  };
+  const updatePosition = (trigger, floating) =&gt; {
+    const request = ++positionRequest;
+    void computePosition(trigger, floating, {
+      middleware: [
+        offset(tooltipGap),
+        flip({ padding: tooltipGap }),
+        shift({ padding: tooltipGap }),
+        size({
+          padding: tooltipGap,
+          apply({ availableHeight, availableWidth, elements }) {
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-width&quot;,
+              `${Math.max(0, availableWidth)}px`,
+            );
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-height&quot;,
+              `${Math.max(0, availableHeight)}px`,
+            );
+          },
+        }),
+      ],
+      placement: getPlacement(trigger),
+      strategy: &quot;fixed&quot;,
+    })
+      .then(({ x, y }) =&gt; {
+        if (activeTrigger !== trigger || request !== positionRequest) {
+          return;
+        }
+        const scale = window.devicePixelRatio || 1;
+        floating.style.transform = `translate(${Math.round(x * scale) / scale}px, ${Math.round(y * scale) / scale}px)`;
+        floating.style.visibility = &quot;visible&quot;;
+      })
+      .catch(() =&gt; {
+        if (activeTrigger === trigger &amp;&amp; request === positionRequest) {
+          closeTooltip(false);
+        }
+      });
+  };
+  const openTooltip = (trigger) =&gt; {
+    const content = getContent(trigger);
+    if (!trigger.isConnected || content.length === 0) {
+      return;
+    }
+    clearOpenTimeout();
+    if (activeTrigger === trigger) {
+      return;
+    }
+    closeTooltip();
+    const floating = getTooltip();
+    floating.textContent = content;
+    floating.style.visibility = &quot;hidden&quot;;
+    floating.style.transform = &quot;translate(0, 0)&quot;;
+    document.body.appendChild(floating);
+    activeTrigger = trigger;
+    setDescribedBy(trigger, true);
+    autoUpdateCleanup = autoUpdate(trigger, floating, () =&gt; {
+      updatePosition(trigger, floating);
+    });
+  };
+  const requestOpen = (trigger, immediate = false) =&gt; {
+    if (
+      getContent(trigger).length === 0 ||
+      activeTrigger === trigger ||
+      pendingTrigger === trigger
+    ) {
+      return;
+    }
+    clearOpenTimeout();
+    pendingTrigger = trigger;
+    const delay =
+      immediate || activeTrigger != null || Date.now() &lt; skipDelayUntil
+        ? 0
+        : hoverDelay;
+    if (delay === 0) {
+      openTooltip(trigger);
+      return;
+    }
+    openTimeout = window.setTimeout(() =&gt; {
+      openTimeout = null;
+      pendingTrigger = null;
+      openTooltip(trigger);
+    }, delay);
+  };
+  const handlePointerOpen = (event) =&gt; {
+    if (event.pointerType === &quot;touch&quot;) {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    requestOpen(trigger);
+  };
+  const handlePointer = (event) =&gt; {
+    lastPointerWasTouch =
+      event.type === &quot;pointerdown&quot; &amp;&amp; event.pointerType === &quot;touch&quot;;
+  };
+  const handleTouchClick = (event) =&gt; {
+    const isTouch = event.pointerType === &quot;touch&quot; || lastPointerWasTouch;
+    lastPointerWasTouch = false;
+    if (!isTouch || event.detail === 0) {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (
+      trigger == null ||
+      !trigger.isConnected ||
+      getContent(trigger).length === 0 ||
+      (pinnedByTouch &amp;&amp; activeTrigger === trigger)
+    ) {
+      if (pinnedByTouch) {
+        closeTooltip();
+      }
+      return;
+    }
+    openTooltip(trigger);
+    pinnedByTouch = activeTrigger === trigger;
+    window.setTimeout(() =&gt; {
+      if (activeTrigger === trigger &amp;&amp; !trigger.isConnected) {
+        closeTooltip(false);
+      }
+    }, 0);
+  };
+  const handleLeave = (event) =&gt; {
+    if (pinnedByTouch) {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const handleFocusIn = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger?.matches(&quot;:focus-visible&quot;)) {
+      requestOpen(trigger, true);
+    }
+  };
+  const handleKeyDown = (event) =&gt; {
+    if (event.key === &quot;Escape&quot;) {
+      closeTooltip();
+    }
+  };
+  const handleContextMenu = (event) =&gt; {
+    lastPointerWasTouch = false;
+    const trigger = getTrigger(event.target);
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const destroy = () =&gt; {
+    closeTooltip(false);
+    lastPointerWasTouch = false;
+    document.removeEventListener(&quot;pointerover&quot;, handlePointerOpen);
+    document.removeEventListener(&quot;pointerdown&quot;, handlePointer);
+    document.removeEventListener(&quot;pointercancel&quot;, handlePointer);
+    document.removeEventListener(&quot;click&quot;, handleTouchClick);
+    document.removeEventListener(&quot;pointerout&quot;, handleLeave);
+    document.removeEventListener(&quot;focusin&quot;, handleFocusIn);
+    document.removeEventListener(&quot;focusout&quot;, handleLeave);
+    document.removeEventListener(&quot;keydown&quot;, handleKeyDown);
+    document.removeEventListener(&quot;contextmenu&quot;, handleContextMenu);
+    tooltip = null;
+  };
+
+  document.addEventListener(&quot;pointerover&quot;, handlePointerOpen);
+  document.addEventListener(&quot;pointerdown&quot;, handlePointer);
+  document.addEventListener(&quot;pointercancel&quot;, handlePointer);
+  document.addEventListener(&quot;click&quot;, handleTouchClick);
+  document.addEventListener(&quot;pointerout&quot;, handleLeave);
+  document.addEventListener(&quot;focusin&quot;, handleFocusIn);
+  document.addEventListener(&quot;focusout&quot;, handleLeave);
+  document.addEventListener(&quot;keydown&quot;, handleKeyDown);
+  document.addEventListener(&quot;contextmenu&quot;, handleContextMenu);
+  window.addEventListener(&quot;pagehide&quot;, destroy, { once: true });
+})();
+&lt;/script&gt;
+&lt;script id=&quot;codex-visualization-tabs&quot;&gt;
+(() =&gt; {
+  const selector = &#x27;.nav[role=&quot;tablist&quot;] [role=&quot;tab&quot;]&#x27;;
+  const disabled = &#x27;:disabled,[aria-disabled=&quot;true&quot;]&#x27;;
+  const selectTab = (selected) =&gt; {
+    const panelId = selected.getAttribute(&quot;aria-controls&quot;);
+    for (const tab of selected.closest(&#x27;[role=&quot;tablist&quot;]&#x27;).querySelectorAll(&#x27;[role=&quot;tab&quot;]&#x27;)) {
+      const active = tab === selected;
+      tab.classList.toggle(&quot;active&quot;, active);
+      tab.setAttribute(&quot;aria-selected&quot;, String(active));
+      const id = tab.getAttribute(&quot;aria-controls&quot;);
+      const panel = id &amp;&amp; document.getElementById(id);
+      if (panel != null) {
+        panel.hidden = id !== panelId;
+        if (!panel.hidden &amp;&amp; selected.id) {
+          panel.setAttribute(&quot;aria-labelledby&quot;, selected.id);
+        }
+      }
+    }
+  };
+  const interact = (event) =&gt; {
+    const tab = event.target?.closest?.(selector);
+    if (event.defaultPrevented || tab == null || tab.matches(disabled)) {
+      return;
+    }
+    if (event.type === &quot;click&quot;) {
+      selectTab(tab);
+      return;
+    }
+    const tabs = Array.from(
+      tab.closest(&#x27;[role=&quot;tablist&quot;]&#x27;).querySelectorAll(&#x27;[role=&quot;tab&quot;]&#x27;),
+    ).filter((candidate) =&gt; !candidate.matches(disabled));
+    const current = tabs.indexOf(tab);
+    let next;
+    if (event.key === &quot;ArrowRight&quot; || event.key === &quot;ArrowDown&quot;) {
+      next = (current + 1) % tabs.length;
+    } else if (event.key === &quot;ArrowLeft&quot; || event.key === &quot;ArrowUp&quot;) {
+      next = (current + tabs.length - 1) % tabs.length;
+    } else if (event.key === &quot;Home&quot;) {
+      next = 0;
+    } else if (event.key === &quot;End&quot;) {
+      next = tabs.length - 1;
+    } else {
+      return;
+    }
+    event.preventDefault();
+    tabs[next].focus();
+    selectTab(tabs[next]);
+  };
+
+  for (const list of document.querySelectorAll(&#x27;.nav[role=&quot;tablist&quot;]&#x27;)) {
+    const selected =
+      list.querySelector(&#x27;[role=&quot;tab&quot;][aria-selected=&quot;true&quot;]&#x27;) ??
+      list.querySelector(&#x27;[role=&quot;tab&quot;].active&#x27;) ??
+      list.querySelector(&#x27;[role=&quot;tab&quot;]&#x27;);
+    if (selected != null) {
+      selectTab(selected);
+    }
+  }
+  document.addEventListener(&quot;click&quot;, interact);
+  document.addEventListener(&quot;keydown&quot;, interact);
+  window.addEventListener(&quot;pagehide&quot;, () =&gt; {
+    document.removeEventListener(&quot;click&quot;, interact);
+    document.removeEventListener(&quot;keydown&quot;, interact);
+  }, { once: true });
+})();
+&lt;/script&gt;
+&lt;script id=&quot;codex-visualization-lucide&quot; async src=&quot;https://unpkg.com/lucide@1.17.0/dist/umd/lucide.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  const initialize = () =&gt; {
+    globalThis.lucide?.createIcons({ attrs: { width: 16, height: 16 } });
+  };
+  if (globalThis.lucide != null) {
+    initialize();
+    return;
+  }
+  document
+    .getElementById(&quot;codex-visualization-lucide&quot;)
+    ?.addEventListener(&quot;load&quot;, initialize, { once: true });
+})();
+&lt;/script&gt;
+
+&lt;/body&gt;
+&lt;/html&gt;
+"></iframe>
+</body>
+</html>
